@@ -3,26 +3,61 @@ import { File } from "expo-file-system";
 
 import { clearSession, loadSession, saveTokens } from "../storage/store";
 
+/**
+ * Decide which host the backend is on, at runtime.
+ *
+ * The app is always served by Metro on the PC, and Metro tells the bundle which
+ * PC that is. Deriving the API host from that address is what makes the app
+ * survive a network change: the PC gets a new IP, the phone rescans the QR,
+ * Metro reports the new host, and the app follows automatically. No saved IP, no
+ * edit to a .env, nothing to remember to re-run.
+ *
+ * An explicit EXPO_PUBLIC_API_URL still wins so a pinned/staging build is
+ * possible, but start.ps1 deliberately leaves it empty.
+ *
+ * @returns {{ url: string, source: string }}
+ */
 function resolveApiBase() {
-  const configured = process.env.EXPO_PUBLIC_API_URL || Constants.expoConfig?.extra?.apiUrl;
-  if (configured) return String(configured).replace(/\/$/, "");
+  const explicit = String(process.env.EXPO_PUBLIC_API_URL || "").trim();
+  if (explicit) return { url: explicit.replace(/\/+$/, ""), source: "EXPO_PUBLIC_API_URL" };
 
-  const hostUri = Constants.expoConfig?.hostUri || Constants.expoConfig?.debuggerHost || "127.0.0.1:8081";
-  const host = hostUri.split(":")[0];
+  const extra = Constants.expoConfig?.extra?.apiUrl;
+  if (extra) return { url: String(extra).replace(/\/+$/, ""), source: "expoConfig.extra.apiUrl" };
 
-  if (!host || host === "127.0.0.1" || host === "localhost") {
-    return "http://127.0.0.1:8000";
+  // hostUri is "<host>:<port>" for the machine Metro is running on. The fields
+  // below are the documented fallbacks across Expo Go and dev-client runtimes.
+  const candidates = [
+    ["Constants.expoConfig.hostUri", Constants.expoConfig?.hostUri],
+    ["Constants.expoConfig.debuggerHost", Constants.expoConfig?.debuggerHost],
+    ["Constants.expoGoConfig.debuggerHost", Constants.expoGoConfig?.debuggerHost],
+    ["Constants.manifest2.debuggerHost", Constants.manifest2?.debuggerHost],
+    ["Constants.manifest2.extra.expoGo?.debuggerHost", Constants.manifest2?.extra?.expoGo?.debuggerHost],
+  ];
+
+  for (const [source, value] of candidates) {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (!raw) continue;
+    // Strip any scheme first: some runtimes hand back "http://10.0.0.5:8081".
+    const host = raw.replace(/^[a-z]+:\/\//i, "").split(":")[0].trim();
+    if (!host) continue;
+    // 127.0.0.1 on a phone is the phone itself, which is never the backend.
+    if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+      return { url: "http://127.0.0.1:8000", source: `${source} (loopback)` };
+    }
+    return { url: `http://${host}:8000`, source };
   }
 
-  return `http://${host}:8000`;
+  return { url: "http://127.0.0.1:8000", source: "default (no Metro host found)" };
 }
 
-export const API_BASE = resolveApiBase();
+const resolved = resolveApiBase();
+export const API_BASE = resolved.url;
+export const API_BASE_SOURCE = resolved.source;
 
-// Printed once at startup: if the phone cannot reach the backend, this line is
-// the fastest way to confirm the app is pointing at the PC's LAN IP and not at
-// localhost (which on a phone means the phone itself).
-console.log(`[RAKSHAK] API base: ${API_BASE}`);
+// Printed once at startup, with the source. When the phone cannot reach the
+// backend this line - visible in the Metro console and in the in-app Test
+// backend result - says which host the app believes it should be talking to.
+console.log(`[RAKSHAK] API base: ${API_BASE}  (source: ${API_BASE_SOURCE})`);
 
 function authDebug(message, extra = {}) {
   console.log(`[RAKSHAK AUTH] ${message}`, extra);
@@ -74,10 +109,18 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+/**
+ * Backend health probe.
+ *
+ * The result carries the host the app actually used, so the on-screen Test
+ * backend result doubles as proof of which machine the app believes it is
+ * talking to. After a network change that is the one line that distinguishes
+ * "the app still has the old IP" from "the phone cannot reach the new one".
+ */
 export async function healthCheck() {
   const url = `${API_BASE}/health`;
   const { json } = await fetchJson(url, { method: "GET", headers: { Accept: "application/json" } });
-  return json || {};
+  return { ...(json || {}), api_base: API_BASE, api_base_source: API_BASE_SOURCE };
 }
 
 export function normalizePlate(raw = "") {

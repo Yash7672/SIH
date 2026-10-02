@@ -2,15 +2,39 @@ import axios from "axios";
 
 const env = (import.meta as any).env || {};
 
-/**
- * Host used by the *browser*, not by a container. `scripts/start.ps1` writes
- * `citizen_web/.env.local` with the PC's LAN IP (docker compose passes it as a
- * runtime env var), so the same bundle is reachable from the PC and from a
- * phone on the same Wi-Fi. `VITE_API_BASE_URL` is kept as a legacy alias.
- */
-export const API_BASE: string = env.VITE_API_URL || env.VITE_API_BASE_URL || "http://localhost:8000";
+function trimmed(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
 
-export const WS_BASE: string = String(env.VITE_WS_URL || API_BASE).replace(/^http/, "ws");
+/**
+ * Where the backend lives, decided at RUNTIME instead of baked into the bundle.
+ *
+ * Vite inlines VITE_* at build time, so a bundle built for one LAN IP keeps
+ * dialling it after the router hands out a new one. Deriving the host from
+ * `window.location` means the page always reaches the backend on the same
+ * machine, whatever the IP is now - no rebuild and no restart after a network
+ * change. An explicit VITE_API_URL still wins for container/CI setups.
+ */
+export function resolveApiBase(): string {
+  const explicit = trimmed(env.VITE_API_URL) || trimmed(env.VITE_API_BASE_URL);
+  if (explicit) return explicit.replace(/\/+$/, "");
+
+  if (typeof window !== "undefined" && window.location && window.location.hostname) {
+    // http://10.175.26.85:5173 -> http://10.175.26.85:8000
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return "http://localhost:8000";
+}
+
+/** Same derivation for the socket: https becomes wss, http becomes ws. */
+export function resolveWsBase(apiBase: string): string {
+  const explicit = trimmed(env.VITE_WS_URL);
+  const source = explicit || apiBase;
+  return source.replace(/^http/, "ws").replace(/\/+$/, "");
+}
+
+export const API_BASE: string = resolveApiBase();
+export const WS_BASE: string = resolveWsBase(API_BASE);
 
 export const api = axios.create({
   baseURL: `${API_BASE}/api/v1`,

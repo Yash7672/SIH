@@ -75,6 +75,44 @@ function Stop-ProcessTree {
     } catch { }
 }
 
+function Get-PortOwner {
+    <#
+        Decides whether the process holding a port belongs to this project.
+
+        The port is on ours if it was launched from this repo, or if it is one of
+        the runtimes start.ps1 uses (Expo/Metro, Vite, uvicorn). A process whose
+        command line cannot be read is never assumed to be ours - guessing there
+        would mean killing something the user cares about.
+    #>
+    param([int]$ProcessId)
+
+    $cmd = ''
+    try {
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($cim -and $cim.CommandLine) { $cmd = [string]$cim.CommandLine }
+    } catch { }
+
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    $name = if ($proc) { $proc.ProcessName } else { 'unknown process' }
+
+    if (-not $cmd) {
+        return [pscustomobject]@{ Ours = $false; Reason = "$name (pid $ProcessId), command line unavailable"; CommandLine = '' }
+    }
+    if ($cmd -like "*$RepoRoot*") {
+        return [pscustomobject]@{ Ours = $true; Reason = 'running from this repo'; CommandLine = $cmd }
+    }
+    if ($cmd -match '(?i)expo(\\|/)bin(\\|/)cli|metro|@expo(\\|/)metro') {
+        return [pscustomobject]@{ Ours = $true; Reason = "Expo/Metro ($name)"; CommandLine = $cmd }
+    }
+    if ($cmd -match '(?i)vite(\\|/)bin(\\|/)vite\.js') {
+        return [pscustomobject]@{ Ours = $true; Reason = "Vite dev server ($name)"; CommandLine = $cmd }
+    }
+    if ($cmd -match '(?i)uvicorn') {
+        return [pscustomobject]@{ Ours = $true; Reason = "uvicorn server ($name)"; CommandLine = $cmd }
+    }
+    return [pscustomobject]@{ Ours = $false; Reason = "$name (pid $ProcessId) is not a RAKSHAK process"; CommandLine = $cmd }
+}
+
 function Read-PidMap {
     $map = @{}
     if (-not (Test-Path -LiteralPath $PidsPath)) { return $map }
@@ -190,9 +228,25 @@ foreach ($port in $portList) {
         Write-Ok ("TCP {0} is free" -f $port)
         continue
     }
+
+    # Only kill what belongs to this project.
+    #
+    # This loop used to taskkill whatever held the port. After a laptop sleep or a
+    # closed window the port is often held by a leftover Metro of ours, but it
+    # can also be some unrelated program that happens to use 8081 - and silently
+    # killing that is both destructive and mystifying. So the owning process is
+    # identified first, and a stranger is reported by name instead of stopped.
+    $verdict = Get-PortOwner -ProcessId $pid_
+    if (-not $verdict.Ours) {
+        Write-Warn2 ("TCP {0} is held by a program that is not part of RAKSHAK: {1}" -f $port, $verdict.Reason)
+        if ($verdict.CommandLine) { Write-Host ('      ' + $verdict.CommandLine) -ForegroundColor DarkYellow }
+        Write-Info  'left it running; close it yourself if the next start complains about the port'
+        continue
+    }
+
     $proc = Get-Process -Id $pid_ -ErrorAction SilentlyContinue
     $procName = if ($proc) { $proc.ProcessName } else { 'unknown' }
-    Write-Step ("TCP {0} still held by {1} (pid {2}) - stopping it" -f $port, $procName, $pid_)
+    Write-Step ("TCP {0} still held by {1} ({2}, pid {3}) - stopping it" -f $port, $procName, $verdict.Reason, $pid_)
     Stop-ProcessTree -ProcessId $pid_
     Start-Sleep -Milliseconds 500
     if ((Get-ListeningPid -Port $port) -gt 0) {

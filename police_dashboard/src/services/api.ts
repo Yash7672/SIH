@@ -2,16 +2,42 @@
 
 const env = (import.meta as any).env || {};
 
-/**
- * Host used by the *browser*, not by a container. `scripts/start.ps1` writes
- * `police_dashboard/.env.local` with the PC's LAN IP (docker compose passes it
- * as a runtime env var), so the same bundle is reachable from the PC and from a
- * phone on the same Wi-Fi. `VITE_API_BASE_URL` is kept as a legacy alias.
- */
-export const API_BASE: string = env.VITE_API_URL || env.VITE_API_BASE_URL || "http://localhost:8000";
+function trimmed(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
 
-/** Alert socket. Explicit VITE_WS_URL wins, otherwise derived from API_BASE. */
-export const WS_BASE: string = String(env.VITE_WS_URL || API_BASE).replace(/^http/, "ws");
+/**
+ * Where the backend lives, decided at RUNTIME instead of baked into the bundle.
+ *
+ * A saved LAN IP is the single reason this dashboard breaks after a network
+ * change: Vite inlines VITE_* into the JS at build time, so a bundle built for
+ * 10.175.26.85 keeps dialling that address after the router hands out a new one,
+ * and the live feed silently stops. Deriving the host from `window.location`
+ * means the page always talks to the backend on the same machine, whatever the
+ * IP is now - no rebuild, no restart.
+ *
+ * An explicit VITE_API_URL still wins, so container/CI setups can pin a host.
+ */
+export function resolveApiBase(): string {
+  const explicit = trimmed(env.VITE_API_URL) || trimmed(env.VITE_API_BASE_URL);
+  if (explicit) return explicit.replace(/\/+$/, "");
+
+  if (typeof window !== "undefined" && window.location && window.location.hostname) {
+    // http://10.175.26.85:5174 -> http://10.175.26.85:8000
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return "http://localhost:8000";
+}
+
+/** Same derivation for the socket: https becomes wss, http becomes ws. */
+export function resolveWsBase(apiBase: string): string {
+  const explicit = trimmed(env.VITE_WS_URL);
+  const source = explicit || apiBase;
+  return source.replace(/^http/, "ws").replace(/\/+$/, "");
+}
+
+export const API_BASE: string = resolveApiBase();
+export const WS_BASE: string = resolveWsBase(API_BASE);
 
 export const api = axios.create({
   baseURL: `${API_BASE}/api/v1`,
@@ -45,7 +71,7 @@ api.interceptors.request.use((config) => {
 // same time, so a batch of requests only renews the token once.
 let refreshInFlight: Promise<string> | null = null;
 
-async function refreshAccessToken(): Promise<string> {
+export async function refreshAccessToken(): Promise<string> {
   const refreshToken = localStorage.getItem(REFRESH_KEY);
   if (!refreshToken) throw new Error("no refresh token");
   const { data } = await axios.post<TokenResponse>(`${API_BASE}/api/v1/auth/refresh`, {
@@ -53,6 +79,49 @@ async function refreshAccessToken(): Promise<string> {
   });
   saveSession(data);
   return data.access_token;
+}
+
+/**
+ * Read a JWT's `exp` claim without verifying it.
+ * Used only to decide *when* to refresh proactively; the server remains the
+ * authority on validity.
+ */
+function tokenExpiresAt(token: string): number | null {
+  const parts = token.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A token that is valid *right now*, refreshing proactively when it is expired
+ * or about to expire.
+ *
+ * The alert socket needs this: it authenticates at connect time, and access
+ * tokens only live 30 minutes. A dashboard left open across that boundary used
+ * to reconnect forever with a dead token and never recover.
+ */
+export async function getValidAccessToken(skewMs = 60000): Promise<string | null> {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) return null;
+
+  const expiresAt = tokenExpiresAt(token);
+  if (expiresAt !== null && expiresAt - Date.now() > skewMs) return token;
+
+  try {
+    return await (refreshInFlight = refreshInFlight || refreshAccessToken()).finally(() => {
+      refreshInFlight = null;
+    });
+  } catch {
+    // A dead refresh token means the session is gone; clearing it stops the
+    // socket from reconnecting in a loop and lets the UI send the user to login.
+    clearSession();
+    return null;
+  }
 }
 
 function forceLogin() {
@@ -173,3 +242,52 @@ export const COMPLAINT_STATUS_COLORS: Record<string, string> = {
   HOTLISTED: "chip-danger",
   CLOSED: "chip-neutral",
 };
+
+/**
+ * Recent hotlist detections, newest first.
+ *
+ * The alert list used to live only in memory, so a browser refresh emptied it
+ * and the operator had no way to see what they had already missed. Hydrating
+ * from GET /alerts on load makes the page survivable; the socket then keeps it
+ * up to date. De-duplication against live events happens in the merge helper.
+ */
+export async function fetchRecentAlerts(): Promise<AlertEvent[]> {
+  // No params: GET /alerts returns the 50 most recent hotlist detections from the
+  // last 24 hours, which is the window the dashboard shows.
+  const { data } = await api.get<AlertEvent[]>("/alerts");
+  return Array.isArray(data) ? data : [];
+}
+
+/** Stable identity for an alert, used to merge history with live events. */
+export function alertKey(a: Pick<AlertEvent, "sighting_id" | "plate" | "timestamp">): string {
+  return a.sighting_id || `${a.plate}::${a.timestamp}`;
+}
+
+/**
+ * Merge freshly-fetched history into the live list.
+ *
+ * Newest first, de-duplicated by sighting id, capped. A live event that is
+ * already present in the history must not appear twice, which is what happens on
+ * every reconnect because the backend keeps sending detections the socket missed
+ * while the page was closed.
+ */
+export function mergeAlerts(live: AlertEvent[], history: AlertEvent[], cap = 100): AlertEvent[] {
+  const seen = new Set<string>();
+  const out: AlertEvent[] = [];
+
+  for (const item of [...live, ...history]) {
+    if (!item || !item.plate) continue;
+    const key = alertKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+
+  out.sort((a, b) => {
+    const at = Date.parse(a.timestamp || "") || 0;
+    const bt = Date.parse(b.timestamp || "") || 0;
+    return bt - at;
+  });
+
+  return out.slice(0, cap);
+}

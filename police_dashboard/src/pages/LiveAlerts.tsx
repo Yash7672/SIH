@@ -2,6 +2,8 @@ import { memo, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { MapPin, RadioTower, Siren } from "lucide-react";
 import { AlertEvent } from "../services/api";
+import { SOCKET_LABELS } from "../components/Layout";
+import { useSocketState } from "../hooks/SocketState";
 import { PageHeader } from "../components/ui/Overlay";
 import { formatCoords, platePath, timeAgo } from "../lib/format";
 
@@ -68,6 +70,62 @@ const AlertRow = memo(function AlertRow({ alert, isNew }: { alert: AlertEvent; i
   );
 });
 
+/**
+ * Live / Reconnecting / Disconnected, with the last alert time.
+ *
+ * This page used to show nothing about the connection, so a dead stream was
+ * indistinguishable from a quiet junction. The retry button is also the escape
+ * hatch for a laptop that just changed network.
+ */
+function StreamStatusBanner() {
+  const { status, detail, lastEventAt, reconnectNow } = useSocketState();
+
+  const live = status === "live";
+  const tone = live
+    ? "border-success/40 bg-success/10 text-success"
+    : status === "offline"
+      ? "border-danger/40 bg-danger/10 text-danger"
+      : "border-warning/40 bg-warning/10 text-warning";
+
+  const lastEvent =
+    lastEventAt === null
+      ? "no alert received on this connection yet"
+      : `last alert ${new Date(lastEventAt).toLocaleTimeString()}`;
+
+  return (
+    <div
+      className={[
+        "flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3 text-sm",
+        tone,
+      ].join(" ")}
+    >
+      <span className="inline-flex items-center gap-2 font-medium">
+        <span className="relative flex h-2 w-2" aria-hidden>
+          {live ? (
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current opacity-60" />
+          ) : null}
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
+        </span>
+        Alert stream: {SOCKET_LABELS[status]}
+        {detail ? ` - ${detail}` : ""}
+      </span>
+
+      <span className="flex items-center gap-3 text-xs opacity-80">
+        <span>{lastEvent}</span>
+        {live ? null : (
+          <button
+            type="button"
+            onClick={reconnectNow}
+            className="rounded-md border border-current px-2 py-1 font-semibold hover:bg-white/10"
+          >
+            Reconnect now
+          </button>
+        )}
+      </span>
+    </div>
+  );
+}
+
 export default function LiveAlerts({ alerts }: { alerts: AlertEvent[] }) {
   const shown = alerts.slice(0, DISPLAY_CAP);
 
@@ -78,6 +136,10 @@ export default function LiveAlerts({ alerts }: { alerts: AlertEvent[] }) {
         subtitle="Hotlist detections pushed over the WebSocket alert stream, newest first."
       />
 
+      {/* Stream status. An operator has to be able to tell "nothing is happening"
+          from "the feed died" - the old page looked identical in both cases. */}
+      <StreamStatusBanner />
+
       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-surface-border bg-surface-card px-4 py-3 text-sm">
         <span className="inline-flex items-center gap-2">
           <span className="relative flex h-2 w-2" aria-hidden>
@@ -85,13 +147,11 @@ export default function LiveAlerts({ alerts }: { alerts: AlertEvent[] }) {
             <span className="relative inline-flex h-2 w-2 rounded-full bg-danger" />
           </span>
           <span className="font-medium text-surface-text">
-            {alerts.length} alert{alerts.length === 1 ? "" : "s"} this session
+            {alerts.length} alert{alerts.length === 1 ? "" : "s"} in the last 24 hours
           </span>
         </span>
         {alerts.length > DISPLAY_CAP ? (
-          <span className="text-xs text-surface-muted">
-            Showing the newest {DISPLAY_CAP}. Reload the page to clear the list.
-          </span>
+          <span className="text-xs text-surface-muted">Showing the newest {DISPLAY_CAP}.</span>
         ) : null}
       </div>
 

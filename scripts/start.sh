@@ -42,6 +42,8 @@ ENV_PATH="$REPO_ROOT/.env"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 PIDS_PATH="$STATE_DIR/pids.json"
 HASHES_PATH="$STATE_DIR/hashes.json"
+# Records the detected network so the NEXT run can tell whether it moved.
+STATE_PATH="$STATE_DIR/state.json"
 SEED_MARKER="$STATE_DIR/seed.done"
 
 BACKEND_DIR="$REPO_ROOT/backend"
@@ -286,31 +288,65 @@ detect_lan_ip() {
   if [ -n "$HOST_IP" ]; then
     info "using --host-ip override: $HOST_IP"
     LAN_IP="$HOST_IP"
+    HOST_IP_PINNED=1
+    NET_ADAPTER="pinned with --host-ip"
     return
   fi
+  HOST_IP_PINNED=0
 
-  local best="" best_score=-1 best_alias=""
+  # Wait for the network to be up. A machine resuming from sleep, or one that has
+  # just joined Wi-Fi, reports no address for a few seconds; without this the
+  # script would settle on the 127.0.0.1 fallback and print a QR nobody can scan.
+  local waited=0
+  while [ "$waited" -lt 20 ]; do
+    if detect_lan_ip_once; then return; fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  warn "Could not detect a LAN IPv4 address automatically."
+  warn "Falling back to 127.0.0.1 - a phone will NOT reach the demo."
+  warn "Re-run with --host-ip 192.168.1.20 if needed."
+  LAN_IP="127.0.0.1"
+  NET_ADAPTER="none"
+}
+
+detect_lan_ip_once() {
+  # Ranking is by the metric of the default route the interface holds, lowest
+  # wins - the same rule the kernel uses to decide where outbound traffic goes, so
+  # it stays correct with a VPN, WSL or VirtualBox adapter layered on top.
+  local best="" best_score=-1 best_alias="" best_metric="" count=0
   if command -v ip >/dev/null 2>&1; then
     while read -r ip alias; do
       [ -n "$ip" ] || continue
       case "$alias" in
-        *vEthernet*|*VirtualBox*|*VMware*|*docker*|*Docker*|*vbox*|*vmnet*|*br-*|*lo*|*virbr*) continue ;;
+        *vEthernet*|*VirtualBox*|*VMware*|*docker*|*Docker*|*vbox*|*vmnet*|*br-*|*lo*|*virbr*|*tailscale*) continue ;;
       esac
       case "$ip" in
         127.*|169.254.*) continue ;;
       esac
-      local score=0 has_gw=0
-      if ip route get "$ip" 2>/dev/null | grep -q 'src'; then has_gw=1; fi
-      [ "$has_gw" -eq 1 ] && score=$((score + 100))
-      case "$ip" in
-        192.168.*) score=$((score + 20)) ;;
-        10.*)      score=$((score + 15)) ;;
-        172.1[6-9].*|172.2[0-9].*|172.3[01].*) score=$((score + 10)) ;;
-      esac
+      count=$((count + 1))
+
+      # Interface state must be UP, not just present.
+      local state
+      state="$(cat "/sys/class/net/${alias#*/}/operstate" 2>/dev/null || echo unknown)"
+      [ "$state" = "down" ] && continue
+
+      local metric=9999
+      if command -v ip >/dev/null 2>&1; then
+        metric="$(ip route show default dev "${alias#*/}" 2>/dev/null | head -1 |
+          sed -n 's/.*metric \([0-9]*\).*/\1/p')"
+        [ -z "$metric" ] && metric=9999
+      fi
+
+      local score=$((10000 - metric))
+      ip route get "$ip" 2>/dev/null | grep -q 'src' && score=$((score + 5000))
       case "$alias" in
-        *Wi-Fi*|*WiFi*|*Wireless*|*wlan*|*eth*|*en0*) score=$((score + 5)) ;;
+        *Wi-Fi*|*WiFi*|*Wireless*|*wlan*|*eth*|*en0*) score=$((score + 200)) ;;
       esac
-      if [ "$score" -gt "$best_score" ]; then best="$ip"; best_score="$score"; best_alias="$alias"; fi
+      if [ "$score" -gt "$best_score" ]; then
+        best="$ip"; best_score="$score"; best_alias="$alias"; best_metric="$metric"
+      fi
     done < <(ip -o -4 addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1], $2}')
   fi
 
@@ -319,14 +355,15 @@ detect_lan_ip() {
   fi
 
   if [ -z "$best" ]; then
-    warn "Could not detect a LAN IPv4 address automatically."
-    warn "Falling back to 127.0.0.1 - a phone will NOT reach the demo."
-    warn "Re-run with --host-ip 192.168.1.20 if needed."
-    LAN_IP="127.0.0.1"
-  else
-    info "detected via interface: ${best_alias:-unknown}"
-    LAN_IP="$best"
+    return 1
   fi
+
+  LAN_IP="$best"
+  NET_ADAPTER="${best_alias:-unknown}"
+  NET_METRIC="${best_metric:-n/a}"
+  NET_GATEWAY="$(ip route show default 2>/dev/null | head -1 | sed -n 's/.*via \([0-9.]*\).*/\1/p')"
+  info "detected via interface: ${NET_ADAPTER} (metric ${NET_METRIC}, gateway ${NET_GATEWAY:-none})"
+  return 0
 }
 
 # --------------------------------------------------------------------------- #
@@ -335,7 +372,11 @@ detect_lan_ip() {
 init_env_files() {
   local api="http://${LAN_IP}:8000"
   local ws="ws://${LAN_IP}:8000"
-  local cors="http://localhost:5173,http://localhost:5174,http://${LAN_IP}:5173,http://${LAN_IP}:5174"
+  # CORS deliberately does not list the LAN IP. It only takes effect when uvicorn
+  # restarts, so listing it meant a new address either got refused by the browser
+  # or forced a backend restart on every network change. main.py also accepts any
+  # loopback/private-LAN origin via CORS_ALLOW_PRIVATE_NETWORK.
+  local cors="http://localhost:5173,http://localhost:5174"
 
   if [ ! -f "$ENV_PATH" ]; then
     if [ -f "$ENV_EXAMPLE" ]; then
@@ -354,6 +395,7 @@ JWT_REFRESH_DAYS=7
 HOTLIST_CONFIRMATION_HOURS=24
 DEMO_MODE=true
 CORS_ORIGINS=$cors
+CORS_ALLOW_PRIVATE_NETWORK=true
 STORAGE_BACKEND=local
 STORAGE_LOCAL_PATH=./data/uploads
 AI_MODEL_PATH=
@@ -368,26 +410,49 @@ EOF
 
   # Only these generated keys are rewritten; everything else the user typed stays.
   set_env_value "$ENV_PATH" CORS_ORIGINS "$cors"
+  set_env_value "$ENV_PATH" CORS_ALLOW_PRIVATE_NETWORK "true"
   set_env_value "$ENV_PATH" API_BASE_URL "$api"
-  set_env_value "$ENV_PATH" VITE_API_URL "$api"
-  set_env_value "$ENV_PATH" VITE_WS_URL "$ws"
-  set_env_value "$ENV_PATH" EXPO_PUBLIC_API_URL "$api"
-  ok ".env updated -> $api"
 
-  write_text "$CITIZEN_DIR/.env.local" <<EOF
-# Generated by scripts/start.sh - the host the *browser* uses.
+  # VITE_API_URL / EXPO_PUBLIC_API_URL are written ONLY when an address was given
+  # explicitly with --host-ip. Vite inlines VITE_* at build time and Metro inlines
+  # EXPO_PUBLIC_* at bundle time, so writing the IP here froze one address into the
+  # bundle and the client kept dialling it after the router moved this machine.
+  # Each client now derives its host at runtime instead.
+  if [ "$HOST_IP_PINNED" = "1" ]; then
+    set_env_value "$ENV_PATH" VITE_API_URL "$api"
+    set_env_value "$ENV_PATH" VITE_WS_URL "$ws"
+    set_env_value "$ENV_PATH" EXPO_PUBLIC_API_URL "$api"
+    warn "pinned VITE_API_URL / EXPO_PUBLIC_API_URL to $api (--host-ip); clear them to auto-detect again"
+    write_text "$CITIZEN_DIR/.env.local" <<EOF
+# Generated by scripts/start.sh - host PINNED with --host-ip.
 VITE_API_URL=$api
 VITE_WS_URL=$ws
 EOF
-  write_text "$POLICE_DIR/.env.local" <<EOF
-# Generated by scripts/start.sh - the host the *browser* uses.
-VITE_API_URL=$api
-VITE_WS_URL=$ws
-EOF
-  write_text "$MOBILE_DIR/.env" <<EOF
-# Generated by scripts/start.sh. EXPO_PUBLIC_* is inlined into the JS bundle.
+    cp "$CITIZEN_DIR/.env.local" "$POLICE_DIR/.env.local"
+    write_text "$MOBILE_DIR/.env" <<EOF
+# Generated by scripts/start.sh. EXPO_PUBLIC_API_URL PINNED with --host-ip.
 EXPO_PUBLIC_API_URL=$api
 EOF
+  else
+    set_env_value "$ENV_PATH" VITE_API_URL ""
+    set_env_value "$ENV_PATH" VITE_WS_URL ""
+    set_env_value "$ENV_PATH" EXPO_PUBLIC_API_URL ""
+    ok ".env updated -> $api (client URLs left empty for runtime resolution)"
+    write_text "$CITIZEN_DIR/.env.local" <<EOF
+# Generated by scripts/start.sh. Left empty on purpose: each app derives the
+# backend host from the address in the browser bar at runtime, so it keeps working
+# when this machine is given a new IP. Set VITE_API_URL here to pin one.
+VITE_API_URL=
+VITE_WS_URL=
+EOF
+    cp "$CITIZEN_DIR/.env.local" "$POLICE_DIR/.env.local"
+    write_text "$MOBILE_DIR/.env" <<EOF
+# Generated by scripts/start.sh. Left empty on purpose: the app reads the host
+# Metro is serving from (Constants.expoConfig.hostUri), so it follows this machine
+# to a new network automatically after you rescan the QR in Expo Go.
+EXPO_PUBLIC_API_URL=
+EOF
+  fi
   ok "wrote citizen_web/.env.local, police_dashboard/.env.local, mobile_app/.env"
 
   import_env "$ENV_PATH"
@@ -730,23 +795,43 @@ phone_state() {
 start_expo() {
   if [ "$NO_MOBILE" -eq 1 ]; then info "mobile app skipped (--no-mobile)"; return; fi
 
-  if service_running expo "$PORT_EXPO"; then
-    ok "Expo Metro already running (reusing it)"
-    FRESH=0
-    return
+  # Metro publishes the address it started with, so after the machine changes
+  # network it is the one process that is genuinely wrong. A reused Metro keeps
+  # advertising the old address: the phone cannot attach ("No apps connected") and
+  # the printed QR encodes an IP that no longer exists. So an IP change always
+  # restarts it, while an unchanged one still reuses it.
+  local prev_ip=""
+  if [ -f "$STATE_PATH" ]; then
+    prev_ip="$(sed -n 's/.*"ip"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE_PATH" | head -1)"
   fi
+
+  if service_running expo "$PORT_EXPO"; then
+    if [ -n "$prev_ip" ] && [ "$prev_ip" != "$LAN_IP" ]; then
+      warn "LAN IP changed $prev_ip -> $LAN_IP: restarting Metro so it advertises the new address"
+      stop_tracked expo || true
+      sleep 2
+    else
+      ok "Expo Metro already running (reusing it)"
+      FRESH=0
+      PHONE_STATE="$(phone_state)"
+      return
+    fi
+  fi
+
   npm_deps "$MOBILE_DIR" mobile-lock yes
   sync_expo_sdk
   assert_port_free "$PORT_EXPO" expo prompt
 
-  # --clear when anything that shapes the bundle changed since the last run.
+  # --clear when anything that shapes the bundle changed since the last run, and
+  # also when the network moved: the advertised host is part of what a stale
+  # Metro would keep serving.
   local cfg prev
   cfg="$(hash_of "$MOBILE_DIR/package.json")$(hash_of "$MOBILE_DIR/app.json")$(hash_of "$MOBILE_DIR/.env")"
   prev="$(hash_recorded expo-config)"
   local args="start --lan"
-  if [ "$REBUILD" -eq 1 ] || [ "$cfg" != "$prev" ]; then
+  if [ "$REBUILD" -eq 1 ] || [ "$cfg" != "$prev" ] || { [ -n "$prev_ip" ] && [ "$prev_ip" != "$LAN_IP" ]; }; then
     args="$args --clear"
-    info "mobile_app: config changed since last run - starting Metro with --clear"
+    info "mobile_app: config or network changed since last run - starting Metro with --clear"
   fi
   record_hash expo-config "$cfg"
 
@@ -763,7 +848,14 @@ start_expo() {
   esac
 
   if [ -f "$MOBILE_DIR/node_modules/expo/bin/cli" ]; then
-    start_process expo "Expo Metro" "$MOBILE_DIR" node node_modules/expo/bin/cli $args
+    # Pin the address Metro advertises. Left unset, Expo picks an interface itself
+    # and with a VPN or several virtual adapters present that is regularly the
+    # wrong one - the QR then points somewhere the phone cannot reach.
+    REACT_NATIVE_PACKAGER_HOSTNAME="$LAN_IP" \
+      start_process expo "Expo Metro" "$MOBILE_DIR" node node_modules/expo/bin/cli $args
+    ok "Expo Metro starting on $LAN_IP"
+    echo "  Expo URL   : exp://${LAN_IP}:${PORT_EXPO}"
+    info '"No apps connected" means the phone still points at the old address - rescan the QR.'
   else
     warn "expo CLI not installed - run: cd mobile_app && npm install && npx expo start --lan"
   fi
@@ -924,6 +1016,31 @@ mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 detect_lan_ip
 step "LAN IP    : $LAN_IP"
+
+# Remember the address, and say so when it moved since the previous run. This is
+# what makes a second run after a network change behave differently from the
+# first: Metro is restarted because the URL it advertises is now wrong.
+prev_ip=""
+if [ -f "$STATE_PATH" ]; then
+  # Read without a JSON parser: the file is written by this function and has one
+  # flat level under "state", so a single anchored match is exact. (json_get does
+  # not exist here, which is why hash_recorded has always silently returned empty.)
+  prev_ip="$(sed -n 's/.*"ip"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE_PATH" | head -1)"
+fi
+write_text "$STATE_PATH" <<EOF
+{
+  "state": {
+    "ip": "$LAN_IP",
+    "adapter": "$NET_ADAPTER",
+    "gateway": "$NET_GATEWAY",
+    "updatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  }
+}
+EOF
+if [ -n "$prev_ip" ] && [ "$prev_ip" != "$LAN_IP" ]; then
+  warn "network changed since the last run: $prev_ip -> $LAN_IP"
+  info "Metro will restart so it advertises the new address; web apps and backend keep running"
+fi
 
 # mode selection
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then

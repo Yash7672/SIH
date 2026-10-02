@@ -47,13 +47,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Origins on loopback or a private LAN address: 10/8, 172.16/12, 192.168/16.
+# Public addresses are deliberately absent - this widens the demo/dev surface,
+# not the production one.
+_PRIVATE_LAN_ORIGIN_RE = (
+    r"^https?://(localhost|127\.0\.0\.1|\[::1\]|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?$"
+)
+
+# Demo/dev only. With it off the explicit CORS_ORIGINS list is the whole policy.
+_allow_private_lan = settings.DEMO_MODE and settings.CORS_ALLOW_PRIVATE_NETWORK
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    allow_origin_regex=_PRIVATE_LAN_ORIGIN_RE if _allow_private_lan else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if _allow_private_lan:
+    logger.info(
+        "CORS: explicit origins %s plus any loopback/private-LAN origin (demo mode)",
+        settings.cors_origins_list,
+    )
 
 
 @app.get("/health")

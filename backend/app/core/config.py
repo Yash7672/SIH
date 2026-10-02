@@ -47,6 +47,17 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174"
 
+    # Allow any origin on a private/loopback address, not just the addresses
+    # spelled out in CORS_ORIGINS.
+    #
+    # CORS_ORIGINS is read once at import time, so a laptop that moves to a new
+    # Wi-Fi gets a new IP and every browser request from it is refused until the
+    # backend is restarted with an updated list. Matching private ranges by regex
+    # removes that whole failure mode: a new IP is accepted immediately, with no
+    # restart and nothing to re-generate. Restricted to demo/dev because in
+    # production the origin list must stay explicit.
+    CORS_ALLOW_PRIVATE_NETWORK: bool = True
+
     STORAGE_BACKEND: str = "local"
     STORAGE_LOCAL_PATH: str = "./data/uploads"
 

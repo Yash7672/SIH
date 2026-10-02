@@ -52,7 +52,9 @@ param(
 
     [switch] $ForceSeed,
 
-    [switch] $SkipFirewall
+    [switch] $SkipFirewall,
+
+    [switch] $NoWatch
 )
 
 # PowerShell 5.1 compatible on purpose: no ??, no ternary, no -AsHashtable.
@@ -71,6 +73,7 @@ $EnvPath = Join-Path $RepoRoot '.env'
 $EnvExamplePath = Join-Path $RepoRoot '.env.example'
 $PidsPath = Join-Path $StateDir 'pids.json'
 $HashesPath = Join-Path $StateDir 'hashes.json'
+$StatePath = Join-Path $StateDir 'state.json'
 $SeedMarkerPath = Join-Path $StateDir 'seed.done'
 
 $BackendDir = Join-Path $RepoRoot 'backend'
@@ -84,12 +87,21 @@ $Ports = @{ backend = 8000; citizen = 5173; police = 5174; expo = 8081 }
 
 $script:Completed = $false
 $script:LanIp = $null
+$script:NetAdapter = ''
+$script:NetGateway = ''
+$script:NetMetric = -1
+$script:NetProfile = 'unknown'
 $script:EffectiveMode = 'local'
 $script:Fresh = $true     # $false => every tracked service was already running
 $script:ExpoPending = $false
 $script:ExpoRunning = $false
 $script:PhoneState = 'not-checked'   # authorized | unauthorized | none | no-adb
 $script:AdbDownloaded = $false
+$script:WatchJob = $null
+$script:Restarting = $false
+# The address the PREVIOUS run recorded, captured before state.json is
+# overwritten. Start-Expo needs it to tell "reusing Metro" from "restart it".
+$script:PreviousLanIp = ''
 
 # --------------------------------------------------------------------------- #
 # Output helpers
@@ -259,6 +271,102 @@ function Stop-ProcessTree {
     if (Test-ProcessAlive $ProcessId) {
         try { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue } catch { }
     }
+}
+
+function Get-ProcessCommandLine {
+    <#
+        Needed before killing anything. The owning PID is on its own not enough to
+        tell "a leftover Metro from a crashed run" from "some other program that
+        happens to use port 8081" - killing the latter would be destructive and
+        confusing.
+    #>
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return '' }
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($p -and $p.CommandLine) { return [string]$p.CommandLine }
+    } catch { }
+    return ''
+}
+
+function Test-ProjectProcess {
+    <#
+        True when the process looks like ours: it was launched from this repo, or
+        it is one of the runtimes start.ps1 uses (expo/Metro, vite, uvicorn).
+
+        Returns an object with Reason so the caller can print *why* it decided,
+        which matters when the user is looking at "stopping node.exe".
+    #>
+    param([int]$ProcessId)
+
+    $cmd = Get-ProcessCommandLine -ProcessId $ProcessId
+    $proc = Get-ProcessInfo $ProcessId
+    $name = if ($proc) { $proc.ProcessName } else { 'unknown' }
+
+    if (-not $cmd) {
+        # No command line available (permissions, or already gone). Never guess
+        # that a process we cannot identify is ours.
+        return [pscustomobject]@{ Ours = $false; Reason = "command line unavailable for $name (pid $ProcessId)" }
+    }
+
+    if ($cmd -like "*$RepoRoot*") {
+        return [pscustomobject]@{ Ours = $true; Reason = "running from this repo ($name)" }
+    }
+    if ($cmd -match '(?i)expo(\\|/)bin(\\|/)cli|metro|@expo(\\|/)metro') {
+        return [pscustomobject]@{ Ours = $true; Reason = "Expo/Metro process ($name)" }
+    }
+    if ($cmd -match '(?i)vite(\\|/)bin(\\|/)vite\.js') {
+        return [pscustomobject]@{ Ours = $true; Reason = "Vite dev server ($name)" }
+    }
+    if ($cmd -match '(?i)uvicorn') {
+        return [pscustomobject]@{ Ours = $true; Reason = "uvicorn server ($name)" }
+    }
+
+    return [pscustomobject]@{ Ours = $false; Reason = "$name (pid $ProcessId) is not a RAKSHAK process" }
+}
+
+function Clear-OrphanOnPort {
+    <#
+        Frees a port that a previous run left behind.
+
+        Called before starting a service. Only processes that can be attributed to
+        this project are killed; anything else is reported by name so the user can
+        decide, instead of the script silently taking the port or silently dying.
+    #>
+    param(
+        [int] $Port,
+        [string] $ServiceName,
+        [switch] $Silent
+    )
+
+    $ownerPid = Get-ListeningPid -Port $Port
+    if ($ownerPid -le 0) { return $true }
+
+    $verdict = Test-ProjectProcess -ProcessId $ownerPid
+    if (-not $verdict.Ours) {
+        if (-not $Silent) {
+            Write-Warn2 ("TCP {0} is held by {1} - not a RAKSHAK process, leaving it alone" -f $Port, $verdict.Reason)
+        }
+        return $false
+    }
+
+    if (-not $Silent) {
+        Write-Warn2 ("cleaning up stale {0} on TCP {1} (pid {2}, {3})" -f $ServiceName, $Port, $ownerPid, $verdict.Reason)
+    }
+    Stop-ProcessTree -ProcessId $ownerPid
+
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and (Get-ListeningPid -Port $Port) -gt 0) {
+        Start-Sleep -Milliseconds 250
+    }
+    if ((Get-ListeningPid -Port $Port) -gt 0) {
+        Write-Warn2 ("TCP {0} is still held after stopping pid {1}" -f $Port, $ownerPid)
+        return $false
+    }
+    if (-not $Silent) {
+        Write-Ok ("TCP {0} is free" -f $Port)
+    }
+    return $true
 }
 
 function Test-TcpPort {
@@ -497,82 +605,157 @@ function Assert-Prerequisites {
 # --------------------------------------------------------------------------- #
 # Step 2 - LAN IP detection
 # --------------------------------------------------------------------------- #
+function Get-NetworkProfileName {
+    <#
+        Windows classifies a NEW network as Public, which blocks the inbound
+        connections the phone needs. Surfaced so the user can see it.
+    #>
+    try {
+        $profile = Get-NetConnectionProfile -ErrorAction Stop |
+            Where-Object { $_.IPv4Connectivity -ne 'Disconnected' } |
+            Select-Object -First 1
+        if ($profile) { return [string]$profile.NetworkCategory }
+    } catch { }
+    return 'unknown'
+}
+
 function Get-LanIpv4 {
-    param([string] $Override)
+    <#
+        Picks the address a phone would actually reach us on.
+
+        Ranking is by ROUTE METRIC of the default route (0.0.0.0/0) that the
+        adapter holds, lowest wins - that is what Windows itself uses to decide
+        where outbound traffic goes, so it stays correct with a VPN, WSL,
+        VirtualBox or a phone hotspot layered on top. Virtual adapters, APIPA
+        (169.254.x.x, i.e. "no DHCP lease yet") and loopback are excluded, and
+        an adapter that is not Up is skipped.
+    #>
+    param([string] $Override, [int] $WaitSeconds = 0)
 
     if ($Override) {
         if ($Override -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
             Die "-HostIp '$Override' is not a valid IPv4 address (example: -HostIp 192.168.1.20)"
         }
         Write-Info ("using -HostIp override: {0}" -f $Override)
+        $script:NetAdapter = 'pinned with -HostIp'
+        $script:NetGateway = ''
+        $script:NetMetric = -1
         return $Override
     }
 
-    $excluded = 'vEthernet|VirtualBox|VMware|WSL|Loopback|Hyper-V|Docker|WSL2|vbox|vmnet|TAP|Tailscale|ZeroTier|Loopback Pseudo'
-    $candidates = New-Object System.Collections.Generic.List[object]
+    $excluded = 'vEthernet|VirtualBox|VMware|WSL|Loopback|Hyper-V|Docker|WSL2|vbox|vmnet|TAP|Tailscale|ZeroTier|Bluetooth|Loopback Pseudo|Npcap'
+    $deadline = (Get-Date).AddSeconds([Math]::Max($WaitSeconds, 0))
 
-    try {
-        $configs = Get-NetIPConfiguration -ErrorAction Stop
-        foreach ($cfg in $configs) {
-            if (-not $cfg.IPv4Address) { continue }
-            $alias = [string]$cfg.InterfaceAlias
-            if ($alias -match $excluded) { continue }
-            $hasGateway = ($null -ne $cfg.IPv4DefaultGateway)
-            foreach ($v4 in $cfg.IPv4Address) {
-                $ip = [string]$v4.IPAddress
-                if (-not $ip) { continue }
-                if ($ip.StartsWith('127.')) { continue }      # loopback
-                if ($ip.StartsWith('169.254.')) { continue }  # APIPA / no DHCP
-                $score = 0
-                if ($hasGateway) { $score += 100 }            # default gateway => real LAN
-                if ($ip.StartsWith('192.168.')) { $score += 20 }
-                elseif ($ip.StartsWith('10.')) { $score += 15 }
-                elseif ($ip -match '^172\.(1[6-9]|2\d|3[01])\.') { $score += 10 }
-    if ($alias -match 'Wi-Fi|Wireless|WLAN|WiFi|Ethernet') { $score += 5 }
-                $candidates.Add([pscustomobject]@{ Ip = $ip; Alias = $alias; Gateway = $hasGateway; Score = $score })
-            }
-        }
-    } catch {
-        Write-Warn2 'Get-NetIPConfiguration failed, falling back to ipconfig parsing.'
-    }
+    while ($true) {
+        $candidates = New-Object System.Collections.Generic.List[object]
 
-    if ($candidates.Count -eq 0) {
+        # Lowest route metric wins, so a VPN or virtual switch with a small
+        # metric cannot hijack the choice.
+        $metricByAlias = @{}
         try {
-            $raw = & ipconfig.exe 2>$null | Out-String
-            $current = ''
-            foreach ($line in ($raw -split "`r?`n")) {
-                if ($line -match '^(.+?)\s*:.*adapter\s*$') { $current = $Matches[1].Trim() }
-                if ($line -match '^\s*IPv4 Address.*:\s*(\d{1,3}(\.\d{1,3}){3})') {
-                    $ip = $Matches[1]
-                    if ($ip.StartsWith('169.254.')) { continue }
-                    if ($ip.StartsWith('127.')) { continue }
-                    if ($current -match $excluded) { continue }
-                    $candidates.Add([pscustomobject]@{ Ip = $ip; Alias = $current; Gateway = $false; Score = 1 })
+            Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | ForEach-Object {
+                $alias = [string]$_.InterfaceAlias
+                $metric = [int]$_.RouteMetric
+                if (-not $metricByAlias.ContainsKey($alias) -or $metric -lt $metricByAlias[$alias]) {
+                    $metricByAlias[$alias] = $metric
                 }
             }
         } catch { }
+
+        try {
+            $configs = Get-NetIPConfiguration -ErrorAction Stop
+            foreach ($cfg in $configs) {
+                $alias = [string]$cfg.InterfaceAlias
+                if ($alias -match $excluded) { continue }
+
+                $up = $true
+                try { if ($cfg.NetAdapter -and $cfg.NetAdapter.Status -ne 'Up') { $up = $false } } catch { }
+                if (-not $up) { continue }
+
+                if (-not $cfg.IPv4Address) { continue }
+                $gateway = ''
+                if ($cfg.IPv4DefaultGateway) {
+                    foreach ($gw in $cfg.IPv4DefaultGateway) {
+                        if ([string]$gw.NextHop) { $gateway = [string]$gw.NextHop; break }
+                    }
+                }
+
+                $metric = if ($metricByAlias.ContainsKey($alias)) { $metricByAlias[$alias] } else { 9999 }
+
+                foreach ($v4 in $cfg.IPv4Address) {
+                    $ip = [string]$v4.IPAddress
+                    if (-not $ip) { continue }
+                    if ($ip.StartsWith('127.')) { continue }      # loopback
+                    if ($ip.StartsWith('169.254.')) { continue }  # APIPA: no DHCP lease
+
+                    # Lower total wins. Route metric is the primary signal
+                    # (Windows' own rule); a real gateway breaks ties.
+                    $score = (10000 - [Math]::Min($metric, 9999))
+                    if ($gateway) { $score += 5000 }
+                    if ($alias -match 'Wi-Fi|Wireless|WLAN|Ethernet') { $score += 200 }
+                    $candidates.Add([pscustomobject]@{
+                        Ip = $ip; Alias = $alias; Gateway = $gateway; Score = $score; Metric = $metric
+                    })
+                }
+            }
+        } catch {
+            Write-Warn2 'Get-NetIPConfiguration failed, falling back to ipconfig parsing.'
+        }
+
+        if ($candidates.Count -eq 0) {
+            try {
+                $raw = & ipconfig.exe 2>$null | Out-String
+                $current = ''
+                foreach ($line in ($raw -split "`r?`n")) {
+                    if ($line -match '^(.+?)\s*:.*adapter\s*$') { $current = $Matches[1].Trim() }
+                    if ($line -match '^\s*IPv4 Address.*:\s*(\d{1,3}(\.\d{1,3}){3})') {
+                        $ip = $Matches[1]
+                        if ($ip.StartsWith('169.254.')) { continue }
+                        if ($ip.StartsWith('127.')) { continue }
+                        if ($current -match $excluded) { continue }
+                        $candidates.Add([pscustomobject]@{
+                            Ip = $ip; Alias = $current; Gateway = ''; Score = 1; Metric = -1
+                        })
+                    }
+                }
+            } catch { }
+        }
+
+        if ($candidates.Count -gt 0) {
+            $best = $candidates | Sort-Object -Property Score -Descending | Select-Object -First 1
+            $script:NetAdapter = [string]$best.Alias
+            $script:NetGateway = [string]$best.Gateway
+            $script:NetMetric = [int]$best.Metric
+
+            if ($candidates.Count -gt 1) {
+                $others = ($candidates | Where-Object { $_.Ip -ne $best.Ip } |
+                    ForEach-Object { "$($_.Ip) ($($_.Alias), metric $($_.Metric))" }) -join ', '
+                Write-Warn2 ("more than one usable adapter - using {0}. Ignored: {1}" -f $best.Alias, $others)
+                Write-Info 'override the choice with -HostIp if the phone is on a different network'
+            }
+            return [string]$best.Ip
+        }
+
+        if ((Get-Date) -ge $deadline) { break }
+        # A machine that just woke from sleep, or just joined Wi-Fi, often needs
+        # a few seconds before DHCP hands out an address.
+        Start-Sleep -Seconds 2
     }
 
-    if ($candidates.Count -eq 0) {
-        Write-Warn2 'Could not detect a LAN IPv4 address automatically.'
-        Write-Warn2 'Falling back to 127.0.0.1 - a phone will NOT be able to reach the demo.'
-        Write-Warn2 'Re-run with an explicit address if needed:  .\start.bat -HostIp 192.168.1.20'
-        return '127.0.0.1'
-    }
-
-    $best = $candidates | Sort-Object -Property Score -Descending | Select-Object -First 1
-    if ($candidates.Count -gt 1) {
-        $others = ($candidates | Where-Object { $_.Ip -ne $best.Ip } | ForEach-Object { "$($_.Ip) ($($_.Alias))" }) -join ', '
-        Write-Info ("other adapters ignored: {0}" -f $others)
-    }
-    return $best.Ip
+    Write-Warn2 'Could not detect a LAN IPv4 address automatically.'
+    Write-Warn2 'Falling back to 127.0.0.1 - a phone will NOT be able to reach the demo.'
+    Write-Warn2 'Re-run with an explicit address if needed:  .\start.bat -HostIp 192.168.1.20'
+    $script:NetAdapter = 'none'
+    $script:NetGateway = ''
+    $script:NetMetric = -1
+    return '127.0.0.1'
 }
 
 # --------------------------------------------------------------------------- #
 # Step 3 + 4 - env files
 # --------------------------------------------------------------------------- #
 function Initialize-EnvFiles {
-    param([string] $Ip)
+    param([string] $Ip, [switch] $PinIp)
 
     $apiBase = "http://${Ip}:8000"
     $wsBase = "ws://${Ip}:8000"
@@ -604,6 +787,7 @@ DEMO_MODE=true
 
 # --- CORS ---
 CORS_ORIGINS=http://localhost:5173,http://localhost:5174
+CORS_ALLOW_PRIVATE_NETWORK=true
 
 # --- Storage ---
 STORAGE_BACKEND=local
@@ -621,33 +805,74 @@ API_BASE_URL=http://localhost:8000
         Write-Info '.env already exists - existing values are preserved'
     }
 
-    # Only these generated keys are rewritten; everything else the user typed stays.
-    $cors = "http://localhost:5173,http://localhost:5174,http://${Ip}:5173,http://${Ip}:5174"
+    # CORS deliberately does NOT list the current LAN IP.
+    #
+    # It used to, and that was the root of the "it works until I change network"
+    # bug: the list only takes effect when uvicorn restarts, so a new IP meant
+    # either a stale allow-list (browser CORS errors, dead live feed) or a forced
+    # backend restart on every network change. main.py now also accepts any
+    # loopback/private-LAN origin via CORS_ALLOW_PRIVATE_NETWORK, so the explicit
+    # list stays IP-independent and .env stops churning.
+    $cors = 'http://localhost:5173,http://localhost:5174'
     Set-DotEnvValue -Path $EnvPath -Key 'CORS_ORIGINS' -Value $cors
+    Set-DotEnvValue -Path $EnvPath -Key 'CORS_ALLOW_PRIVATE_NETWORK' -Value 'true'
     Set-DotEnvValue -Path $EnvPath -Key 'API_BASE_URL' -Value $apiBase
-    Set-DotEnvValue -Path $EnvPath -Key 'VITE_API_URL' -Value $apiBase
-    Set-DotEnvValue -Path $EnvPath -Key 'VITE_WS_URL' -Value $wsBase
-    Set-DotEnvValue -Path $EnvPath -Key 'EXPO_PUBLIC_API_URL' -Value $apiBase
-    Write-Ok ('.env updated: CORS_ORIGINS, API_BASE_URL, VITE_API_URL, VITE_WS_URL, EXPO_PUBLIC_API_URL -> {0}' -f $apiBase)
 
-    # Frontend env files: the LAN IP so the PC browser AND the phone both work.
-    Write-TextFile (Join-Path $CitizenDir '.env.local') @"
-# Generated by scripts/start.ps1 - the host the *browser* uses.
-# Do not use "backend:8000" here: that name only resolves inside Docker.
+    # VITE_API_URL / EXPO_PUBLIC_API_URL are left EMPTY unless the IP was pinned
+    # explicitly with -HostIp.
+    #
+    # Vite inlines VITE_* into the JS bundle at build time and Metro inlines
+    # EXPO_PUBLIC_* at bundle time, so writing the IP here froze one address into
+    # the bundle and the client kept dialling it after the router moved the PC.
+    # Every client now derives its host at runtime instead (see the resolve*
+    # helpers in the web apps and mobile_app/src/services/api.js), so these are
+    # only written when a specific address was demanded.
+    if ($PinIp) {
+        Set-DotEnvValue -Path $EnvPath -Key 'VITE_API_URL' -Value $apiBase
+        Set-DotEnvValue -Path $EnvPath -Key 'VITE_WS_URL' -Value $wsBase
+        Set-DotEnvValue -Path $EnvPath -Key 'EXPO_PUBLIC_API_URL' -Value $apiBase
+        Write-Warn2 ("pinned VITE_API_URL / EXPO_PUBLIC_API_URL to {0} (-HostIp). Clear these to go back to auto-detection." -f $apiBase)
+    } else {
+        Set-DotEnvValue -Path $EnvPath -Key 'VITE_API_URL' -Value ''
+        Set-DotEnvValue -Path $EnvPath -Key 'VITE_WS_URL' -Value ''
+        Set-DotEnvValue -Path $EnvPath -Key 'EXPO_PUBLIC_API_URL' -Value ''
+        Write-Ok ('.env updated: CORS_ORIGINS (private LAN allowed), API_BASE_URL -> {0}; client URLs left empty for runtime resolution' -f $apiBase)
+    }
+
+    # Frontend env files. Same rule: empty unless the IP was pinned, so a network
+    # change never requires rebuilding either web app.
+    $webEnv = if ($PinIp) {
+@"
+# Generated by scripts/start.ps1 - host PINNED with -HostIp.
 VITE_API_URL=$apiBase
 VITE_WS_URL=$wsBase
 "@
-    Write-TextFile (Join-Path $PoliceDir '.env.local') @"
-# Generated by scripts/start.ps1 - the host the *browser* uses.
-# Do not use "backend:8000" here: that name only resolves inside Docker.
-VITE_API_URL=$apiBase
-VITE_WS_URL=$wsBase
+    } else {
+@"
+# Generated by scripts/start.ps1. Left empty on purpose: each app derives the
+# backend host from window.location at runtime, so it keeps working when the
+# router hands this PC a new address. Set VITE_API_URL here to pin one.
+VITE_API_URL=
+VITE_WS_URL=
 "@
-    Write-TextFile (Join-Path $MobileDir '.env') @"
-# Generated by scripts/start.ps1. EXPO_PUBLIC_* is inlined into the JS bundle at
-# Metro start time, so the phone gets the PC's LAN IP instead of localhost.
+    }
+    Write-TextFile (Join-Path $CitizenDir '.env.local') $webEnv
+    Write-TextFile (Join-Path $PoliceDir '.env.local') $webEnv
+
+    $mobileEnv = if ($PinIp) {
+@"
+# Generated by scripts/start.ps1. EXPO_PUBLIC_API_URL PINNED with -HostIp.
 EXPO_PUBLIC_API_URL=$apiBase
 "@
+    } else {
+@"
+# Generated by scripts/start.ps1. Left empty on purpose: the app reads the host
+# Metro is serving from (Constants.expoConfig.hostUri), so it follows the PC to
+# a new network automatically after you rescan the QR in Expo Go.
+EXPO_PUBLIC_API_URL=
+"@
+    }
+    Write-TextFile (Join-Path $MobileDir '.env') $mobileEnv
     Write-Ok 'wrote citizen_web/.env.local, police_dashboard/.env.local, mobile_app/.env'
 
     Import-DotEnv -Path $EnvPath
@@ -657,6 +882,16 @@ EXPO_PUBLIC_API_URL=$apiBase
 # Step 5 - firewall
 # --------------------------------------------------------------------------- #
 function Initialize-Firewall {
+    <#
+        Opens 8000 / 5173 / 5174 / 8081 for inbound traffic.
+
+        Windows classifies a network it has not seen before as Public, and Public
+        blocks inbound by default - so joining a new Wi-Fi silently breaks the
+        phone with no error anywhere. The rules are therefore created with
+        -Profile Any rather than Private only, and any older RAKSHAK-* rule is
+        replaced, because a rule left over from a previous run with a narrower
+        profile would otherwise keep blocking the port.
+    #>
     param([string] $Ip)
 
     $definitions = @(
@@ -666,36 +901,150 @@ function Initialize-Firewall {
         @{ Port = 8081; Name = 'RAKSHAK-EXPO-8081';   What = 'Expo Metro (QR code)' }
     )
 
-    $isAdmin = Test-Admin
     if ($SkipFirewall) {
         Write-Info 'firewall step skipped (-SkipFirewall)'
         return
     }
-    if (-not $isAdmin) {
-        Write-Warn2 'not running as Administrator - firewall rules were NOT added'
-        Write-Warn2 'the phone can still connect if Windows Firewall is off or the node/Private profile prompts "Allow access"'
-        Write-Warn2 'to allow it once, open PowerShell as Administrator and run:'
-        $oneLiner = ($definitions | ForEach-Object {
-            "New-NetFirewallRule -DisplayName '$($_.Name)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $($_.Port) -Profile Private,Public"
-        }) -join '; '
+
+    # Report the active profile: on a fresh network this is what decides whether
+    # the rules below matter at all.
+    $script:NetProfile = Get-NetworkProfileName
+    $profileText = if ($script:NetProfile -eq 'unknown') { 'unknown' } else { [string]$script:NetProfile }
+    if ($profileText -eq 'Public') {
+        # Worth saying out loud: a network Windows has not seen before is always
+        # Public, and Public blocks inbound by default, so a newly joined Wi-Fi or
+        # hotspot is the classic reason the phone suddenly cannot reach the PC.
+        Write-Info ('active network profile: Public (inbound blocked unless an allow rule exists)')
+    } else {
+        Write-Info ("active network profile: {0}" -f $profileText)
+    }
+
+    # The admin one-liner is built first so it can be printed in either branch.
+    $oneLiner = 'Get-NetFirewallRule -DisplayName RAKSHAK-* -ErrorAction SilentlyContinue | Remove-NetFirewallRule; ' +
+        (($definitions | ForEach-Object {
+            "New-NetFirewallRule -DisplayName '$($_.Name)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $($_.Port) -Profile Any"
+        }) -join '; ')
+
+    if (-not (Test-Admin)) {
+        Write-Info 'not running as Administrator - the firewall step cannot change anything'
+        # Reading rules works without admin, so we can still tell the user whether
+        # they need to do anything at all instead of always shouting.
+        $script:HasFirewallRules = @(Get-NetFirewallRule -DisplayName 'RAKSHAK-*' -ErrorAction SilentlyContinue)
+        if ($script:HasFirewallRules.Count -gt 0) {
+            Write-Ok ('RAKSHAK firewall rules already present ({0}) - nothing to do' -f (($script:HasFirewallRules | ForEach-Object { $_.DisplayName }) -join ', '))
+            return
+        }
+
+        # No RAKSHAK rules - but that is not automatically a problem. When Windows
+        # asks "Allow access" the first time a server binds a port it creates
+        # *program*-scoped rules (node.exe, python.exe) instead, and those already
+        # cover all four ports. Check for those before warning: warning about a
+        # blocked phone when the phone works fine trains the user to ignore the
+        # message that matters.
+        $programRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
+            Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Allow' -and $_.Direction -eq 'Inbound' -and
+                           $_.DisplayName -match '^(node|python)' })
+        if ($programRules.Count -gt 0) {
+            Write-Ok ('inbound is already allowed for {0} (program-scoped rules Windows created earlier)' -f
+                (($programRules | ForEach-Object { $_.DisplayName } | Sort-Object -Unique) -join ', '))
+            Write-Info 'these cover 8000 / 5173 / 5174 / 8081 on any network, including a new Wi-Fi'
+            return
+        }
+
+        Write-Warn2 'no inbound allow rule exists, and the profile blocks it - the phone cannot reach this PC'
+        Write-Warn2 'open PowerShell AS ADMINISTRATOR and paste this single line:'
         Write-Host ("      " + $oneLiner) -ForegroundColor DarkYellow
         return
     }
 
     foreach ($def in $definitions) {
         try {
-            $existing = Get-NetFirewallRule -DisplayName $def.Name -ErrorAction SilentlyContinue
-            if ($existing) {
-                Write-Info ("firewall rule '{0}' already exists" -f $def.Name)
+            $existing = @(Get-NetFirewallRule -DisplayName $def.Name -ErrorAction SilentlyContinue)
+            $needsReplace = $false
+            foreach ($rule in $existing) {
+                # A rule scoped to a profile that is not Any would keep blocking
+                # the port on a newly-joined Public network.
+                $profiles = [string]$rule.Profile
+                if ($profiles -ne 'Any') { $needsReplace = $true }
+            }
+            if ($existing.Count -gt 0 -and -not $needsReplace) {
+                Write-Info ("firewall rule '{0}' already exists (Profile Any)" -f $def.Name)
                 continue
             }
+            if ($needsReplace) {
+                Write-Info ("replacing firewall rule '{0}' - it was limited to a narrower profile" -f $def.Name)
+                $existing | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            }
             New-NetFirewallRule -DisplayName $def.Name -Direction Inbound -Action Allow -Protocol TCP `
-                -LocalPort $def.Port -Profile Private,Public -Description "RAKSHAK demo: $($def.What)" | Out-Null
-            Write-Ok ("firewall rule '{0}' opened on TCP {1}" -f $def.Name, $def.Port)
+                -LocalPort $def.Port -Profile Any -Description "RAKSHAK demo: $($def.What)" | Out-Null
+            Write-Ok ("firewall rule '{0}' opened on TCP {1} (profile Any)" -f $def.Name, $def.Port)
         } catch {
             Write-Warn2 ("could not add firewall rule '{0}': {1}" -f $def.Name, $_.Exception.Message)
         }
     }
+}
+
+function Write-ExpoQr {
+    <#
+        Prints a scannable QR for the Expo URL in the main window.
+
+        Expo already prints one in its own window; this is the copy you can see
+        without hunting for that window, and it is the thing that actually
+        changes after a network switch, so it belongs next to the summary.
+
+        Rendered by scripts/qr.js using the `toqr` encoder already present in
+        mobile_app/node_modules - no new dependency. If node or the encoder is
+        unavailable the URL is still printed, so this can never block a start.
+    #>
+    param([string] $Url)
+
+    $qrScript = Join-Path $ScriptDir 'qr.js'
+    if (-not (Test-Path -LiteralPath $qrScript)) {
+        Write-Info "QR script missing - type this into Expo Go manually: $Url"
+        return
+    }
+
+    $nodeExe = Test-Command -Name 'node'
+    if (-not $nodeExe) {
+        Write-Info "node not on PATH - type this into Expo Go manually: $Url"
+        return
+    }
+
+    try {
+        $lines = @(& $nodeExe $qrScript $Url 2>$null)
+        $code = $LASTEXITCODE
+    } catch {
+        $lines = @()
+        $code = 1
+    }
+
+    if ($code -ne 0 -or $lines.Count -eq 0) {
+        Write-Info "could not render the QR code - type this into Expo Go manually: $Url"
+        return
+    }
+
+    foreach ($line in $lines) {
+        # Two leading spaces keeps the code aligned under the summary block.
+        Write-Host ('  ' + $line) -ForegroundColor White
+    }
+}
+
+function Write-NetworkState {
+    <#
+        Persists the detected network so the NEXT run can tell whether it moved.
+
+        Without this, a second start.bat had no way to know the address had
+        changed and reused a Metro that was still advertising the old one.
+    #>
+    param([string] $Ip)
+
+    $state = Get-StateMap -Path $StatePath -Property 'state'
+    $state['ip'] = $Ip
+    $state['adapter'] = $script:NetAdapter
+    $state['gateway'] = $script:NetGateway
+    $state['profile'] = $script:NetProfile
+    $state['updatedAt'] = (Get-Date).ToString('o')
+    Write-JsonFile $StatePath ([pscustomobject]@{ state = $state })
 }
 
 # --------------------------------------------------------------------------- #
@@ -793,30 +1142,54 @@ function Assert-PortFree {
     $ownerPid = Get-ListeningPid -Port $Port
     if ($ownerPid -le 0) { return $true }
 
+    # Was it started by a previous run of this script? (pids.json survives a
+    # crash, a closed window and a laptop sleep.)
     $map = Get-PidMap
-    $ours = $false
+    $tracked = $false
     if ($map.ContainsKey($ServiceName)) {
         $entry = $map[$ServiceName]
         $trackedPid = 0
         if ($entry -is [int] -or $entry -is [long]) { $trackedPid = [int]$entry }
         else { $trackedPid = [int]$entry.pid }
-        if ($trackedPid -eq $ownerPid) { $ours = $true }
+        if ($trackedPid -eq $ownerPid) { $tracked = $true }
     }
 
     $proc = Get-ProcessInfo $ownerPid
     $procName = if ($proc) { $proc.ProcessName } else { 'unknown process' }
     Write-Warn2 ("TCP {0} is already in use by {1} (pid {2})" -f $Port, $procName, $ownerPid)
 
-    if ($ours) {
+    if ($tracked) {
         Write-Info "that is the $ServiceName this script started earlier - reusing it"
         return $true
     }
 
-    if ($AllowReuse) {
-        Write-Warn2 ("stopping the process holding TCP {0}" -f $Port)
+    # Not tracked. Only take the port if the process can be attributed to this
+    # project - otherwise a stale Metro from a crashed run would block the start
+    # forever, and an unrelated program would be killed by surprise.
+    $verdict = Test-ProjectProcess -ProcessId $ownerPid
+    if ($verdict.Ours) {
+        Write-Info ("untracked but recognisable as ours: {0}" -f $verdict.Reason)
         Stop-ProcessTree -ProcessId $ownerPid
-        Start-Sleep -Milliseconds 700
-        return ((Get-ListeningPid -Port $Port) -le 0)
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline -and (Get-ListeningPid -Port $Port) -gt 0) {
+            Start-Sleep -Milliseconds 250
+        }
+        if ((Get-ListeningPid -Port $Port) -gt 0) {
+            Die ("TCP {0} is still held after stopping pid {1} ({2})." -f $Port, $ownerPid, $verdict.Reason)
+        }
+        Write-Ok ("freed TCP {0}" -f $Port)
+        return $true
+    }
+
+    # Someone else's program. Name it precisely and refuse, rather than guessing.
+    $cmd = Get-ProcessCommandLine -ProcessId $ownerPid
+    Write-Warn2 ("TCP {0} is held by a program that is not part of RAKSHAK: {1}" -f $Port, $verdict.Reason)
+    if ($cmd) {
+        Write-Host ('      ' + $cmd) -ForegroundColor DarkYellow
+    }
+
+    if ($AllowReuse) {
+        Die ("TCP {0} is held by {1}. Stop it yourself, then re-run start.bat." -f $Port, $verdict.Reason)
     }
 
     $answer = Confirm-Question ("Stop {0} (pid {1}) and continue? This will interrupt whatever it is running" -f $procName, $ownerPid)
@@ -1307,22 +1680,58 @@ function Sync-ExpoSdk {
     }
 }
 
+function Stop-ExpoIfRunning {
+    <#
+        Metro is the one service that is useless after an IP change: it advertises
+        the address it started with, so the phone cannot attach to a stale one.
+        Reused processes are killed here rather than left running, which is what
+        produced "No apps connected" and a QR code for an IP that no longer
+        existed.
+    #>
+    $owner = Get-ListeningPid -Port $Ports.expo
+    if ($owner -le 0) { return }
+    Write-Warn2 ("stopping Expo Metro (pid {0}) - it advertises the old network address" -f $owner)
+    Stop-ProcessTree -ProcessId $owner
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline -and (Get-ListeningPid -Port $Ports.expo) -gt 0) {
+        Start-Sleep -Milliseconds 250
+    }
+    $script:ExpoRunning = $false
+}
+
 function Start-Expo {
     if ($NoMobile) {
         Write-Info 'mobile app skipped (-NoMobile)'
         return
     }
 
+    # The IP this run started on, compared against the address the PREVIOUS run
+    # recorded. That value is captured in step 2, before Write-NetworkState
+    # overwrites state.json - re-reading the file here would always see the
+    # current IP and the restart would never trigger.
+    $prevIp = [string]$script:PreviousLanIp
+    $ipChanged = ($prevIp -ne '' -and $prevIp -ne $script:LanIp)
+
     if ((Get-ListeningPid -Port $Ports.expo) -gt 0) {
-        Write-Ok 'Expo Metro already running (reusing it)'
-        $script:Fresh = $false
-        $script:ExpoRunning = $true
-        return
+        if ($ipChanged) {
+            Write-Warn2 ("LAN IP changed {0} -> {1}: restarting Metro so it advertises the new address" -f $prevIp, $script:LanIp)
+            Stop-ExpoIfRunning
+        } else {
+            Write-Ok 'Expo Metro already running (reusing it)'
+            $script:Fresh = $false
+            $script:ExpoRunning = $true
+            # The reuse path used to return before the phone was ever looked at,
+            # so "plug the phone in, then re-run start.bat" could never work:
+            # Metro was reused, --android was skipped and the summary said
+            # SKIPPED. Detect the phone here too.
+            $script:PhoneState = Get-PhoneConnection
+            return
+        }
     }
 
     Initialize-NodeDeps -Dir $MobileDir -Key 'mobile-lock' -AllowInstall | Out-Null
     Sync-ExpoSdk
-    Assert-PortFree -Port $Ports.expo -ServiceName 'expo' | Out-Null
+    Assert-PortFree -Port $Ports.expo -ServiceName 'expo' -AllowReuse | Out-Null
 
     # --clear whenever something that shapes the bundle changed since the last
     # run: package.json, app.json or the API URL. A stale Metro cache is the
@@ -1342,9 +1751,9 @@ function Start-Expo {
     # Metro has to run on the HOST: a container breaks LAN/QR discovery, which is
     # exactly how the phone finds the demo server.
     $cliArgs = @('start', '--lan')
-    if ($Rebuild -or $configChanged) {
+    if ($Rebuild -or $configChanged -or $ipChanged) {
         $cliArgs += '--clear'
-        Write-Info 'mobile_app: config changed since last run - starting Metro with --clear'
+        Write-Info 'mobile_app: config or network changed since last run - starting Metro with --clear'
     }
 
     # A USB-attached phone lets the CLI install/open the matching Expo Go on it.
@@ -1367,10 +1776,16 @@ function Start-Expo {
     # brand new console and detaches it from this script's stdout, so a piped or
     # redirected start.ps1 call returns instead of hanging on the Metro process.
     Write-Step 'starting Expo Metro on the host (a new window opens with the QR code)'
+
+    # REACT_NATIVE_PACKAGER_HOSTNAME pins the address Metro advertises in the QR
+    # and in exp:// URLs. Left unset, Metro picks an adapter itself and on a
+    # laptop with a VPN, WSL or VirtualBox adapter that is regularly the wrong
+    # one - the QR then points somewhere the phone cannot reach. set/ restores
+    # afterwards so this script's own environment is untouched.
     $inner = '"' + $launcher.FilePath + '" ' + (($launcher.Arguments | ForEach-Object {
         if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
     }) -join ' ')
-    $inner = 'cd /d "' + $MobileDir + '" && ' + $inner
+    $inner = 'cd /d "' + $MobileDir + '" && set "REACT_NATIVE_PACKAGER_HOSTNAME=' + $script:LanIp + '" && ' + $inner
 
     try {
         Start-Process -FilePath $env:ComSpec `
@@ -1383,9 +1798,82 @@ function Start-Expo {
 
     # Track whatever ends up owning TCP 8081 so stop.ps1 can kill it. Resolved
     # after Metro binds the port, because `start` returns before that.
-    Write-Ok 'Expo Metro starting - look for the QR code in the new window'
-    Write-Info '  (press r to reload, a for Android, or scan the QR with Expo Go)'
+    Write-Ok ("Expo Metro starting on {0} - QR code in the new window" -f $script:LanIp)
+    Write-Host ('  Expo URL   : exp://{0}:{1}' -f $script:LanIp, $Ports.expo) -ForegroundColor Cyan
+    Write-Info '  (in the Expo window: r reloads, a opens Android)'
+    Write-Info '  "No apps connected" means the phone still points at the old address - rescan the QR.'
     $script:ExpoPending = $true
+}
+
+function Watch-Network {
+    <#
+        Polls the LAN address while the demo runs and restarts ONLY Metro when it
+        moves.
+
+        Metro bakes the address it advertises into its QR code and its exp:// URL,
+        so after a network change it is the one process that is genuinely wrong.
+        The backend and both Vite servers resolve the host at runtime and keep
+        working untouched, so restarting anything else would be pure disruption.
+
+        The address is re-read from Windows on each poll rather than re-detected
+        from scratch, so a second adapter appearing cannot change the answer.
+    #>
+    param([string] $Ip, [int] $IntervalSeconds = 10)
+
+    Write-Host ''
+    Write-Host ("  Watching the network every {0}s - Ctrl+C in this window stops everything." -f $IntervalSeconds) -ForegroundColor DarkGray
+
+    while ($true) {
+        Start-Sleep -Seconds $IntervalSeconds
+        if ($script:Completed) { return }
+
+        try {
+            $current = Get-LanIpv4
+        } catch {
+            continue
+        }
+
+        if ($current -eq $Ip) { continue }
+
+        # Never re-enter while a restart is already in flight, or a flapping
+        # adapter would start Metro repeatedly.
+        if ($script:Restarting) { continue }
+        $script:Restarting = $true
+        try {
+            Write-Host ''
+            Write-Banner ("Network changed: {0} -> {1}" -f $Ip, $current) Yellow
+            Write-Info 'only Metro is restarted: it is the one process that advertises an address'
+            Write-Info 'the web apps and the backend follow the new IP on their own'
+
+            $Ip = $current
+            $script:LanIp = $current
+            $script:NetProfile = Get-NetworkProfileName
+            Write-NetworkState -Ip $current
+
+            # Clear the recorded bundle hash so Start-Expo adds --clear: the QR and
+            # the advertised URL are part of what a stale Metro would serve.
+            try {
+                $hashes = Get-StateMap -Path $HashesPath -Property 'hashes'
+                $hashes['expo-config'] = 'network-changed'
+                Write-JsonFile $HashesPath ([pscustomobject]@{ hashes = $hashes })
+            } catch { }
+
+            $script:ExpoRunning = $false
+            Start-Expo
+            Resolve-ExpoPid
+
+            $newUrl = "exp://{0}:8081" -f $current
+            Write-Host ''
+            Write-Host ('  New Expo URL : {0}' -f $newUrl) -ForegroundColor Cyan
+            Write-Host '  Rescan the QR in Expo Go - the old one points at an address that no longer exists.' -ForegroundColor Yellow
+            Write-Host ('  Phone test   : http://{0}:8000/healthz' -f $current) -ForegroundColor DarkGray
+            Write-ExpoQr -Url $newUrl
+        } catch {
+            Write-Warn2 ("could not restart Metro after the network change: {0}" -f $_.Exception.Message)
+        } finally {
+            $script:Restarting = $false
+        }
+    }
 }
 
 function Resolve-ExpoPid {
@@ -1597,6 +2085,23 @@ function Write-FinalSummary {
 
     Write-Banner 'RAKSHAK is up' Green
     Write-SummaryTable -Results $Results -Ip $Ip
+
+    # Which adapter the address came from. With a VPN, WSL, VirtualBox or a
+    # hotspot layered on there is more than one plausible candidate, and the
+    # usual cause of "the phone cannot reach it" is simply having picked the wrong
+    # one - so the choice is shown rather than hidden.
+    Write-Host ''
+    Write-Host '  Network' -ForegroundColor Yellow
+    $metricText = if ($script:NetMetric -ge 0) { "route metric $($script:NetMetric)" } else { 'route metric n/a' }
+    $gatewayText = if ($script:NetGateway) { $script:NetGateway } else { 'none' }
+    Write-Host '    Adapter   : ' -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0}  ({1}, gateway {2})" -f $script:NetAdapter, $metricText, $gatewayText) -ForegroundColor Cyan
+    Write-Host '    Profile   : ' -NoNewline -ForegroundColor DarkGray
+    if ($script:NetProfile -eq 'Public') {
+        Write-Host 'Public  (inbound needs an allow rule - checked below)' -ForegroundColor Cyan
+    } else {
+        Write-Host $script:NetProfile -ForegroundColor Cyan
+    }
     Write-ServiceFailureLogs -Results $Results
 
     Write-Host ''
@@ -1617,18 +2122,23 @@ function Write-FinalSummary {
     Write-Host '    Expo SDK   : ' -NoNewline -ForegroundColor DarkGray
     Write-Host $expoSdk -ForegroundColor Cyan
     Write-Host '    Expo URL   : ' -NoNewline -ForegroundColor DarkGray
-    Write-Host "exp://${Ip}:8081" -ForegroundColor Cyan
+    $expoUrl = "exp://${Ip}:8081"
+    Write-Host $expoUrl -ForegroundColor Cyan
+
+    # Where the app will look for the backend. It derives this from the Metro host
+    # at runtime, so it follows the PC onto a new network once the QR is rescanned
+    # - no .env holds an address any more.
     Write-Host '    API target : ' -NoNewline -ForegroundColor DarkGray
-    $apiUrl = 'not set'
-    try {
-        $mobileEnv = Join-Path $MobileDir '.env'
-        if (Test-Path -LiteralPath $mobileEnv) {
-            $line = Select-String -LiteralPath $mobileEnv -Pattern 'EXPO_PUBLIC_API_URL' -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if ($line) { $apiUrl = ($line.Line -split '=', 2)[1].Trim() }
-        }
-    } catch { $apiUrl = 'not set' }
-    Write-Host $apiUrl -ForegroundColor Cyan
+    Write-Host ('http://{0}:8000  (derived from the Metro host at runtime)' -f $Ip) -ForegroundColor Cyan
+
+    if (-not $NoMobile) {
+        # The QR code, printed here as well as in the Expo window.
+        Write-Host ''
+        Write-Host ('  Phone: open Expo Go and scan the QR (or Enter URL manually: exp://{0}:8081).' -f $Ip) -ForegroundColor Green
+        Write-Host '  After switching network you must rescan once.' -ForegroundColor Green
+        Write-Host ''
+        Write-ExpoQr -Url $expoUrl
+    }
 
     if (-not $NoMobile) {
         # Exactly one line, and only when it is actually needed.
@@ -1651,6 +2161,12 @@ function Write-FinalSummary {
 
     Write-Host ''
     Write-Host '  On your phone: same Wi-Fi as this PC, open Expo Go / the dev client and scan the QR' -ForegroundColor Green
+
+    # The single most useful diagnostic when the phone cannot connect: if the
+    # backend is reachable from the phone browser, the problem is the QR/Metro
+    # side, not the network.
+    Write-Host ('  Phone test : open http://{0}:8000/healthz in the phone browser.' -f $Ip) -ForegroundColor DarkGray
+    Write-Host '  If that does not load: same Wi-Fi? hotspot/guest or router "AP isolation" blocks device-to-device traffic.' -ForegroundColor DarkGray
 
     if ($script:Fresh) {
         Write-Host ''
@@ -1741,11 +2257,30 @@ try {
     Write-Info ("repository : {0}" -f $RepoRoot)
 
     # --- Step 2 first: the IP decides every URL we are about to write --------- #
-    $script:LanIp = Get-LanIpv4 -Override $HostIp
+    $script:LanIp = Get-LanIpv4 -Override $HostIp -WaitSeconds 20
     Write-Step ("LAN IP    : {0}" -f $script:LanIp)
 
     if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
     if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+    # Remember the address, and say so when it moved since the previous run. This
+    # is what makes a second run after a network switch behave differently from
+    # the first: Metro is restarted because the URL it advertises is now wrong.
+    $previousIp = ''
+    if (Test-Path -LiteralPath $StatePath) {
+        $prevState = Get-StateMap -Path $StatePath -Property 'state'
+        if ($prevState.ContainsKey('ip')) { $previousIp = [string]$prevState['ip'] }
+    }
+    # Kept for Start-Expo, which runs later and after state.json has been
+    # overwritten with the current address.
+    $script:PreviousLanIp = $previousIp
+
+    $script:NetProfile = Get-NetworkProfileName
+    Write-NetworkState -Ip $script:LanIp
+    if ($previousIp -and $previousIp -ne $script:LanIp) {
+        Write-Warn2 ("network changed since the last run: {0} -> {1}" -f $previousIp, $script:LanIp)
+        Write-Info 'Metro restarts to advertise the new address; the web apps and backend keep running'
+    }
 
     # --- mode selection ------------------------------------------------------ #
     $dockerAvailable = $false
@@ -1784,7 +2319,10 @@ try {
     Assert-Prerequisites -InMode $script:EffectiveMode
 
     # --- Step 3 + 4 ---------------------------------------------------------- #
-    Initialize-EnvFiles -Ip $script:LanIp
+    # -PinIp only when the address was given explicitly. Otherwise the generated
+    # client env files are left empty so each app resolves its host at runtime and
+    # keeps working after the next network change.
+    Initialize-EnvFiles -Ip $script:LanIp -PinIp:([bool]$HostIp)
 
     # --- Step 5 ------------------------------------------------------------- #
     Initialize-Firewall -Ip $script:LanIp
@@ -1843,6 +2381,22 @@ try {
 
     # --- Step 10 ------------------------------------------------------------- #
     Write-FinalSummary -Results $results -Ip $script:LanIp
+
+    # --- Step 11: watch for the network changing under us --------------------- #
+    # Only Metro is restarted when the address moves, because Metro is the one
+    # process that publishes an address. Ctrl+C stops the watcher and, in the
+    # finally block below, the child processes.
+    if ($NoWatch) {
+        Write-Info 'network watching skipped (-NoWatch) - re-run start.bat after changing network to pick up the new IP'
+    } elseif ($NoMobile) {
+        Write-Info 'network watching skipped (-NoMobile)'
+    } else {
+        try {
+            Watch-Network -Ip $script:LanIp -IntervalSeconds 10
+        } catch {
+            Write-Warn2 ("network watcher stopped: {0}" -f $_.Exception.Message)
+        }
+    }
 
     $script:Completed = $true
 } catch {
