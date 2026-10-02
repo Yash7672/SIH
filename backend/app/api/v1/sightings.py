@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -8,7 +8,7 @@ from app.api.deps import require_cop, require_volunteer
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import get_db
-from app.models import Device, Sighting, User
+from app.models import Device, Hotlist, Sighting, User
 from app.schemas.entities import SightingCreate, SightingOut
 from app.services.plate import normalize_plate
 from app.services.sighting_service import SightingService
@@ -59,10 +59,15 @@ async def create_sighting(
 
     if sighting is None:
         # Not hotlisted or throttled — no sighting, no alert, nothing persisted.
-        return HTTPException(status_code=200, detail="accepted_no_match")
+        # 202: the detection was accepted and deliberately discarded.
+        return Response(
+            content='{"accepted": false, "detail": "accepted_no_match"}',
+            status_code=status.HTTP_202_ACCEPTED,
+            media_type="application/json",
+        )
 
     # Build alert payload and push to police dashboards via WebSocket
-    hotlist_entry = db.get(__import__("app.models", fromlist=["Hotlist"]).Hotlist, sighting.hotlist_id)
+    hotlist_entry = db.get(Hotlist, sighting.hotlist_id)
     alert_payload = {
         "sighting_id": str(sighting.id),
         "plate": norm.normalized,
@@ -90,8 +95,6 @@ def list_sightings(
     _: User = Depends(require_cop),
     db: Session = Depends(get_db),
 ):
-    from app.models import Hotlist
-
     stmt = select(Sighting).order_by(Sighting.detected_at.desc()).limit(500)
     if hotlist_id:
         stmt = stmt.where(Sighting.hotlist_id == hotlist_id).order_by(Sighting.detected_at.asc())

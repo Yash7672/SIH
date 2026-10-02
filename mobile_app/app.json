@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "RAKSHAK Scanner",
+    "slug": "rakshak-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0f172a",
+    "splash": {
+      "backgroundColor": "#0f172a",
+      "resizeMode": "contain"
+    },
+    "android": {
+      "package": "in.gov.rakshak.scanner",
+      "permissions": ["CAMERA"]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "RAKSHAK uses your camera to read vehicle number plates during demo scanning."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RAKSHAK uses your location to tag plate detections."
+        }
+      ]
+    ]
+  }
+}

@@ -1,13 +1,17 @@
+import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.v1.health import healthz
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
+from app.db.session import SessionLocal, get_db
 from app.jobs.expiry import hotlist_expiry_worker
+from app.services.hotlist_service import HotlistService
 from app.services.seed import seed_demo_users
 
 logger = get_logger(__name__)
@@ -22,12 +26,19 @@ async def lifespan(app: FastAPI):
         logger.info("Demo users ensured")
     except Exception as exc:
         logger.warning("Seed skipped/failed: %s", exc)
-    task = asyncio_task = asyncio.create_task(hotlist_expiry_worker())
+    try:
+        db = SessionLocal()
+        try:
+            count = HotlistService(db).rebuild_cache()
+            logger.info("Hotlist cache rebuilt (%d active plates)", count)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Hotlist cache rebuild skipped: %s", exc)
+    task = asyncio.create_task(hotlist_expiry_worker())
     yield
     task.cancel()
 
-
-import asyncio  # noqa: E402
 
 app = FastAPI(
     title="RAKSHAK API",
@@ -43,6 +54,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health")
+async def health_root(db=Depends(get_db)):
+    return healthz(db)
+
 
 app.include_router(api_router, prefix="/api/v1")
 

@@ -1,16 +1,58 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
-import { AlertEvent } from "../services/api";
+import {
+  BarChart3,
+  ChevronDown,
+  ChevronLeft,
+  LayoutDashboard,
+  ListChecks,
+  LogOut,
+  PanelLeft,
+  Radio,
+  Search,
+  Settings,
+  ShieldAlert,
+  Siren,
+  X,
+} from "lucide-react";
+import { AlertEvent, clearSession } from "../services/api";
 import { usePoliceSocket } from "../hooks/usePoliceSocket";
+import { Wordmark } from "./Brand";
+import { Button } from "./ui/Button";
+import { formatCoords, platePath, timeAgo } from "../lib/format";
+import { ThemeModePicker, ThemeToggle } from "./ThemeToggle";
+import { PageBackground } from "./ui/PageBackground";
 
 const NAV = [
-  { to: "/", label: "Overview", end: true },
-  { to: "/complaints", label: "Complaints" },
-  { to: "/hotlist", label: "Hotlist" },
-  { to: "/alerts", label: "Live Alerts" },
-  { to: "/search", label: "Vehicle Search" },
-  { to: "/analytics", label: "Analytics" },
-];
+  { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
+  { to: "/alerts", label: "Live Alerts", icon: Siren, end: false, badge: "alerts" },
+  { to: "/complaints", label: "Complaints", icon: ListChecks, end: false },
+  { to: "/hotlist", label: "Hotlist", icon: ShieldAlert, end: false },
+  { to: "/search", label: "Vehicle Search", icon: Search, end: false },
+  { to: "/analytics", label: "Analytics", icon: BarChart3, end: false },
+] as const;
+
+function ConnectionPill({ connected }: { connected: boolean }) {
+  return (
+    <span
+      className={[
+        "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ring-1 ring-inset",
+        connected ? "bg-success/10 text-success ring-success/30" : "bg-danger/10 text-danger ring-danger/30",
+      ].join(" ")}
+      title={connected ? "WebSocket connected" : "Reconnecting to the alert stream"}
+    >
+      <span className="relative flex h-2 w-2">
+        {connected ? (
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+        ) : null}
+        <span
+          className={["relative inline-flex h-2 w-2 rounded-full", connected ? "bg-success" : "bg-danger"].join(" ")}
+        />
+      </span>
+      {connected ? "Live" : "Disconnected"}
+    </span>
+  );
+}
 
 export default function Layout({
   alerts,
@@ -22,105 +64,268 @@ export default function Layout({
   const nav = useNavigate();
   const user = JSON.parse(localStorage.getItem("rakshak_user") || "null");
   const { connected } = usePoliceSocket(onAlert);
+
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [banner, setBanner] = useState<AlertEvent | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const latestId = alerts[0]?.sighting_id ?? null;
 
   useEffect(() => {
-    if (alerts.length > 0) {
-      setBanner(alerts[0]);
-      const t = setTimeout(() => setBanner(null), 8000);
-      return () => clearTimeout(t);
-    }
-  }, [alerts[0]?.sighting_id]);
+    if (!latestId) return;
+    setBanner(alerts[0]);
+    const t = setTimeout(() => setBanner(null), 8000);
+    return () => clearTimeout(t);
+    // Keyed on the newest sighting only: a re-render of the same alert list
+    // must not restart the 8-second timer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestId]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);
+    document.addEventListener("mousedown", onClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuOpen]);
+
+  const items = useMemo(
+    () => (user?.role === "ADMIN" ? [...NAV, { to: "/admin", label: "Admin", icon: Settings, end: false }] : NAV),
+    [user?.role]
+  );
+
+  const sidebarWidth = collapsed ? "lg:w-[68px]" : "lg:w-60";
+  const linkBase =
+    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors";
+
+  function navLinkClass(isActive: boolean) {
+    return [
+      linkBase,
+      isActive
+        ? "bg-solid text-white shadow-sm"
+        : "text-dark-600 hover:bg-dark-700 hover:text-white",
+    ].join(" ");
+  }
 
   return (
-    <div className="min-h-screen flex">
-      <aside className="w-60 shrink-0 border-r border-slate-800 bg-slate-900/50 flex flex-col">
-        <div className="px-4 py-5 border-b border-slate-800">
-          <div className="flex items-center gap-2">
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-red-600 text-sm font-bold text-white">R</span>
-            <div>
-              <p className="text-sm font-bold">RAKSHAK</p>
-              <p className="text-[10px] uppercase tracking-wider text-slate-500">Police Console</p>
-            </div>
-          </div>
-        </div>
-        <nav className="flex-1 px-2 py-4 space-y-1">
-          {NAV.map((n) => (
-            <NavLink
-              key={n.to}
-              to={n.to}
-              end={n.end}
-              className={({ isActive }) =>
-                `block rounded-lg px-3 py-2 text-sm font-medium ${
-                  isActive ? "bg-brand-600 text-white" : "text-slate-300 hover:bg-slate-800 hover:text-white"
-                }`
-              }
-            >
-              {n.label}
-              {n.to === "/alerts" && alerts.length > 0 && (
-                <span className="ml-2 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
-                  {alerts.length}
-                </span>
-              )}
-            </NavLink>
-          ))}
-          {user?.role === "ADMIN" && (
-            <NavLink
-              to="/admin"
-              className={({ isActive }) =>
-                `block rounded-lg px-3 py-2 text-sm font-medium ${
-                  isActive ? "bg-brand-600 text-white" : "text-slate-300 hover:bg-slate-800 hover:text-white"
-                }`
-              }
-            >
-              Admin
-            </NavLink>
-          )}
-        </nav>
-        <div className="border-t border-slate-800 px-4 py-3">
-          <div className="flex items-center gap-2 text-xs">
-            <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-slate-600"}`} />
-            <span className="text-slate-400">{connected ? "Live" : "Offline"}</span>
-          </div>
-          <p className="mt-1 text-xs text-slate-500">{user?.name}</p>
+    <PageBackground>
+      <div className="min-h-screen">
+        {/* Mobile drawer backdrop */}
+        {drawerOpen ? (
           <button
-            onClick={() => {
-              localStorage.clear();
-              nav("/login");
-            }}
-            className="mt-2 w-full rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-700"
-          >
-            Sign out
-          </button>
-        </div>
-      </aside>
+            type="button"
+            aria-label="Close navigation"
+            onClick={() => setDrawerOpen(false)}
+            className="fixed inset-0 z-40 bg-primary-900/60 backdrop-blur-sm lg:hidden"
+          />
+        ) : null}
 
-      <div className="flex-1 flex flex-col min-w-0">
-        {banner && (
-          <div className="bg-red-600 text-white px-6 py-3 flex items-center justify-between animate-pulse">
-            <div className="flex items-center gap-3">
-              <span className="text-xl">🚨</span>
-              <div>
-                <p className="font-bold text-sm">HOTLIST VEHICLE DETECTED</p>
-                <p className="text-xs text-red-100">
-                  <span className="font-mono font-bold">{banner.plate}</span> · {banner.latitude.toFixed(5)},{" "}
-                  {banner.longitude.toFixed(5)} · {new Date(banner.timestamp).toLocaleTimeString()} ·{" "}
-                  {banner.confidence ? `${Math.round(banner.confidence * 100)}%` : "—"}
-                </p>
-              </div>
+        <div className="flex min-h-screen">
+          <aside
+            className={[
+              "fixed inset-y-0 left-0 z-50 flex shrink-0 flex-col border-r border-dark-700 bg-dark-900 transition-all duration-200",
+              "w-60 lg:sticky lg:top-0 lg:h-screen lg:translate-x-0",
+              sidebarWidth,
+              collapsed ? "lg:w-[68px]" : "",
+              drawerOpen ? "translate-x-0" : "-translate-x-full",
+            ].join(" ")}
+          >
+            <div className="flex items-center justify-between gap-2 border-b border-dark-700 px-4 py-4">
+              <Link to="/" onClick={() => setDrawerOpen(false)} className="rounded-lg">
+                <Wordmark
+                  tone="dark"
+                  subtitle="Police console"
+                  className={collapsed ? "lg:hidden" : ""}
+                />
+              </Link>
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(false)}
+                aria-label="Close navigation"
+                className="rounded-md p-1.5 text-dark-600 hover:bg-dark-700 hover:text-white lg:hidden"
+              >
+                <X className="h-4 w-4" aria-hidden />
+              </button>
             </div>
-            <Link
-              to={`/vehicles/${banner.plate}`}
-              className="rounded-lg bg-white px-3 py-1.5 text-xs font-bold text-red-700 hover:bg-red-50"
-            >
-              VIEW VEHICLE →
-            </Link>
+
+            <nav className="scrollbar-dark flex-1 space-y-1 overflow-y-auto px-2 py-4" aria-label="Main">
+              {items.map((n) => {
+                const Icon = n.icon;
+                const count = "badge" in n && n.badge === "alerts" ? alerts.length : 0;
+                return (
+                  <NavLink
+                    key={n.to}
+                    to={n.to}
+                    end={n.end}
+                    title={n.label}
+                    onClick={() => setDrawerOpen(false)}
+                    className={({ isActive }) => navLinkClass(isActive)}
+                  >
+                    <Icon className="h-[18px] w-[18px] shrink-0" aria-hidden />
+                    <span className={collapsed ? "lg:hidden" : ""}>{n.label}</span>
+                    {count > 0 ? (
+                      <span
+                        className={[
+                          "ml-auto rounded-full bg-solid-danger px-1.5 py-0.5 text-[10px] font-bold text-white",
+                          collapsed ? "lg:hidden" : "",
+                        ].join(" ")}
+                      >
+                        {count}
+                      </span>
+                    ) : null}
+                  </NavLink>
+                );
+              })}
+            </nav>
+
+            <div className="border-t border-dark-700 px-3 py-3">
+              <div className={["flex items-center gap-2", collapsed ? "lg:justify-center" : ""].join(" ")}>
+                <span
+                  className={["h-2 w-2 shrink-0 rounded-full", connected ? "bg-success" : "bg-danger"].join(" ")}
+                  aria-hidden
+                />
+                <span className={["text-xs", collapsed ? "lg:hidden" : "text-dark-600"].join(" ")}>
+                  {connected ? "Alert stream live" : "Reconnecting…"}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCollapsed((v) => !v)}
+                className={[
+                  "mt-3 hidden w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-dark-600 hover:bg-dark-700 hover:text-white lg:flex",
+                  collapsed ? "justify-center" : "",
+                ].join(" ")}
+                aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              >
+                <ChevronLeft
+                  className={["h-4 w-4 transition-transform", collapsed ? "rotate-180" : ""].join(" ")}
+                  aria-hidden
+                />
+                {collapsed ? null : <span>Collapse</span>}
+              </button>
+            </div>
+          </aside>
+
+          <div className="flex min-w-0 flex-1 flex-col">
+            <header className="sticky top-0 z-30 border-b border-surface-border bg-surface-card/90 backdrop-blur">
+              <div className="flex items-center gap-3 px-4 py-3 sm:px-6">
+                <button
+                  type="button"
+                  onClick={() => setDrawerOpen(true)}
+                  aria-label="Open navigation"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-surface-muted transition-colors hover:bg-surface-raised lg:hidden"
+                >
+                  <PanelLeft className="h-5 w-5" aria-hidden />
+                </button>
+
+                <div className="hidden items-center gap-2 text-sm text-surface-muted sm:flex">
+                  <Radio className="h-4 w-4 text-accent-600" aria-hidden />
+                  Hotlist detection stream
+                </div>
+
+                <div className="ml-auto flex items-center gap-3">
+                  <ConnectionPill connected={connected} />
+                  <ThemeToggle />
+
+                  {user ? (
+                    <div className="relative" ref={menuRef}>
+                      <button
+                        type="button"
+                        onClick={() => setMenuOpen((v) => !v)}
+                        aria-haspopup="menu"
+                        aria-expanded={menuOpen}
+                        className="inline-flex items-center gap-2 rounded-lg px-1.5 py-1.5 transition-colors hover:bg-surface-raised"
+                      >
+                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-dark-900 text-xs font-semibold text-white">
+                          {String(user.name || "?")
+                            .split(" ")
+                            .slice(0, 2)
+                            .map((p: string) => p[0])
+                            .join("")
+                            .toUpperCase()}
+                        </span>
+                        <span className="hidden text-sm font-medium text-surface-text sm:inline">
+                          {user.name}
+                        </span>
+                        <ChevronDown className="h-4 w-4 text-surface-muted" aria-hidden />
+                      </button>
+
+                      {menuOpen ? (
+                        <div
+                          role="menu"
+                          className="absolute right-0 mt-2 w-60 animate-slide-up rounded-xl border border-surface-border bg-surface-card p-1.5 shadow-overlay"
+                        >
+                          <div className="border-b border-surface-border px-3 py-2.5">
+                            <p className="truncate text-sm font-medium text-surface-text">{user.name}</p>
+                            <p className="truncate text-xs text-surface-muted">{user.email}</p>
+                            <p className="mt-1 inline-flex rounded-full chip-primary px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                              {user.role}
+                            </p>
+                          </div>
+                          <div className="px-2 py-2">
+                            <ThemeModePicker className="w-full" />
+                          </div>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              clearSession();
+                              nav("/login");
+                            }}
+                            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-danger transition-colors hover:bg-danger/10"
+                          >
+                            <LogOut className="h-4 w-4" aria-hidden /> Sign out
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </header>
+
+            {banner ? (
+              <div
+                role="alert"
+                className="flex animate-slide-up flex-wrap items-center justify-between gap-3 bg-solid-danger px-4 py-3 text-white sm:px-6"
+              >
+                <div className="flex min-w-0 items-center gap-3">
+                  <Siren className="h-5 w-5 shrink-0" aria-hidden />
+                  <div className="min-w-0">
+                    <p className="text-sm font-bold">HOTLIST VEHICLE DETECTED</p>
+                    <p className="truncate text-xs text-white/85">
+                      {banner.plate} · {formatCoords(banner.latitude, banner.longitude)} ·{" "}
+                      {timeAgo(banner.timestamp)}
+                      {banner.confidence ? ` · ${Math.round(banner.confidence * 100)}%` : ""}
+                    </p>
+                  </div>
+                </div>
+                <Link to={platePath(banner.plate)} onClick={() => setBanner(null)}>
+                  <Button size="sm" className="bg-surface-card text-danger hover:bg-danger/10">
+                    View vehicle
+                  </Button>
+                </Link>
+              </div>
+            ) : null}
+
+            <main className="flex-1 px-4 py-6 sm:px-6">
+              <Outlet />
+            </main>
+
+            <footer className="border-t border-surface-border px-4 py-4 text-center text-xs text-surface-muted sm:px-6">
+              RAKSHAK Police Console · Internal system · Alerts are advisory, verify before intercepting.
+            </footer>
           </div>
-        )}
-        <main className="flex-1 overflow-auto p-6">
-          <Outlet />
-        </main>
+        </div>
       </div>
-    </div>
+    </PageBackground>
   );
 }

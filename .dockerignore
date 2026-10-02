@@ -1,0 +1,25 @@
+# Keep the build context small — the backend image is built from the repo root.
+.git
+.gitignore
+.freebuff
+.pytest_cache
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/dist
+**/.expo
+**/android
+**/ios
+**/*.tsbuildinfo
+**/*.log
+logs
+.rakshak
+brag-output-*
+data
+plate_model_source
+docs
+.venv
+venv
+.env
+.env.local
+.env.production

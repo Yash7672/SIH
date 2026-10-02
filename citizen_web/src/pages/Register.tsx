@@ -1,6 +1,10 @@
 import { FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, TokenResponse } from "../services/api";
+import { api, saveSession, TokenResponse } from "../services/api";
+import { Wordmark } from "../components/Brand";
+import { Button } from "../components/ui/Button";
+import { Input } from "../components/ui/Input";
+import { ThemeToggle } from "../components/ThemeToggle";
 
 export default function Register() {
   const nav = useNavigate();
@@ -23,8 +27,7 @@ export default function Register() {
         password,
         role: "CITIZEN",
       });
-      localStorage.setItem("rakshak_token", data.access_token);
-      localStorage.setItem("rakshak_user", JSON.stringify(data.user));
+      saveSession(data);
       nav("/");
     } catch (err: any) {
       setError(err.response?.data?.detail || "Registration failed");
@@ -34,28 +37,83 @@ export default function Register() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-brand-50 to-slate-100 px-4">
-      <div className="w-full max-w-md rounded-2xl bg-white p-8 shadow-xl ring-1 ring-slate-200">
-        <h1 className="mb-1 text-center text-2xl font-bold text-slate-900">Create account</h1>
-        <p className="mb-6 text-center text-sm text-slate-500">Citizen registration</p>
-        <form onSubmit={submit} className="space-y-4">
-          <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name"
-            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200" />
-          <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email"
-            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200" />
-          <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Phone (optional)"
-            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200" />
-          <input required type="password" minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password (min 8 chars)"
-            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200" />
-          {error && <div className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 ring-1 ring-red-200">{error}</div>}
-          <button disabled={loading} type="submit"
-            className="w-full rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50">
-            {loading ? "Creating…" : "Create account"}
-          </button>
-        </form>
-        <p className="mt-4 text-center text-sm text-slate-500">
-          Already registered? <Link to="/login" className="font-medium text-brand-600 hover:underline">Sign in</Link>
-        </p>
+    <div className="relative flex min-h-screen items-center justify-center bg-gradient-to-br from-primary-50 via-surface-bg to-accent-50 px-4 py-10">
+      <div className="absolute right-4 top-4 z-10 sm:right-6 sm:top-6">
+        <ThemeToggle />
+      </div>
+
+      <div className="w-full max-w-md">
+        <div className="mb-6 flex flex-col items-center text-center">
+          <Wordmark />
+          <h1 className="mt-5 text-2xl font-semibold tracking-tight text-surface-text">
+            Create your account
+          </h1>
+          <p className="mt-1.5 text-sm text-surface-muted">
+            File complaints and follow your vehicle&apos;s status.
+          </p>
+        </div>
+
+        <div className="rounded-2xl border border-surface-border bg-surface-card p-6 shadow-overlay sm:p-8">
+          <form onSubmit={submit} className="space-y-5" noValidate>
+            <Input
+              label="Full name"
+              required
+              autoComplete="name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Your name"
+            />
+            <Input
+              label="Email"
+              type="email"
+              required
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="citizen@example.com"
+            />
+            <Input
+              label="Phone"
+              type="tel"
+              autoComplete="tel"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="Optional"
+              hint="Used by police only if they need to reach you about a complaint."
+            />
+            <Input
+              label="Password"
+              type="password"
+              required
+              minLength={8}
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="At least 8 characters"
+              hint={password && password.length < 8 ? `${8 - password.length} more character(s) needed.` : undefined}
+            />
+
+            {error ? (
+              <div
+                role="alert"
+                className="rounded-lg border border-danger/40 bg-danger/10 px-3.5 py-2.5 text-sm font-medium text-danger"
+              >
+                {error}
+              </div>
+            ) : null}
+
+            <Button type="submit" size="lg" fullWidth loading={loading}>
+              {loading ? "Creating account…" : "Create account"}
+            </Button>
+          </form>
+
+          <p className="mt-5 text-center text-sm text-surface-muted">
+            Already registered?{" "}
+            <Link to="/login" className="font-medium text-primary-600 hover:text-primary-700 hover:underline">
+              Sign in
+            </Link>
+          </p>
+        </div>
       </div>
     </div>
   );

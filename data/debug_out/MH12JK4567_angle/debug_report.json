@@ -1,0 +1,271 @@
+{
+  "image": "C:\\Users\\yashw\\AppData\\Local\\Temp\\opencode\\repro\\MH12JK4567_angle.jpg",
+  "size": [
+    1280,
+    960
+  ],
+  "detector_events": [
+    "yolo: 1 box(es) >= conf 0.25",
+    "detect: YOLO box=(264, 583, 1013, 823) conf=0.557 padded=(190, 540, 1087, 866) crop=897x326"
+  ],
+  "stages": {
+    "crop": {
+      "detector": "yolo",
+      "raw_box": [
+        264,
+        583,
+        1013,
+        823
+      ],
+      "padded_box": [
+        190,
+        540,
+        1087,
+        866
+      ],
+      "confidence": 0.557,
+      "crop_size": [
+        897,
+        326
+      ]
+    },
+    "preprocessed": {
+      "deskew_deg": 0.0,
+      "size": [
+        736,
+        267
+      ]
+    },
+    "raw_hits": {
+      "crop_raw": [
+        {
+          "text": "IND",
+          "conf": 0.9411,
+          "box": "x[97-129] y[102-124]",
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "18112JK4667",
+          "conf": 0.7069,
+          "box": "x[430-558] y[149-193]",
+          "normalized": "18112JK4667",
+          "valid": false,
+          "reason": "no plate-length candidate"
+        }
+      ],
+      "crop_focused": [
+        {
+          "text": "ONI",
+          "conf": 0.8459,
+          "box": "x[37-70] y[55-79]",
+          "normalized": "ONI",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "12JK4867",
+          "conf": 0.826,
+          "box": "x[371-497] y[105-146]",
+          "normalized": "12JK4867",
+          "valid": false,
+          "reason": "invalid: 12JK4867 fails pattern/whitelist (tried: 12JK4867, 12JK4B67)"
+        }
+      ],
+      "crop_focused_preprocessed": [
+        {
+          "text": "IND",
+          "conf": 0.9899,
+          "box": "x[36-65] y[53-74]",
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "MN12JK4067",
+          "conf": 0.8623,
+          "box": "x[351-470] y[99-138]",
+          "normalized": "MN12JK4067",
+          "valid": true,
+          "reason": "exact match, state code MN is a valid RTO code"
+        }
+      ],
+      "crop_preprocessed": [
+        {
+          "text": "IND",
+          "conf": 0.9809,
+          "box": "x[81-106] y[84-102]",
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JC4067",
+          "conf": 0.777,
+          "box": "x[354-457] y[122-158]",
+          "normalized": "M12JC4067",
+          "valid": false,
+          "reason": "invalid: MI2JC4067 fails pattern/whitelist (tried: M12JC4067, MI2JC4067, MI2JC4O67)"
+        }
+      ]
+    },
+    "merged": {
+      "crop_raw": [
+        {
+          "text": "18112JK4667",
+          "conf": 0.7069,
+          "normalized": "18112JK4667",
+          "valid": false,
+          "reason": "no plate-length candidate"
+        }
+      ],
+      "crop_focused": [
+        {
+          "text": "ONI",
+          "conf": 0.8459,
+          "normalized": "ONI",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "12JK4867",
+          "conf": 0.826,
+          "normalized": "12JK4867",
+          "valid": false,
+          "reason": "invalid: 12JK4867 fails pattern/whitelist (tried: 12JK4867, 12JK4B67)"
+        }
+      ],
+      "crop_focused_preprocessed": [
+        {
+          "text": "MN12JK4067",
+          "conf": 0.8623,
+          "normalized": "MN12JK4067",
+          "valid": true,
+          "reason": "exact match, state code MN is a valid RTO code"
+        }
+      ],
+      "crop_preprocessed": [
+        {
+          "text": "M12JC4067",
+          "conf": 0.777,
+          "normalized": "M12JC4067",
+          "valid": false,
+          "reason": "invalid: MI2JC4067 fails pattern/whitelist (tried: M12JC4067, MI2JC4067, MI2JC4O67)"
+        }
+      ]
+    },
+    "candidates": {
+      "crop_raw": [
+        {
+          "text": "IND",
+          "conf": 0.9411,
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "18112JK4667",
+          "conf": 0.7069,
+          "normalized": "18112JK4667",
+          "valid": false,
+          "reason": "no plate-length candidate"
+        }
+      ],
+      "crop_focused": [
+        {
+          "text": "ONI",
+          "conf": 0.8459,
+          "normalized": "ONI",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "12JK4867",
+          "conf": 0.826,
+          "normalized": "12JK4867",
+          "valid": false,
+          "reason": "invalid: 12JK4867 fails pattern/whitelist (tried: 12JK4867, 12JK4B67)"
+        }
+      ],
+      "crop_focused_preprocessed": [
+        {
+          "text": "IND",
+          "conf": 0.9899,
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "MN12JK4067",
+          "conf": 0.8623,
+          "normalized": "MN12JK4067",
+          "valid": true,
+          "reason": "exact match, state code MN is a valid RTO code"
+        }
+      ],
+      "crop_preprocessed": [
+        {
+          "text": "IND",
+          "conf": 0.9809,
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JC4067",
+          "conf": 0.777,
+          "normalized": "M12JC4067",
+          "valid": false,
+          "reason": "invalid: MI2JC4067 fails pattern/whitelist (tried: M12JC4067, MI2JC4067, MI2JC4O67)"
+        }
+      ]
+    },
+    "fullframe_hits": [
+      {
+        "text": "ONI",
+        "conf": 0.8163,
+        "normalized": "ONI",
+        "valid": false,
+        "reason": "length 3 is not a plate length (8-10)"
+      },
+      {
+        "text": "12K4867",
+        "conf": 0.7859,
+        "normalized": "12K4867",
+        "valid": false,
+        "reason": "length 7 is not a plate length (8-10)"
+      }
+    ],
+    "normalize": [
+      {
+        "raw": "ONI",
+        "normalized": "ONI",
+        "valid": false,
+        "reason": "length 3 is not a plate length (8-10)"
+      },
+      {
+        "raw": "12K4867",
+        "normalized": "12K4867",
+        "valid": false,
+        "reason": "length 7 is not a plate length (8-10)"
+      },
+      {
+        "raw": "18112JK4667",
+        "normalized": "18112JK4667",
+        "valid": false,
+        "reason": "no plate-length candidate"
+      }
+    ]
+  },
+  "final": {
+    "plate": "MN12JK4067",
+    "confidence": 0.862,
+    "valid": true,
+    "uncertain": false,
+    "source": "crop",
+    "stage": "crop_focused_preprocessed",
+    "reason": "exact match, state code MN is a valid RTO code",
+    "votes": {}
+  }
+}

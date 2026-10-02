@@ -12,7 +12,6 @@ class PoliceAlertManager:
         self._connections: dict[WebSocket, dict[str, Any]] = {}
 
     async def connect(self, websocket: WebSocket, user_id: str, role: str) -> None:
-        await websocket.accept()
         self._connections[websocket] = {"user_id": user_id, "role": role}
 
     def disconnect(self, websocket: WebSocket) -> None:

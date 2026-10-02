@@ -18,6 +18,7 @@ class HotlistService:
         stmt = (
             select(Hotlist)
             .where(Hotlist.plate == plate, Hotlist.status.in_([HotlistStatus.ACTIVE, HotlistStatus.FIR_CONFIRMED]))
+            .order_by(Hotlist.added_at.desc())
             .limit(1)
         )
         return self.db.execute(stmt).scalar_one_or_none()
@@ -44,6 +45,23 @@ class HotlistService:
         complaint_id: Optional[UUID] = None,
         fir_reference: Optional[str] = None,
     ) -> Hotlist:
+        # One active hotlist entry per plate: re-verifying the same plate (or
+        # verifying a second complaint for it) must not create a duplicate row.
+        existing = self.get_active_by_plate(plate)
+        if existing is not None:
+            changed = False
+            if complaint_id is not None and existing.complaint_id is None:
+                existing.complaint_id = complaint_id
+                changed = True
+            if fir_reference and existing.fir_reference != fir_reference:
+                existing.fir_reference = fir_reference
+                changed = True
+            if changed:
+                self.db.commit()
+                self.db.refresh(existing)
+            cache_service.add_active_plate(plate)
+            return existing
+
         now = datetime.now(timezone.utc)
         expiry = None
         if settings.HOTLIST_CONFIRMATION_HOURS:

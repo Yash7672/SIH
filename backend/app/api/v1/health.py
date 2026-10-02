@@ -10,8 +10,7 @@ from app.services.cache import cache_service
 router = APIRouter()
 
 
-@router.get("/healthz", response_model=HealthOut)
-def healthz(db: Session = Depends(get_db)):
+def _health_state(db: Session) -> HealthOut:
     try:
         db.execute(text("SELECT 1"))
         db_status = "ok"
@@ -20,3 +19,13 @@ def healthz(db: Session = Depends(get_db)):
     redis_status = "ok" if cache_service.available else "unavailable"
     status = "ok" if db_status == "ok" else "degraded"
     return HealthOut(status=status, database=db_status, redis=redis_status, demo_mode=settings.DEMO_MODE)
+
+
+@router.get("/healthz", response_model=HealthOut)
+def healthz(db: Session = Depends(get_db)):
+    return _health_state(db)
+
+
+@router.get("/health", response_model=HealthOut)
+def health(db: Session = Depends(get_db)):
+    return _health_state(db)

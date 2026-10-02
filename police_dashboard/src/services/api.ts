@@ -1,27 +1,87 @@
-import axios from "axios";
+﻿import axios from "axios";
 
-export const API_BASE =
-  (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000";
+const env = (import.meta as any).env || {};
+
+/**
+ * Host used by the *browser*, not by a container. `scripts/start.ps1` writes
+ * `police_dashboard/.env.local` with the PC's LAN IP (docker compose passes it
+ * as a runtime env var), so the same bundle is reachable from the PC and from a
+ * phone on the same Wi-Fi. `VITE_API_BASE_URL` is kept as a legacy alias.
+ */
+export const API_BASE: string = env.VITE_API_URL || env.VITE_API_BASE_URL || "http://localhost:8000";
+
+/** Alert socket. Explicit VITE_WS_URL wins, otherwise derived from API_BASE. */
+export const WS_BASE: string = String(env.VITE_WS_URL || API_BASE).replace(/^http/, "ws");
 
 export const api = axios.create({
   baseURL: `${API_BASE}/api/v1`,
   timeout: 15000,
 });
 
+const TOKEN_KEY = "rakshak_token";
+const REFRESH_KEY = "rakshak_refresh";
+const USER_KEY = "rakshak_user";
+
+/** Store the access + refresh pair from a login/register/refresh response. */
+export function saveSession(data: TokenResponse) {
+  localStorage.setItem(TOKEN_KEY, data.access_token);
+  if (data.refresh_token) localStorage.setItem(REFRESH_KEY, data.refresh_token);
+  localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+}
+
+export function clearSession() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(USER_KEY);
+}
+
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("rakshak_token");
+  const token = localStorage.getItem(TOKEN_KEY);
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
 
+// A single in-flight refresh is shared by every request that hits a 401 at the
+// same time, so a batch of requests only renews the token once.
+let refreshInFlight: Promise<string> | null = null;
+
+async function refreshAccessToken(): Promise<string> {
+  const refreshToken = localStorage.getItem(REFRESH_KEY);
+  if (!refreshToken) throw new Error("no refresh token");
+  const { data } = await axios.post<TokenResponse>(`${API_BASE}/api/v1/auth/refresh`, {
+    refresh_token: refreshToken,
+  });
+  saveSession(data);
+  return data.access_token;
+}
+
+function forceLogin() {
+  clearSession();
+  if (window.location.pathname !== "/login") window.location.href = "/login";
+}
+
 api.interceptors.response.use(
   (r) => r,
-  (err) => {
-    if (err.response?.status === 401) {
-      localStorage.removeItem("rakshak_token");
-      localStorage.removeItem("rakshak_user");
-      if (window.location.pathname !== "/login") window.location.href = "/login";
+  async (err) => {
+    const original = err.config;
+    const isAuthCall = typeof original?.url === "string" && original.url.includes("/auth/");
+
+    if (err.response?.status === 401 && original && !original._retried && !isAuthCall) {
+      original._retried = true;
+      try {
+        refreshInFlight = refreshInFlight || refreshAccessToken();
+        const token = await refreshInFlight.finally(() => {
+          refreshInFlight = null;
+        });
+        original.headers = { ...(original.headers || {}), Authorization: `Bearer ${token}` };
+        return api(original);
+      } catch {
+        forceLogin();
+        return Promise.reject(err);
+      }
     }
+
+    if (err.response?.status === 401) forceLogin();
     return Promise.reject(err);
   }
 );
@@ -31,6 +91,8 @@ export interface User {
   name: string;
   email: string;
   role: string;
+  phone?: string;
+  created_at?: string;
 }
 
 export interface TokenResponse {
@@ -91,19 +153,23 @@ export interface Overview {
   active_devices: number;
 }
 
+/* Legacy dark-console pill classes, kept so any straggler call site still
+   resolves. New code should prefer the chip-* classes from
+   components/ui/StatusChip.tsx and components/ui/HotlistChip.tsx, which are
+   theme-aware. */
 export const HOTLIST_STATUS_COLORS: Record<string, string> = {
-  ACTIVE: "bg-red-500/15 text-red-400 ring-red-500/30",
-  FIR_CONFIRMED: "bg-orange-500/15 text-orange-400 ring-orange-500/30",
-  RECOVERED: "bg-emerald-500/15 text-emerald-400 ring-emerald-500/30",
-  CLOSED: "bg-slate-500/15 text-slate-400 ring-slate-500/30",
-  EXPIRED: "bg-yellow-500/15 text-yellow-400 ring-yellow-500/30",
+  ACTIVE: "chip-danger",
+  FIR_CONFIRMED: "chip-warning",
+  RECOVERED: "chip-success",
+  CLOSED: "chip-neutral",
+  EXPIRED: "chip-warning",
 };
 
 export const COMPLAINT_STATUS_COLORS: Record<string, string> = {
-  PENDING: "bg-amber-500/15 text-amber-400 ring-amber-500/30",
-  UNDER_REVIEW: "bg-blue-500/15 text-blue-400 ring-blue-500/30",
-  VERIFIED: "bg-indigo-500/15 text-indigo-400 ring-indigo-500/30",
-  REJECTED: "bg-red-500/15 text-red-400 ring-red-500/30",
-  HOTLISTED: "bg-red-500/15 text-red-400 ring-red-500/30",
-  CLOSED: "bg-slate-500/15 text-slate-400 ring-slate-500/30",
+  PENDING: "chip-warning",
+  UNDER_REVIEW: "chip-info",
+  VERIFIED: "chip-primary",
+  REJECTED: "chip-danger",
+  HOTLISTED: "chip-danger",
+  CLOSED: "chip-neutral",
 };

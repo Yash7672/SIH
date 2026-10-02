@@ -22,3 +22,5 @@ coverage/
 alembic/versions/__pycache__/
 .env.local
 .env.production
+.rakshak/
+logs/

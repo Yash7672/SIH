@@ -8,6 +8,7 @@ from app.api.v1 import (
     devices,
     health,
     hotlist,
+    scanner,
     sightings,
     users,
     vehicles,
@@ -25,4 +26,5 @@ api_router.include_router(devices.router, prefix="/devices", tags=["devices"])
 api_router.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
 api_router.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
+api_router.include_router(scanner.router, prefix="/scanner", tags=["scanner"])
 api_router.include_router(ws.router, prefix="/ws", tags=["ws"])

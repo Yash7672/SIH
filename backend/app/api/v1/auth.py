@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.core.security import create_access_token, create_refresh_token, decode_token, hash_password, verify_password
+from app.core.security import TokenError, create_access_token, create_refresh_token, decode_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models import Role, User
 from app.schemas.entities import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, UserOut
@@ -77,6 +77,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     try:
         data = decode_token(payload.refresh_token)
+    except TokenError as exc:
+        # Same distinction as the access path: a stale refresh token can be
+        # replaced by logging in, a wrong-secret one means the stored session
+        # is unrecoverable and must be cleared.
+        raise HTTPException(status_code=401, detail=f"Refresh {exc.detail[0].lower()}{exc.detail[1:]}")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
     if data.get("type") != "refresh":

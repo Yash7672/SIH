@@ -1,54 +1,60 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
-import L from "leaflet";
-import { api, HOTLIST_STATUS_COLORS } from "../services/api";
+import { ArrowLeft, MapPin, RadioTower } from "lucide-react";
+import { api } from "../services/api";
+import { Button } from "../components/ui/Button";
+import { Card, CardHeader } from "../components/ui/Card";
+import { HotlistChip } from "../components/ui/HotlistChip";
+import { StatusChip } from "../components/ui/StatusChip";
+import { Skeleton } from "../components/ui/Feedback";
+import type { MapPoint } from "../components/map/VehicleMap";
+import { formatCoords, timeAgo } from "../lib/format";
 
-const alertIcon = L.divIcon({
-  className: "",
-  html: `<div style="background:#dc2626;color:#fff;border:2px solid #fff;border-radius:50%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:12px;box-shadow:0 2px 6px rgba(0,0,0,.5);">R</div>`,
-  iconSize: [28, 28],
-  iconAnchor: [14, 14],
-});
+// Leaflet is ~150 kB gzipped; it only loads once an officer opens this page,
+// and separately from the page shell so the header appears immediately.
+const VehicleMap = lazy(() => import("../components/map/VehicleMap"));
 
-function FitBounds({ points }: { points: [number, number][] }) {
-  const map = useMap();
-  useEffect(() => {
-    if (points.length > 0) {
-      map.fitBounds(L.latLngBounds(points), { padding: [40, 40] });
-    }
-  }, [points.length]);
-  return null;
-}
-
-interface TimelinePoint {
-  id: string;
-  latitude: number;
-  longitude: number;
-  detected_at: string;
-  confidence?: number;
-  device_id: string;
+interface VehicleDetailResponse {
+  plate: string;
+  sightings_count: number;
+  hotlist: {
+    id: string;
+    status: string;
+    fir_reference?: string;
+    expiry_at?: string;
+    last_seen_at?: string;
+    last_seen_lat?: number;
+    last_seen_lng?: number;
+  };
+  complaint?: { type?: string; status?: string; description?: string } | null;
 }
 
 export default function VehicleDetail() {
   const { plate } = useParams();
-  const [detail, setDetail] = useState<any>(null);
-  const [timeline, setTimeline] = useState<TimelinePoint[]>([]);
-  const [error, setError] = useState("");
+  const [detail, setDetail] = useState<VehicleDetailResponse | null>(null);
+  const [timeline, setTimeline] = useState<MapPoint[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
-  function load() {
+  const load = useCallback(() => {
+    setLoading(true);
+    setError(null);
     api
-      .get(`/vehicles/${plate}`)
+      .get<VehicleDetailResponse>(`/vehicles/${plate}`)
       .then((r) => setDetail(r.data))
-      .catch((e) => setError(e.response?.data?.detail || "Failed to load"));
+      .catch((e) => {
+        const d = e.response?.data?.detail;
+        setError(typeof d === "string" ? d : "Failed to load this vehicle");
+      })
+      .finally(() => setLoading(false));
     api
-      .get<TimelinePoint[]>(`/vehicles/${plate}/timeline`)
+      .get<MapPoint[]>(`/vehicles/${plate}/timeline`)
       .then((r) => setTimeline(r.data))
       .catch(() => {});
-  }
+  }, [plate]);
 
-  useEffect(load, [plate]);
+  useEffect(load, [load]);
 
   async function patch(status: string) {
     if (!detail) return;
@@ -56,182 +62,196 @@ export default function VehicleDetail() {
     try {
       await api.patch(`/hotlist/${detail.hotlist.id}`, { status });
       load();
+    } catch (e: any) {
+      const d = e.response?.data?.detail;
+      setError(typeof d === "string" ? d : "Could not update the hotlist entry");
     } finally {
       setBusy(false);
     }
   }
 
-  if (error)
+  if (error) {
     return (
-      <div className="rounded-xl bg-red-500/10 p-6 text-sm text-red-400 ring-1 ring-red-500/30">
-        {error}{" "}
-        <Link to="/search" className="underline">
-          Search again
-        </Link>
+      <Card padding="none" className="border-danger/40">
+        <div role="alert" className="p-6 text-sm text-danger">
+          <p className="font-semibold">{error}</p>
+          <Link to="/search" className="mt-2 inline-block font-medium underline">
+            Search for another vehicle
+          </Link>
+        </div>
+      </Card>
+    );
+  }
+
+  if (loading && !detail) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-8 w-64" />
+        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          {[0, 1, 2, 3].map((i) => (
+            <Skeleton key={i} className="h-24 rounded-xl" />
+          ))}
+        </div>
+        <Skeleton className="h-[420px] rounded-xl" />
       </div>
     );
-  if (!detail) return <div className="p-8 text-center text-sm text-slate-500">Loading…</div>;
+  }
+
+  if (!detail) return null;
 
   const h = detail.hotlist;
-  const points: [number, number][] = timeline.map((t) => [t.latitude, t.longitude]);
-  const center: [number, number] =
-    points.length > 0 ? points[points.length - 1] : [17.385, 78.4867];
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <Link to="/hotlist" className="text-xs text-brand-400 hover:underline">
-            ← Hotlist
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <Link
+            to="/hotlist"
+            className="inline-flex items-center gap-1.5 text-sm font-medium text-primary-600 hover:text-primary-700"
+          >
+            <ArrowLeft className="h-4 w-4" aria-hidden /> Hotlist
           </Link>
-          <div className="mt-1 flex items-center gap-3">
-            <h1 className="font-mono text-3xl font-bold text-white">{detail.plate}</h1>
-            <span
-              className={`rounded-full px-3 py-1 text-xs font-bold ring-1 ring-inset ${HOTLIST_STATUS_COLORS[h.status]}`}
-            >
-              {h.status.replace(/_/g, " ")}
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            {/* Plate badge keeps the on-vehicle look at every size. */}
+            <span className="inline-flex items-center rounded-md border-2 border-slate-900 bg-white px-4 py-2 font-mono text-2xl font-bold tracking-[0.2em] text-slate-900 shadow-sm">
+              {detail.plate}
             </span>
+            <HotlistChip status={h.status} className="px-3 py-1.5 text-sm" />
+            {h.fir_reference ? (
+              <span className="font-mono text-xs text-surface-muted">FIR {h.fir_reference}</span>
+            ) : null}
           </div>
         </div>
-        <div className="flex gap-2">
-          {h.status === "ACTIVE" && (
-            <>
-              <button
-                disabled={busy}
-                onClick={() => patch("FIR_CONFIRMED")}
-                className="rounded-lg bg-orange-600 px-3 py-2 text-xs font-bold text-white hover:bg-orange-500 disabled:opacity-50"
-              >
-                Confirm FIR
-              </button>
-              <button
-                disabled={busy}
-                onClick={() => patch("RECOVERED")}
-                className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50"
-              >
-                Mark Recovered
-              </button>
-              <button
-                disabled={busy}
-                onClick={() => patch("CLOSED")}
-                className="rounded-lg bg-slate-700 px-3 py-2 text-xs font-bold text-slate-300 hover:bg-slate-600 disabled:opacity-50"
-              >
-                Close
-              </button>
-            </>
-          )}
-        </div>
+
+        {h.status === "ACTIVE" || h.status === "FIR_CONFIRMED" ? (
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" loading={busy} onClick={() => patch("FIR_CONFIRMED")}>
+              Confirm FIR
+            </Button>
+            <Button size="sm" loading={busy} onClick={() => patch("RECOVERED")}>
+              Mark recovered
+            </Button>
+            <Button size="sm" variant="secondary" loading={busy} onClick={() => patch("CLOSED")}>
+              Close
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <div className="rounded-xl bg-slate-900 p-4 ring-1 ring-slate-800">
-          <p className="text-xs text-slate-500">Total sightings</p>
-          <p className="mt-1 text-2xl font-bold text-white">{detail.sightings_count}</p>
-        </div>
-        <div className="rounded-xl bg-slate-900 p-4 ring-1 ring-slate-800">
-          <p className="text-xs text-slate-500">Last detected</p>
-          <p className="mt-1 text-sm font-semibold text-white">
-            {h.last_seen_at ? new Date(h.last_seen_at).toLocaleString() : "—"}
-          </p>
-        </div>
-        <div className="rounded-xl bg-slate-900 p-4 ring-1 ring-slate-800">
-          <p className="text-xs text-slate-500">Last location</p>
-          <p className="mt-1 text-sm font-semibold font-mono text-white">
-            {h.last_seen_lat != null
-              ? `${h.last_seen_lat.toFixed(5)}, ${h.last_seen_lng.toFixed(5)}`
-              : "—"}
-          </p>
-        </div>
-        <div className="rounded-xl bg-slate-900 p-4 ring-1 ring-slate-800">
-          <p className="text-xs text-slate-500">Expiry (FIR window)</p>
-          <p className="mt-1 text-sm font-semibold text-white">
-            {h.expiry_at ? new Date(h.expiry_at).toLocaleString() : "—"}
-          </p>
-        </div>
+        {[
+          { label: "Total sightings", value: detail.sightings_count },
+          { label: "Last detected", value: h.last_seen_at ? timeAgo(h.last_seen_at) : "—" },
+          {
+            label: "Last location",
+            value:
+              h.last_seen_lat != null ? formatCoords(h.last_seen_lat, h.last_seen_lng) : "—",
+            mono: true,
+          },
+          { label: "FIR window ends", value: h.expiry_at ? timeAgo(h.expiry_at) : "—" },
+        ].map((kpi) => (
+          <Card key={kpi.label} padding="sm">
+            <p className="text-xs font-medium text-surface-muted">{kpi.label}</p>
+            <p
+              className={[
+                "mt-1.5 font-semibold text-surface-text",
+                kpi.mono ? "font-mono text-sm" : "text-xl",
+              ].join(" ")}
+            >
+              {kpi.value}
+            </p>
+          </Card>
+        ))}
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2 rounded-xl bg-slate-900 ring-1 ring-slate-800 overflow-hidden">
-          <div className="border-b border-slate-800 px-5 py-3 flex items-center justify-between">
-            <p className="font-semibold text-sm">Tracking map</p>
-            <p className="text-xs text-slate-500">{timeline.length} sighting(s) · chronological route</p>
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-5">
+        <Card padding="none" className="overflow-hidden xl:col-span-3">
+          <div className="p-5 pb-0">
+            <CardHeader
+              title="Tracking map"
+              subtitle={`${timeline.length} sighting${timeline.length === 1 ? "" : "s"} · chronological route`}
+            />
           </div>
-          <div className="h-[420px]">
-            <MapContainer center={center} zoom={12} style={{ height: "100%", width: "100%" }}>
-              <TileLayer
-                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              />
-              <FitBounds points={points} />
-              {points.length > 1 && (
-                <Polyline positions={points} pathOptions={{ color: "#ef4444", weight: 4, opacity: 0.85 }} />
-              )}
-              {timeline.map((t, i) => (
-                <Marker key={t.id} position={[t.latitude, t.longitude]} icon={alertIcon}>
-                  <Popup>
-                    <div style={{ fontFamily: "monospace", fontSize: 12 }}>
-                      <strong>{detail.plate}</strong>
-                      <br />
-                      Marker {i + 1} / {timeline.length}
-                      <br />
-                      Time: {new Date(t.detected_at).toLocaleTimeString()}
-                      <br />
-                      Lat: {t.latitude.toFixed(6)}
-                      <br />
-                      Lng: {t.longitude.toFixed(6)}
-                      <br />
-                      Confidence: {t.confidence ? `${Math.round(t.confidence * 100)}%` : "—"}
-                      <br />
-                      Device: {t.device_id.slice(0, 8)}…
-                    </div>
-                  </Popup>
-                </Marker>
-              ))}
-            </MapContainer>
+          <div className="mt-4">
+            <Suspense
+              fallback={
+                <div className="flex h-[420px] items-center justify-center bg-surface-bg text-sm text-surface-muted">
+                  <Skeleton className="h-full w-full rounded-none" />
+                </div>
+              }
+            >
+              <VehicleMap plate={detail.plate} points={timeline} />
+            </Suspense>
           </div>
-        </div>
+        </Card>
 
-        <div className="space-y-6">
-          <div className="rounded-xl bg-slate-900 ring-1 ring-slate-800">
-            <div className="border-b border-slate-800 px-5 py-3 font-semibold text-sm">Detection timeline</div>
+        <div className="space-y-6 xl:col-span-2">
+          <Card padding="none">
+            <div className="p-5 pb-0">
+              <CardHeader title="Detection timeline" subtitle="Newest first, numbered as on the map." />
+            </div>
             {timeline.length === 0 ? (
-              <div className="p-6 text-center text-sm text-slate-500">No sightings yet.</div>
+              <p className="px-5 py-8 text-center text-sm text-surface-muted">
+                No sightings recorded for this vehicle yet.
+              </p>
             ) : (
-              <ol className="divide-y divide-slate-800/60 max-h-96 overflow-auto">
-                {timeline.map((t, i) => (
-                  <li key={t.id} className="px-5 py-3 flex items-start gap-3">
-                    <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-red-600 text-[10px] font-bold text-white">
-                      {i + 1}
-                    </span>
-                    <div className="min-w-0">
-                      <p className="text-xs font-semibold text-white">
-                        {new Date(t.detected_at).toLocaleString()}
-                      </p>
-                      <p className="text-xs font-mono text-slate-400 truncate">
-                        {t.latitude.toFixed(5)}, {t.longitude.toFixed(5)}
-                      </p>
-                      <p className="text-[11px] text-slate-600">
-                        {t.confidence ? `${Math.round(t.confidence * 100)}% conf · ` : ""}
-                        device {t.device_id.slice(0, 8)}…
-                      </p>
-                    </div>
-                  </li>
-                ))}
+              <ol className="scrollbar-thin mt-4 max-h-[420px] divide-y divide-surface-border overflow-y-auto">
+                {[...timeline].reverse().map((t, i) => {
+                  const n = timeline.length - i;
+                  return (
+                    <li key={t.id} className="flex items-start gap-3 px-5 py-3 transition-colors hover:bg-surface-bg">
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-solid-danger text-[10px] font-bold text-white">
+                        {n}
+                      </span>
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-surface-text">
+                          {new Date(t.detected_at).toLocaleString()}
+                        </p>
+                        <p className="mt-0.5 inline-flex items-center gap-1.5 font-mono text-xs text-surface-muted">
+                          <MapPin className="h-3 w-3" aria-hidden />
+                          {formatCoords(t.latitude, t.longitude)}
+                        </p>
+                        <p className="mt-0.5 inline-flex items-center gap-1.5 text-[11px] text-surface-subtle">
+                          <RadioTower className="h-3 w-3" aria-hidden />
+                          {t.confidence ? `${Math.round(t.confidence * 100)}% conf · ` : ""}
+                          device {t.device_id.slice(0, 8)}…
+                        </p>
+                      </div>
+                    </li>
+                  );
+                })}
               </ol>
             )}
-          </div>
+          </Card>
 
-          {detail.complaint && (
-            <div className="rounded-xl bg-slate-900 ring-1 ring-slate-800 p-5">
-              <p className="mb-2 font-semibold text-sm">Complaint</p>
-              <p className="text-xs text-slate-400">
-                Type: <span className="text-white">{detail.complaint.type}</span>
-              </p>
-              <p className="text-xs text-slate-400">
-                Status: <span className="text-white">{detail.complaint.status}</span>
-              </p>
-              <p className="mt-2 text-xs text-slate-500">{detail.complaint.description || "No description"}</p>
-            </div>
-          )}
+          {detail.complaint ? (
+            <Card>
+              <CardHeader title="Originating complaint" />
+              <dl className="mt-4 space-y-2 text-sm">
+                {detail.complaint.type ? (
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-surface-muted">Type</dt>
+                    <dd className="font-medium capitalize text-surface-text">
+                      {detail.complaint.type.replace(/_/g, " ")}
+                    </dd>
+                  </div>
+                ) : null}
+                {detail.complaint.status ? (
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-surface-muted">Status</dt>
+                    <dd>
+                      <StatusChip status={detail.complaint.status} />
+                    </dd>
+                  </div>
+                ) : null}
+              </dl>
+              {detail.complaint.description ? (
+                <p className="mt-3 border-t border-surface-border pt-3 text-sm text-surface-muted">
+                  {detail.complaint.description}
+                </p>
+              ) : null}
+            </Card>
+          ) : null}
         </div>
       </div>
     </div>

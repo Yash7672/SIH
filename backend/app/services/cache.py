@@ -104,6 +104,20 @@ class CacheService:
         except Exception:
             return True
 
+    def cooldown(self, key: str, seconds: int) -> bool:
+        """Return True if the caller may proceed now, and block repeats for `seconds`.
+
+        Unlike throttle (a per-window count limit), this is a strict lock: only the
+        first caller within the window is allowed.
+        """
+        if not self.available:
+            return True  # fail open — DB remains source of truth
+        try:
+            rkey = f"rakshak:cooldown:{key}"
+            return bool(self._client.set(rkey, "1", nx=True, ex=seconds))
+        except Exception:
+            return True
+
     def set_json(self, key: str, value: dict, ttl: int = 60) -> None:
         if not self.available:
             return

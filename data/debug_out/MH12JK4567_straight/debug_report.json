@@ -1,0 +1,264 @@
+{
+  "image": "C:\\Users\\yashw\\AppData\\Local\\Temp\\opencode\\repro\\MH12JK4567_straight.jpg",
+  "size": [
+    1280,
+    960
+  ],
+  "detector_events": [
+    "yolo: 0 box(es) >= conf 0.25",
+    "detect: YOLO found nothing - falling back to contours",
+    "contour: best box=(259, 594, 1021, 824) aspect=4.44",
+    "detect: CONTOUR fallback used box=(259, 594, 1021, 824) padded=(183, 553, 1097, 865)"
+  ],
+  "stages": {
+    "crop": {
+      "detector": "contour",
+      "raw_box": [
+        259,
+        594,
+        1021,
+        824
+      ],
+      "padded_box": [
+        183,
+        553,
+        1097,
+        865
+      ],
+      "confidence": null,
+      "crop_size": [
+        914,
+        312
+      ]
+    },
+    "preprocessed": {
+      "deskew_deg": 0.0,
+      "size": [
+        736,
+        251
+      ]
+    },
+    "raw_hits": {
+      "crop_raw": [
+        {
+          "text": "IND",
+          "conf": 0.9937,
+          "box": "x[82-115] y[149-170]",
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4867",
+          "conf": 0.8731,
+          "box": "x[440-570] y[148-167]",
+          "normalized": "M12JK4867",
+          "valid": false,
+          "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+        }
+      ],
+      "crop_focused": [
+        {
+          "text": "IND",
+          "conf": 0.99,
+          "box": "x[37-68] y[117-138]",
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4867",
+          "conf": 0.9152,
+          "box": "x[393-522] y[116-135]",
+          "normalized": "M12JK4867",
+          "valid": false,
+          "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+        }
+      ],
+      "crop_focused_preprocessed": [
+        {
+          "text": "IND",
+          "conf": 0.99,
+          "box": "x[33-61] y[105-123]",
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4067",
+          "conf": 0.8901,
+          "box": "x[352-467] y[103-121]",
+          "normalized": "M12JK4067",
+          "valid": false,
+          "reason": "invalid: MI2JK4067 fails pattern/whitelist (tried: M12JK4067, MI2JK4067, MI2JK4O67)"
+        }
+      ],
+      "crop_preprocessed": [
+        {
+          "text": "ONI",
+          "conf": 0.9489,
+          "box": "x[66-92] y[120-137]",
+          "normalized": "ONI",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4067",
+          "conf": 0.9196,
+          "box": "x[354-458] y[118-135]",
+          "normalized": "M12JK4067",
+          "valid": false,
+          "reason": "invalid: MI2JK4067 fails pattern/whitelist (tried: M12JK4067, MI2JK4067, MI2JK4O67)"
+        }
+      ]
+    },
+    "merged": {
+      "crop_raw": [
+        {
+          "text": "M12JK4867",
+          "conf": 0.8731,
+          "normalized": "M12JK4867",
+          "valid": false,
+          "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+        }
+      ],
+      "crop_focused": [
+        {
+          "text": "M12JK4867",
+          "conf": 0.9152,
+          "normalized": "M12JK4867",
+          "valid": false,
+          "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+        }
+      ],
+      "crop_focused_preprocessed": [
+        {
+          "text": "M12JK4067",
+          "conf": 0.8901,
+          "normalized": "M12JK4067",
+          "valid": false,
+          "reason": "invalid: MI2JK4067 fails pattern/whitelist (tried: M12JK4067, MI2JK4067, MI2JK4O67)"
+        }
+      ],
+      "crop_preprocessed": [
+        {
+          "text": "ONIM12JK4067",
+          "conf": 0.9196,
+          "normalized": "ONIM12JK4067",
+          "valid": false,
+          "reason": "length 12 is not a plate length (8-10)"
+        }
+      ]
+    },
+    "candidates": {
+      "crop_raw": [
+        {
+          "text": "IND",
+          "conf": 0.9937,
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4867",
+          "conf": 0.8731,
+          "normalized": "M12JK4867",
+          "valid": false,
+          "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+        }
+      ],
+      "crop_focused": [
+        {
+          "text": "IND",
+          "conf": 0.99,
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4867",
+          "conf": 0.9152,
+          "normalized": "M12JK4867",
+          "valid": false,
+          "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+        }
+      ],
+      "crop_focused_preprocessed": [
+        {
+          "text": "IND",
+          "conf": 0.99,
+          "normalized": "IND",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4067",
+          "conf": 0.8901,
+          "normalized": "M12JK4067",
+          "valid": false,
+          "reason": "invalid: MI2JK4067 fails pattern/whitelist (tried: M12JK4067, MI2JK4067, MI2JK4O67)"
+        }
+      ],
+      "crop_preprocessed": [
+        {
+          "text": "ONI",
+          "conf": 0.9489,
+          "normalized": "ONI",
+          "valid": false,
+          "reason": "length 3 is not a plate length (8-10)"
+        },
+        {
+          "text": "M12JK4067",
+          "conf": 0.9196,
+          "normalized": "M12JK4067",
+          "valid": false,
+          "reason": "invalid: MI2JK4067 fails pattern/whitelist (tried: M12JK4067, MI2JK4067, MI2JK4O67)"
+        },
+        {
+          "text": "ONIM12JK4067",
+          "conf": 0.9196,
+          "normalized": "ONIM12JK4067",
+          "valid": false,
+          "reason": "length 12 is not a plate length (8-10)"
+        }
+      ]
+    },
+    "fullframe_hits": [
+      {
+        "text": "IND",
+        "conf": 0.9924,
+        "normalized": "IND",
+        "valid": false,
+        "reason": "length 3 is not a plate length (8-10)"
+      },
+      {
+        "text": "0t 12 JK 4867",
+        "conf": 0.8045,
+        "normalized": "0T12JK4867",
+        "valid": false,
+        "reason": "invalid: OT12JK4867 fails pattern/whitelist (tried: 0T12JK4867, OT12JK4867, OT1ZJK4867)"
+      }
+    ],
+    "normalize": [
+      {
+        "raw": "IND",
+        "normalized": "IND",
+        "valid": false,
+        "reason": "length 3 is not a plate length (8-10)"
+      },
+      {
+        "raw": "0t 12 JK 4867",
+        "normalized": "0T12JK4867",
+        "valid": false,
+        "reason": "invalid: OT12JK4867 fails pattern/whitelist (tried: 0T12JK4867, OT12JK4867, OT1ZJK4867)"
+      },
+      {
+        "raw": "M12JK4867",
+        "normalized": "M12JK4867",
+        "valid": false,
+        "reason": "invalid: MI2JK4867 fails pattern/whitelist (tried: M12JK4867, MI2JK4867, MI2JK4B67)"
+      }
+    ]
+  },
+  "final": null
+}

@@ -158,6 +158,8 @@ class Hotlist(Base):
         Index("idx_hotlist_status", "status"),
         Index("idx_hotlist_expiry", "expiry_at"),
         Index("idx_hotlist_added_at", "added_at"),
+        # Covers the Redis-miss fallback lookup: active plate -> newest entry.
+        Index("idx_hotlist_plate_status_added", "plate", "status", "added_at"),
     )
 
 
@@ -181,6 +183,8 @@ class Sighting(Base):
         Index("idx_sightings_device_id", "device_id"),
         Index("idx_sightings_hotlist_id", "hotlist_id"),
         Index("idx_sightings_created_at", "created_at"),
+        # Covers the vehicle timeline/route queries (filter by hotlist, order by time).
+        Index("idx_sightings_hotlist_detected", "hotlist_id", "detected_at"),
     )
 
 

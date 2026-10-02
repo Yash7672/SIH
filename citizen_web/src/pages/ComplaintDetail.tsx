@@ -1,102 +1,225 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, Complaint, STATUS_COLORS } from "../services/api";
+import {
+  BadgeCheck,
+  Check,
+  ChevronLeft,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  X,
+} from "lucide-react";
+import { api, Complaint } from "../services/api";
+import { Button } from "../components/ui/Button";
+import { Card, CardHeader } from "../components/ui/Card";
+import { ErrorState, PageSkeleton } from "../components/ui/Feedback";
+import { PlateBadge, StatusChip } from "../components/ui/StatusChip";
 
-const TIMELINE: Record<string, string[]> = {
-  PENDING: ["Submitted"],
-  UNDER_REVIEW: ["Submitted", "Under review"],
-  VERIFIED: ["Submitted", "Under review", "Verified"],
-  REJECTED: ["Submitted", "Under review", "Rejected"],
-  HOTLISTED: ["Submitted", "Under review", "Verified", "Hotlisted"],
-  CLOSED: ["Submitted", "Under review", "Verified", "Hotlisted", "Closed"],
+const TIMELINE: Record<string, { steps: string[]; outcome: "open" | "verified" | "hotlisted" | "rejected" }> = {
+  PENDING: { steps: ["Submitted"], outcome: "open" },
+  UNDER_REVIEW: { steps: ["Submitted", "Under review"], outcome: "open" },
+  VERIFIED: { steps: ["Submitted", "Under review", "Verified"], outcome: "verified" },
+  HOTLISTED: { steps: ["Submitted", "Under review", "Verified", "Hotlisted"], outcome: "hotlisted" },
+  CLOSED: { steps: ["Submitted", "Under review", "Verified", "Hotlisted", "Closed"], outcome: "verified" },
+  REJECTED: { steps: ["Submitted", "Under review", "Rejected"], outcome: "rejected" },
 };
+
+/** The short explanation under the timeline, one per verification outcome. */
+function OutcomeNote({ status }: { status: string }) {
+  const { outcome } = TIMELINE[status] || { outcome: "open" as const };
+
+  if (outcome === "rejected") {
+    return (
+      <div className="rounded-xl border border-danger/40 bg-danger/10 p-4 text-sm text-danger">
+        <p className="flex items-center gap-2 font-semibold">
+          <X className="h-4 w-4" aria-hidden /> Not added to the hotlist
+        </p>
+        <p className="mt-1">
+          Police could not verify this report. If you have more evidence, contact the station directly with the
+          complaint ID.
+        </p>
+      </div>
+    );
+  }
+
+  if (outcome === "hotlisted") {
+    return (
+      <div className="rounded-xl border border-danger/40 bg-danger/10 p-4 text-sm text-danger">
+        <p className="flex items-center gap-2 font-semibold">
+          <ShieldAlert className="h-4 w-4" aria-hidden /> Active hotlist entry
+        </p>
+        <p className="mt-1">
+          Volunteers&apos; scanners now flag sightings of this vehicle and alert police in real time.
+        </p>
+      </div>
+    );
+  }
+
+  if (outcome === "verified") {
+    return (
+      <div className="rounded-xl border border-success/40 bg-success/10 p-4 text-sm text-success">
+        <p className="flex items-center gap-2 font-semibold">
+          <BadgeCheck className="h-4 w-4" aria-hidden /> Verified by police
+        </p>
+        <p className="mt-1">
+          Thank you - this report was confirmed and passed to the operations team.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-surface-border bg-surface-raised p-4 text-sm text-surface-muted">
+      Police are still verifying this report. Most complaints are reviewed within 24 hours.
+    </div>
+  );
+}
 
 export default function ComplaintDetail() {
   const { id } = useParams();
   const [complaint, setComplaint] = useState<Complaint | null>(null);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    api.get<Complaint>(`/complaints/${id}`)
+  const load = useCallback(() => {
+    setError(null);
+    api
+      .get<Complaint>(`/complaints/${id}`)
       .then((r) => setComplaint(r.data))
-      .catch((e) => setError(e.response?.data?.detail || "Failed to load"));
+      .catch((e) => {
+        const detail = e.response?.data?.detail;
+        setError(typeof detail === "string" ? detail : "Could not load this complaint");
+      });
   }, [id]);
 
-  if (error) return <div className="rounded-lg bg-red-50 p-4 text-sm text-red-700">{error}</div>;
-  if (!complaint) return <div className="p-8 text-center text-sm text-slate-400">Loading…</div>;
+  useEffect(load, [load]);
 
-  const steps = TIMELINE[complaint.status] || ["Submitted"];
-  const allSteps = ["Submitted", "Under review", "Verified", "Hotlisted"];
-  const currentIndex = steps.length - 1;
+  if (error) {
+    return (
+      <div className="mx-auto max-w-2xl space-y-4">
+        <Link
+          to="/complaints"
+          className="inline-flex items-center gap-1.5 text-sm font-medium text-primary-600 hover:text-primary-700"
+        >
+          <ChevronLeft className="h-4 w-4" aria-hidden /> Back to my complaints
+        </Link>
+        <Card padding="none">
+          <ErrorState title="Could not load this complaint" description={error} onRetry={load} />
+        </Card>
+      </div>
+    );
+  }
+
+  if (!complaint) return <PageSkeleton rows={3} />;
+
+  const flow = TIMELINE[complaint.status] || TIMELINE.PENDING;
+  const reached = flow.steps.length;
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
-      <div>
-        <Link to="/complaints" className="text-sm text-brand-600 hover:underline">← Back to my complaints</Link>
-        <div className="mt-2 flex items-center justify-between">
-          <h1 className="font-mono text-2xl font-bold text-slate-900">{complaint.plate}</h1>
-          <span className={`inline-flex rounded-full px-3 py-1 text-sm font-medium ring-1 ring-inset ${STATUS_COLORS[complaint.status]}`}>
-            {complaint.status.replace(/_/g, " ")}
-          </span>
+      <Link
+        to="/complaints"
+        className="inline-flex items-center gap-1.5 text-sm font-medium text-primary-600 hover:text-primary-700"
+      >
+        <ChevronLeft className="h-4 w-4" aria-hidden /> Back to my complaints
+      </Link>
+
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="min-w-0">
+          <PlateBadge plate={complaint.plate} size="lg" />
+          <p className="mt-2.5 text-xs text-surface-muted">
+            Complaint ID <code className="font-mono text-surface-text">{complaint.id}</code>
+          </p>
         </div>
-        <p className="mt-1 text-sm text-slate-500">
-          Complaint ID: <code className="font-mono text-xs">{complaint.id}</code>
-        </p>
+        <StatusChip status={complaint.status} className="px-3 py-1.5 text-sm" />
       </div>
 
-      <div className="rounded-xl bg-white p-6 ring-1 ring-slate-200">
-        <h2 className="mb-4 font-semibold text-slate-700">Status timeline</h2>
-        <ol className="flex items-center">
-          {allSteps.map((step, i) => {
-            const done = i <= currentIndex;
+      <Card padding="none">
+        <div className="p-5 pb-0">
+          <CardHeader title="Status timeline" subtitle="Each step is recorded by the verifying officer." />
+        </div>
+        <ol className="mt-5 space-y-0 px-5 pb-5">
+          {flow.steps.map((step, i) => {
+            const done = i < reached;
+            const current = i === flow.steps.length - 1;
+            const rejected = flow.outcome === "rejected" && current;
             return (
-              <li key={step} className={`flex-1 ${i === 0 ? "" : ""}`}>
-                <div className="flex flex-col items-center">
-                  <div
-                    className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold ${
-                      done ? "bg-brand-600 text-white" : "bg-slate-200 text-slate-500"
-                    }`}
-                  >
-                    {i + 1}
-                  </div>
-                  <span className={`mt-2 text-center text-xs ${done ? "text-slate-800 font-medium" : "text-slate-400"}`}>{step}</span>
-                </div>
-                {i < allSteps.length - 1 && (
-                  <div className="hidden" />
+              <li key={step} className="relative flex gap-4 pb-5 last:pb-0">
+                {current ? null : (
+                  <span
+                    className={[
+                      "absolute left-[13px] top-7 h-full w-0.5",
+                      done && !rejected ? "bg-primary-200" : "bg-surface-border",
+                    ].join(" ")}
+                    aria-hidden
+                  />
                 )}
+                <span
+                  className={[
+                    "z-10 flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
+                    rejected
+                      ? "bg-danger/15 text-danger"
+                      : done
+                        ? "bg-solid text-white"
+                        : "bg-surface-raised text-surface-subtle",
+                  ].join(" ")}
+                  aria-hidden
+                >
+                  {done ? <Check className="h-4 w-4" /> : <ShieldCheck className="h-3 w-3" />}
+                </span>
+                <div className="min-w-0 pt-0.5">
+                  <p
+                    className={[
+                      "text-sm font-medium",
+                      rejected ? "text-danger" : done ? "text-surface-text" : "text-surface-muted",
+                    ].join(" ")}
+                  >
+                    {step}
+                  </p>
+                  {current ? <p className="mt-0.5 text-xs text-surface-muted">Current status</p> : null}
+                </div>
               </li>
             );
           })}
         </ol>
-      </div>
+      </Card>
 
-      <div className="rounded-xl bg-white p-6 ring-1 ring-slate-200">
-        <h2 className="mb-3 font-semibold text-slate-700">Details</h2>
-        <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+      <OutcomeNote status={complaint.status} />
+
+      <Card>
+        <CardHeader title="Report details" />
+        <dl className="mt-4 grid grid-cols-1 gap-4 text-sm sm:grid-cols-2">
           <div>
-            <dt className="text-slate-500">Type</dt>
-            <dd className="font-medium text-slate-900">{complaint.complaint_type}</dd>
+            <dt className="text-surface-muted">Type</dt>
+            <dd className="mt-0.5 font-medium capitalize text-surface-text">
+              {String(complaint.complaint_type).replace(/_/g, " ")}
+            </dd>
           </div>
           <div>
-            <dt className="text-slate-500">Submitted</dt>
-            <dd className="font-medium text-slate-900">{new Date(complaint.created_at).toLocaleString()}</dd>
+            <dt className="text-surface-muted">Submitted</dt>
+            <dd className="mt-0.5 font-medium text-surface-text">
+              {new Date(complaint.created_at).toLocaleString()}
+            </dd>
           </div>
           <div>
-            <dt className="text-slate-500">Last updated</dt>
-            <dd className="font-medium text-slate-900">{new Date(complaint.updated_at).toLocaleString()}</dd>
+            <dt className="text-surface-muted">Last updated</dt>
+            <dd className="mt-0.5 font-medium text-surface-text">
+              {new Date(complaint.updated_at).toLocaleString()}
+            </dd>
           </div>
           <div className="sm:col-span-2">
-            <dt className="text-slate-500">Description</dt>
-            <dd className="mt-1 text-slate-800">{complaint.description || "—"}</dd>
+            <dt className="text-surface-muted">Description</dt>
+            <dd className="mt-0.5 whitespace-pre-line text-surface-text">
+              {complaint.description || "No description provided."}
+            </dd>
           </div>
         </dl>
-      </div>
+      </Card>
 
-      {complaint.status === "HOTLISTED" && (
-        <div className="rounded-xl bg-red-50 p-4 text-sm text-red-800 ring-1 ring-red-200">
-          This vehicle has been added to the active hotlist. Volunteers' scanners will now flag sightings for police.
-        </div>
-      )}
+      <div className="flex justify-end">
+        <Button variant="secondary" onClick={load} icon={<RefreshCw className="h-3.5 w-3.5" />}>
+          Refresh status
+        </Button>
+      </div>
     </div>
   );
 }

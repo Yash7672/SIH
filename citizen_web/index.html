@@ -3,7 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Report a stolen or missing vehicle and track police verification. Privacy-first crowdsourced ANPR." />
+    <meta name="theme-color" content="#F8FAFC" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>RAKSHAK — Citizen Portal</title>
+    <!-- Applies the saved theme before React boots so there is no white flash.
+         Keep in sync with applyTheme() in src/hooks/useTheme.ts. -->
+    <script>
+      (function () {
+        try {
+          var mode = localStorage.getItem("rakshak-theme");
+          var dark =
+            mode === "dark" ||
+            ((!mode || mode === "system") &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {
+          /* storage blocked: fall back to the light default in CSS */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

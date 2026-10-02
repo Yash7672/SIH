@@ -5,6 +5,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.models import Device, HotlistStatus, Sighting, utcnow
 from app.services.cache import cache_service
@@ -35,15 +36,29 @@ class SightingService:
         if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
             raise ValueError("Invalid coordinates")
 
+        # Fast path: the Redis set of active hotlist plates answers the common
+        # case (an arbitrary non-hotlisted plate) without touching PostgreSQL.
+        # PostgreSQL stays the source of truth whenever the cache is missing.
+        cached = cache_service.get_active_plates()
+        if cached is not None and plate not in cached:
+            logger.info("Non-hotlist plate detected (cache miss, not stored)")
+            return None
+
         entry = self.hotlist.get_active_by_plate(plate)
         if entry is None:
-            # Non-hotlisted plate: do NOT persist anything.
+            # Not hotlisted: do NOT persist anything. If the cache claimed it was
+            # hotlisted, drop the stale entry so the next lookup is cheap.
+            if cached is not None:
+                cache_service.remove_active_plate(plate)
             logger.info("Non-hotlist plate detected (not stored)")
             return None
+        if cached is None:
+            # Cache was cold/unavailable — warm it now that we have an answer.
+            cache_service.add_active_plate(plate)
 
         # Cooldown / duplicate suppression via Redis (fail-open if Redis down)
         cooldown_key = f"plate:{plate}:{device.id}"
-        if not cache_service.throttle(cooldown_key, 60):
+        if not cache_service.cooldown(cooldown_key, settings.DETECTION_COOLDOWN_SECONDS):
             logger.info("Detection throttled for plate (cooldown active)")
             return None
 

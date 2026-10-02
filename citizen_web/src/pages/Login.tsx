@@ -1,11 +1,17 @@
 import { FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, TokenResponse } from "../services/api";
+import { Eye, EyeOff } from "lucide-react";
+import { api, saveSession, TokenResponse } from "../services/api";
+import { Wordmark } from "../components/Brand";
+import { Button } from "../components/ui/Button";
+import { Input } from "../components/ui/Input";
+import { ThemeToggle } from "../components/ThemeToggle";
 
 export default function Login() {
   const nav = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -19,8 +25,7 @@ export default function Login() {
         setError("This portal is for citizens. Police should use the Police Dashboard.");
         return;
       }
-      localStorage.setItem("rakshak_token", data.access_token);
-      localStorage.setItem("rakshak_user", JSON.stringify(data.user));
+      saveSession(data);
       nav("/");
     } catch (err: any) {
       setError(err.response?.data?.detail || "Login failed");
@@ -30,55 +35,80 @@ export default function Login() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-brand-50 to-slate-100 px-4">
-      <div className="w-full max-w-md rounded-2xl bg-white p-8 shadow-xl ring-1 ring-slate-200">
-        <div className="mb-6 text-center">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-brand-600 text-xl font-bold text-white">R</div>
-          <h1 className="text-2xl font-bold text-slate-900">RAKSHAK</h1>
-          <p className="text-sm text-slate-500">Report a stolen vehicle</p>
+    <div className="relative flex min-h-screen items-center justify-center bg-gradient-to-br from-primary-50 via-surface-bg to-accent-50 px-4 py-10">
+      <div className="absolute right-4 top-4 z-10 sm:right-6 sm:top-6">
+        <ThemeToggle />
+      </div>
+
+      <div className="w-full max-w-md">
+        <div className="mb-6 flex flex-col items-center text-center">
+          <Wordmark />
+          <h1 className="mt-5 text-2xl font-semibold tracking-tight text-surface-text">
+            Report a stolen vehicle
+          </h1>
+          <p className="mt-1.5 text-sm text-surface-muted">
+            Privacy-first crowdsourced ANPR. Sign in to file and track complaints.
+          </p>
         </div>
-        <form onSubmit={submit} className="space-y-4">
-          <div>
-            <label className="mb-1 block text-sm font-medium text-slate-700">Email</label>
-            <input
+
+        <div className="rounded-2xl border border-surface-border bg-surface-card p-6 shadow-overlay sm:p-8">
+          <form onSubmit={submit} className="space-y-5" noValidate>
+            <Input
+              label="Email"
               type="email"
+              autoComplete="email"
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200"
               placeholder="citizen@example.com"
             />
-          </div>
-          <div>
-            <label className="mb-1 block text-sm font-medium text-slate-700">Password</label>
-            <input
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200"
-              placeholder="••••••••"
-            />
-          </div>
-          {error && (
-            <div className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 ring-1 ring-red-200">{error}</div>
-          )}
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
-          >
-            {loading ? "Signing in…" : "Sign in"}
-          </button>
-        </form>
-        <p className="mt-4 text-center text-sm text-slate-500">
-          No account?{" "}
-          <Link to="/register" className="font-medium text-brand-600 hover:underline">
-            Register as citizen
-          </Link>
-        </p>
-        <div className="mt-4 rounded-lg bg-slate-50 p-3 text-xs text-slate-500 ring-1 ring-slate-200">
-          Demo: <code className="font-mono">citizen@example.com</code> / <code className="font-mono">Citizen@123</code>
+
+            <div className="relative">
+              <Input
+                label="Password"
+                type={showPassword ? "text" : "password"}
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="pr-11"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                aria-label={showPassword ? "Hide password" : "Show password"}
+                className="absolute right-3 top-[30px] rounded p-1 text-surface-muted transition-colors hover:text-surface-text"
+              >
+                {showPassword ? <EyeOff className="h-4 w-4" aria-hidden /> : <Eye className="h-4 w-4" aria-hidden />}
+              </button>
+            </div>
+
+            {error ? (
+              <div
+                role="alert"
+                className="rounded-lg border border-danger/40 bg-danger/10 px-3.5 py-2.5 text-sm font-medium text-danger"
+              >
+                {error}
+              </div>
+            ) : null}
+
+            <Button type="submit" size="lg" fullWidth loading={loading}>
+              {loading ? "Signing in…" : "Sign in"}
+            </Button>
+          </form>
+
+          <p className="mt-5 text-center text-sm text-surface-muted">
+            No account?{" "}
+            <Link to="/register" className="font-medium text-primary-600 hover:text-primary-700 hover:underline">
+              Register as citizen
+            </Link>
+          </p>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-surface-border bg-surface-card/70 px-4 py-3 text-center text-xs text-surface-muted">
+          Demo · <code className="font-mono font-medium text-surface-text">citizen@example.com</code> /{" "}
+          <code className="font-mono font-medium text-surface-text">Citizen@123</code>
         </div>
       </div>
     </div>

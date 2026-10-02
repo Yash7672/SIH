@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { API_BASE, AlertEvent } from "../services/api";
+import { AlertEvent, WS_BASE } from "../services/api";
 
 export function usePoliceSocket(onAlert: (a: AlertEvent) => void) {
   const [connected, setConnected] = useState(false);
@@ -10,7 +10,9 @@ export function usePoliceSocket(onAlert: (a: AlertEvent) => void) {
   const connect = useCallback(() => {
     const token = localStorage.getItem("rakshak_token");
     if (!token) return;
-    const url = API_BASE.replace(/^http/, "ws") + "/api/v1/ws/police?token=" + token;
+    // WS_BASE comes from the same env value as the REST base URL (VITE_API_URL
+    // or VITE_WS_URL), so the dashboard never points at the Docker hostname.
+    const url = WS_BASE + "/api/v1/ws/police?token=" + token;
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;

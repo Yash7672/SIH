@@ -10,6 +10,7 @@ from app.models import Hotlist, Role, User
 from app.schemas.entities import HotlistCreate, HotlistOut, HotlistPatch
 from app.services.audit_service import log_action
 from app.services.hotlist_service import HotlistService
+from app.services.plate import normalize_plate
 
 router = APIRouter()
 
@@ -37,8 +38,19 @@ def create_hotlist(
     user: User = Depends(require_cop),
     db: Session = Depends(get_db),
 ):
+    """Add a plate to the hotlist.
+
+    The plate is normalized exactly like complaint intake and detection reports,
+    otherwise a hand-typed plate could never match an ANPR reading.
+    """
+    norm = normalize_plate(payload.plate)
+    if not norm.valid:
+        raise HTTPException(status_code=422, detail="Invalid Indian-style plate number")
+
     svc = HotlistService(db)
-    entry = svc.add_to_hotlist(payload.plate.upper(), complaint_id=payload.complaint_id, fir_reference=payload.fir_reference)
+    entry = svc.add_to_hotlist(
+        norm.normalized, complaint_id=payload.complaint_id, fir_reference=payload.fir_reference
+    )
     log_action(db, user.id, "hotlist.created", "hotlist", str(entry.id), {"plate": entry.plate})
     return entry
 

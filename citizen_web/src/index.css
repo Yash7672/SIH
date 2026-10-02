@@ -2,6 +2,388 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+/* RAKSHAK global base styles. Byte-identical to police_dashboard/src/index.css
+   (that app appends its Leaflet theme in a separate file, leaflet-theme.css).
+
+   Every theme colour is stored as space-separated RGB channels so Tailwind can
+   apply opacity modifiers: `bg-primary-600/25` becomes
+   `rgb(var(--primary-600) / 0.25)`. Light values live on :root, dark values
+   override them on `.dark`. */
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* --- Surfaces & text ------------------------------------------- */
+    --surface-bg: 248 250 252; /* #F8FAFC */
+    --surface-card: 255 255 255; /* #FFFFFF */
+    --surface-raised: 241 245 249; /* #F1F5F9 */
+    --surface-sunken: 241 245 249;
+    --surface-border: 226 232 240; /* #E2E8F0 */
+    --surface-text: 15 23 42; /* #0F172A */
+    --surface-muted: 90 107 133; /* #5A6B85 */
+    --surface-subtle: 124 140 165; /* #7C8CA5 */
+
+    /* --- Primary (tints + on-surface text) ------------------------- */
+    --primary-50: 238 241 255;
+    --primary-100: 224 229 255;
+    --primary-200: 199 207 255;
+    --primary-300: 163 174 255;
+    --primary-400: 110 119 238;
+    --primary-500: 85 96 224;
+    --primary-600: 47 75 216; /* links: 6.7:1 on white */
+    --primary-700: 38 63 175;
+    --primary-800: 29 44 135;
+    --primary-900: 11 20 55;
+
+    /* --- Accent (teal) ---------------------------------------------- */
+    --accent-50: 236 254 255;
+    --accent-100: 207 250 254;
+    --accent-200: 165 243 252;
+    --accent-300: 103 232 249;
+    --accent-400: 34 211 238;
+    --accent-500: 6 182 212;
+    --accent-600: 14 116 144;
+    --accent-700: 21 94 117;
+    --accent-800: 22 78 99;
+    --accent-900: 11 43 56;
+
+    /* --- Solid fills. Always dark enough for white text (AA) in BOTH
+           themes, unlike --primary-600 which flips for link contrast. --- */
+    --solid: 47 75 216; /* #2F4BD8 - white text 6.7:1 */
+    --solid-hover: 38 63 175; /* #263FAF */
+    --solid-danger: 185 29 28; /* #B91C1C - white text 6.6:1 */
+    --solid-danger-hover: 153 27 27;
+
+    /* --- Always-dark chrome (police sidebar, scanner) ---------------- */
+    --dark-900: 11 18 32;
+    --dark-800: 17 26 46;
+    --dark-700: 27 39 66;
+    --dark-600: 148 163 184; /* muted TEXT on dark chrome: 7.4:1 */
+
+    /* --- Semantic status (text / dot track) ------------------------- */
+    --success: 21 128 61;
+    --warning: 180 83 9;
+    --danger: 220 38 38;
+    --info: 3 105 161;
+
+    --status-pending: 180 83 9;
+    --status-under-review: 3 105 161;
+    --status-verified: 21 128 61;
+    --status-rejected: 220 38 38;
+    --status-hotlisted: 47 75 216;
+    --status-closed: 71 85 105;
+
+    /* --- Legacy alias kept so older classes still resolve ----------- */
+    --brand-50: 238 241 255;
+    --brand-100: 224 229 255;
+    --brand-500: 85 96 224;
+    --brand-600: 47 75 216;
+    --brand-700: 38 63 175;
+    --brand-900: 11 20 55;
+
+    /* --- Soft chips / badges ---------------------------------------- */
+    --chip-neutral-bg: 238 242 247;
+    --chip-neutral-fg: 51 65 85;
+    --chip-primary-bg: 230 234 255;
+    --chip-primary-fg: 29 44 135;
+    --chip-success-bg: 220 252 231;
+    --chip-success-fg: 20 83 45;
+    --chip-warning-bg: 254 243 199;
+    --chip-warning-fg: 120 53 15;
+    --chip-danger-bg: 254 226 226;
+    --chip-danger-fg: 127 29 29;
+    --chip-info-bg: 224 242 254;
+    --chip-info-fg: 7 89 133;
+
+    /* --- Decoration knobs. Tune the watermark here. ------------------ */
+    --wm-color: 125 196 255; /* #7DC4FF */
+    --wm-opacity: 0.08;
+    --glow: rgb(47 75 216 / 0.09);
+    --pattern-dot: rgb(15 23 42 / 0.3);
+    --pattern-line: rgb(15 23 42 / 0.16);
+
+    /* Table zebra / hover. */
+    --row-zebra: rgb(15 23 42 / 0.02);
+    --row-hover: rgb(47 75 216 / 0.06);
+
+    /* Recharts reads these so charts follow the theme. */
+    --chart-grid: rgb(15 23 42 / 0.08);
+    --chart-axis: #5a6b85;
+  }
+
+  .dark {
+    color-scheme: dark;
+
+    --surface-bg: 11 18 32; /* #0B1220 */
+    --surface-card: 17 26 46; /* #111A2E */
+    --surface-raised: 27 39 66; /* #1B2742 */
+    --surface-sunken: 15 26 47;
+    --surface-border: 38 53 82; /* #263552 */
+    --surface-text: 230 237 247; /* #E6EDF7 */
+    --surface-muted: 159 176 199; /* #9FB0C7 - 7.9:1 */
+    --surface-subtle: 140 156 181; /* #8C9CB5 */
+
+    --primary-50: 22 32 58;
+    --primary-100: 27 39 66;
+    --primary-200: 39 53 79;
+    --primary-300: 110 119 238;
+    --primary-400: 139 147 244;
+    --primary-500: 163 174 255;
+    --primary-600: 185 192 255; /* links: 11:1 on #0B1220 */
+    --primary-700: 211 215 255;
+    --primary-800: 230 233 255;
+    --primary-900: 255 255 255;
+
+    --accent-50: 14 36 50;
+    --accent-100: 18 58 74;
+    --accent-200: 22 78 99;
+    --accent-300: 34 211 238;
+    --accent-400: 76 224 245;
+    --accent-500: 123 235 255;
+    --accent-600: 165 243 252;
+    --accent-700: 207 250 254;
+    --accent-800: 230 251 255;
+    --accent-900: 255 255 255;
+
+    --solid: 59 88 232; /* #3B58E8 - white text 5.6:1 */
+    --solid-hover: 47 75 216; /* #2F4BD8 - white text 6.7:1 */
+    --solid-danger: 127 29 29; /* #7F1D1D - white text 9.1:1 */
+    --solid-danger-hover: 103 22 22;
+
+    --success: 74 222 128;
+    --warning: 251 191 36;
+    --danger: 248 113 113;
+    --info: 56 189 248;
+
+    --status-pending: 251 191 36;
+    --status-under-review: 56 189 248;
+    --status-verified: 74 222 128;
+    --status-rejected: 248 113 113;
+    --status-hotlisted: 185 192 255;
+    --status-closed: 148 163 184;
+
+    --brand-50: 27 39 66;
+    --brand-100: 39 53 79;
+    --brand-500: 163 174 255;
+    --brand-600: 185 192 255;
+    --brand-700: 211 215 255;
+    --brand-900: 255 255 255;
+
+    --chip-neutral-bg: 27 39 66;
+    --chip-neutral-fg: 203 213 225;
+    --chip-primary-bg: 36 48 92;
+    --chip-primary-fg: 199 207 255;
+    --chip-success-bg: 15 58 38;
+    --chip-success-fg: 134 239 172;
+    --chip-warning-bg: 69 48 17;
+    --chip-warning-fg: 252 211 77;
+    --chip-danger-bg: 74 21 25;
+    --chip-danger-fg: 252 165 165;
+    --chip-info-bg: 12 51 80;
+    --chip-info-fg: 125 211 252;
+
+    --wm-color: 125 196 255;
+    --wm-opacity: 0.07;
+    --glow: rgb(96 165 250 / 0.16);
+    --pattern-dot: rgb(190 215 255 / 0.55);
+    --pattern-line: rgb(190 215 255 / 0.28);
+
+    --row-zebra: rgb(148 163 184 / 0.05);
+    --row-hover: rgb(125 196 255 / 0.1);
+
+    --chart-grid: rgb(148 163 184 / 0.16);
+    --chart-axis: #9fb0c7;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-surface-bg text-surface-text antialiased;
+    font-family: theme("fontFamily.sans");
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    /* Smooth 150ms colour swap between themes; disabled under reduced motion. */
+    transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-primary-600;
+    --tw-ring-offset-color: var(--surface-bg);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply text-surface-text;
+    letter-spacing: -0.011em;
+  }
+
+  ::selection {
+    background-color: rgb(var(--primary-600) / 0.25);
+  }
+}
+
+@layer components {
+  /* ------------------------------------------------------------------ *
+   * Page decoration: a fixed dot-grid + diagonal texture + soft glow,
+   * and a centred low-opacity "POLICE" watermark. Both are pure CSS,
+   * fixed to the viewport (they never scroll) and cost nothing at
+   * runtime. Tune --wm-opacity / --wm-color / --pattern-dot in :root.
+   * ------------------------------------------------------------------ */
+  .page-decor {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background-color: rgb(var(--surface-bg));
+    background-image:
+      radial-gradient(60rem 40rem at 50% -14%, var(--glow) 0%, transparent 72%),
+      radial-gradient(var(--pattern-dot) 1px, transparent 1px),
+      repeating-linear-gradient(135deg, var(--pattern-line) 0 1px, transparent 1px 16px);
+    background-size:
+      100% 100%,
+      24px 24px,
+      auto;
+    -webkit-mask-image: radial-gradient(ellipse 120% 78% at 50% 0%, #000 0%, rgb(0 0 0 / 0.6) 58%, transparent 100%);
+    mask-image: radial-gradient(ellipse 120% 78% at 50% 0%, #000 0%, rgb(0 0 0 / 0.6) 58%, transparent 100%);
+  }
+
+  .page-watermark {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    overflow: hidden;
+  }
+
+  .page-watermark__text {
+    color: rgb(var(--wm-color));
+    opacity: var(--wm-opacity);
+    font-weight: 800;
+    text-transform: uppercase;
+    white-space: nowrap;
+    line-height: 1;
+    font-size: clamp(56px, 15vw, 220px);
+    letter-spacing: 0.3em;
+    /* Trailing letter-space pushes the word off-centre; pull it back. */
+    margin-right: -0.3em;
+  }
+
+  /* Optional shield mark above the word, same opacity. Inline SVG only. */
+  .page-watermark__shield {
+    display: block;
+    margin: 0 auto 0.12em;
+    width: clamp(40px, 8vw, 96px);
+    height: auto;
+    color: rgb(var(--wm-color));
+    opacity: var(--wm-opacity);
+  }
+
+  @media print {
+    .page-watermark,
+    .page-decor {
+      display: none !important;
+    }
+  }
+
+  @media (max-height: 420px) {
+    .page-watermark {
+      display: none;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Soft chips / badges / status pills. One class per tone so the
+   * status mapping stays identical across both web clients.
+   * ------------------------------------------------------------------ */
+  .chip-neutral {
+    background-color: rgb(var(--chip-neutral-bg));
+    color: rgb(var(--chip-neutral-fg));
+  }
+  .chip-primary {
+    background-color: rgb(var(--chip-primary-bg));
+    color: rgb(var(--chip-primary-fg));
+  }
+  .chip-success {
+    background-color: rgb(var(--chip-success-bg));
+    color: rgb(var(--chip-success-fg));
+  }
+  .chip-warning {
+    background-color: rgb(var(--chip-warning-bg));
+    color: rgb(var(--chip-warning-fg));
+  }
+  .chip-danger {
+    background-color: rgb(var(--chip-danger-bg));
+    color: rgb(var(--chip-danger-fg));
+  }
+  .chip-info {
+    background-color: rgb(var(--chip-info-bg));
+    color: rgb(var(--chip-info-fg));
+  }
+
+  /* Table rows: zebra banding and hover both come from tokens. */
+  .row-zebra-odd {
+    background-color: var(--row-zebra);
+  }
+  .row-zebra-even {
+    background-color: transparent;
+  }
+  .row-hover:hover {
+    background-color: var(--row-hover);
+  }
+
+  /* Thin scrollbar so long tables and dark sidebars do not dominate. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--surface-border)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background-color: rgb(var(--surface-border));
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(var(--surface-muted));
+  }
+
+  .scrollbar-dark {
+    scrollbar-width: thin;
+    scrollbar-color: #27354f transparent;
+  }
+  .scrollbar-dark::-webkit-scrollbar {
+    width: 6px;
+  }
+  .scrollbar-dark::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background-color: #27354f;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

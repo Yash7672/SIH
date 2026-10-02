@@ -51,5 +51,26 @@ def create_refresh_token(user_id: UUID, role: str) -> str:
     )
 
 
+class TokenError(Exception):
+    """Why a token was rejected, so the API can say which one.
+
+    "Invalid or expired token" covered both a merely stale access token and a
+    token signed with a different secret. Those need opposite responses - the
+    first refreshes silently, the second means every stored token is dead and
+    the user must log in again - so they must not share a message.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 def decode_token(token: str) -> dict:
-    return jwt.decode(token, settings.JWT_SECRET, algorithms=[ALGORITHM])
+    try:
+        return jwt.decode(token, settings.JWT_SECRET, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError as exc:
+        raise TokenError("Token expired") from exc
+    except jwt.InvalidTokenError as exc:
+        raise TokenError(
+            f"Invalid token ({type(exc).__name__}) - server secret may have changed"
+        ) from exc

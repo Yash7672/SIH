@@ -6,47 +6,49 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_cop
 from app.db.session import get_db
-from app.models import Complaint, ComplaintStatus, Device, Hotlist, HotlistStatus, Sighting
+from app.models import Complaint, ComplaintStatus, Device, Hotlist, HotlistStatus, Sighting, User
 
 router = APIRouter()
 
 
 @router.get("/overview")
 def overview(_: User = Depends(require_cop), db: Session = Depends(get_db)):
+    """Dashboard KPIs.
+
+    All counters are computed as scalar subqueries in a single round trip
+    instead of five separate COUNT queries.
+    """
     now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    active_hotlist = db.execute(
-        select(func.count()).select_from(Hotlist).where(
-            Hotlist.status.in_([HotlistStatus.ACTIVE, HotlistStatus.FIR_CONFIRMED])
+    def count_of(model, *conditions):
+        return select(func.count()).select_from(model).where(*conditions).scalar_subquery()
+
+    detections_today = count_of(Sighting, Sighting.detected_at >= day_start)
+
+    row = db.execute(
+        select(
+            count_of(Hotlist, Hotlist.status.in_([HotlistStatus.ACTIVE, HotlistStatus.FIR_CONFIRMED])).label(
+                "active_hotlist"
+            ),
+            count_of(
+                Complaint,
+                Complaint.status.in_([ComplaintStatus.PENDING, ComplaintStatus.UNDER_REVIEW]),
+            ).label("pending_complaints"),
+            detections_today.label("detections_today"),
+            detections_today.label("hotlist_matches_today"),
+            count_of(Hotlist, Hotlist.status == HotlistStatus.RECOVERED).label("recovered_vehicles"),
+            count_of(Device, Device.revoked.is_(False)).label("active_devices"),
         )
-    ).scalar_one()
-
-    pending_complaints = db.execute(
-        select(func.count()).select_from(Complaint).where(
-            Complaint.status.in_([ComplaintStatus.PENDING, ComplaintStatus.UNDER_REVIEW])
-        )
-    ).scalar_one()
-
-    detections_today = db.execute(
-        select(func.count()).select_from(Sighting).where(Sighting.detected_at >= day_start)
-    ).scalar_one()
-
-    recovered = db.execute(
-        select(func.count()).select_from(Hotlist).where(Hotlist.status == HotlistStatus.RECOVERED)
-    ).scalar_one()
-
-    active_devices = db.execute(
-        select(func.count()).select_from(Device).where(Device.revoked.is_(False))
-    ).scalar_one()
+    ).one()
 
     return {
-        "active_hotlist": active_hotlist,
-        "pending_complaints": pending_complaints,
-        "detections_today": detections_today,
-        "hotlist_matches_today": detections_today,
-        "recovered_vehicles": recovered,
-        "active_devices": active_devices,
+        "active_hotlist": row.active_hotlist,
+        "pending_complaints": row.pending_complaints,
+        "detections_today": row.detections_today,
+        "hotlist_matches_today": row.hotlist_matches_today,
+        "recovered_vehicles": row.recovered_vehicles,
+        "active_devices": row.active_devices,
     }
 
 

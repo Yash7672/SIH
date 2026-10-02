@@ -1,0 +1,291 @@
+{
+  "image": "data\\generated\\plate_3_MH12JK4567.png",
+  "size": [
+    1119,
+    266
+  ],
+  "detector_events": [
+    "yolo: 1 box(es) >= conf 0.25",
+    "detect: YOLO box=(1, 56, 1119, 228) conf=0.624 padded=(0, 26, 1119, 258) crop=1119x232"
+  ],
+  "stages": {
+    "crop": {
+      "detector": "yolo",
+      "raw_box": [
+        1,
+        56,
+        1119,
+        228
+      ],
+      "padded_box": [
+        0,
+        26,
+        1119,
+        258
+      ],
+      "confidence": 0.624,
+      "crop_size": [
+        1119,
+        232
+      ]
+    },
+    "preprocessed": {
+      "deskew_deg": 0.0,
+      "size": [
+        482,
+        100
+      ]
+    },
+    "raw_hits": {
+      "raw crop": [
+        {
+          "text": "4567",
+          "conf": 0.9995,
+          "box": "x[656-972] y[48-173]",
+          "normalized": "4567",
+          "valid": false,
+          "reason": "length 4 is not a plate length (8-10)"
+        },
+        {
+          "text": "12",
+          "conf": 0.9994,
+          "box": "x[225-383] y[75-182]",
+          "normalized": "12",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "JK",
+          "conf": 0.9987,
+          "box": "x[444-611] y[74-172]",
+          "normalized": "JK",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "MH",
+          "conf": 0.9982,
+          "box": "x[0-171] y[89-188]",
+          "normalized": "MH",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        }
+      ],
+      "preprocessed crop": [
+        {
+          "text": "JK",
+          "conf": 0.9997,
+          "box": "x[191-263] y[32-74]",
+          "normalized": "JK",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "4567",
+          "conf": 0.9998,
+          "box": "x[282-419] y[20-75]",
+          "normalized": "4567",
+          "valid": false,
+          "reason": "length 4 is not a plate length (8-10)"
+        },
+        {
+          "text": "MH",
+          "conf": 0.9987,
+          "box": "x[0-74] y[38-82]",
+          "normalized": "MH",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "12",
+          "conf": 0.9996,
+          "box": "x[96-166] y[31-79]",
+          "normalized": "12",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        }
+      ]
+    },
+    "merged": {
+      "raw crop": [
+        {
+          "text": "MH12JK4567",
+          "conf": 0.9982,
+          "normalized": "MH12JK4567",
+          "valid": true,
+          "reason": "exact match, state code MH is a valid RTO code"
+        }
+      ],
+      "preprocessed crop": [
+        {
+          "text": "MH12JK4567",
+          "conf": 0.9987,
+          "normalized": "MH12JK4567",
+          "valid": true,
+          "reason": "exact match, state code MH is a valid RTO code"
+        }
+      ]
+    },
+    "candidates": {
+      "raw crop": [
+        {
+          "text": "4567",
+          "conf": 0.9995,
+          "normalized": "4567",
+          "valid": false,
+          "reason": "length 4 is not a plate length (8-10)"
+        },
+        {
+          "text": "12",
+          "conf": 0.9994,
+          "normalized": "12",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "JK",
+          "conf": 0.9987,
+          "normalized": "JK",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "MH",
+          "conf": 0.9982,
+          "normalized": "MH",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "MH12JK4567",
+          "conf": 0.9982,
+          "normalized": "MH12JK4567",
+          "valid": true,
+          "reason": "exact match, state code MH is a valid RTO code"
+        }
+      ],
+      "preprocessed crop": [
+        {
+          "text": "JK",
+          "conf": 0.9997,
+          "normalized": "JK",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "4567",
+          "conf": 0.9998,
+          "normalized": "4567",
+          "valid": false,
+          "reason": "length 4 is not a plate length (8-10)"
+        },
+        {
+          "text": "MH",
+          "conf": 0.9987,
+          "normalized": "MH",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "12",
+          "conf": 0.9996,
+          "normalized": "12",
+          "valid": false,
+          "reason": "length 2 is not a plate length (8-10)"
+        },
+        {
+          "text": "MH12JK4567",
+          "conf": 0.9987,
+          "normalized": "MH12JK4567",
+          "valid": true,
+          "reason": "exact match, state code MH is a valid RTO code"
+        }
+      ]
+    },
+    "fullframe_hits": [
+      {
+        "text": "4567",
+        "conf": 0.9988,
+        "normalized": "4567",
+        "valid": false,
+        "reason": "length 4 is not a plate length (8-10)"
+      },
+      {
+        "text": "12",
+        "conf": 0.9998,
+        "normalized": "12",
+        "valid": false,
+        "reason": "length 2 is not a plate length (8-10)"
+      },
+      {
+        "text": "JK",
+        "conf": 0.9998,
+        "normalized": "JK",
+        "valid": false,
+        "reason": "length 2 is not a plate length (8-10)"
+      },
+      {
+        "text": "MH",
+        "conf": 0.9988,
+        "normalized": "MH",
+        "valid": false,
+        "reason": "length 2 is not a plate length (8-10)"
+      },
+      {
+        "text": "\u751f",
+        "conf": 0.6472,
+        "normalized": "\u751f",
+        "valid": false,
+        "reason": "length 1 is not a plate length (8-10)"
+      }
+    ],
+    "normalize": [
+      {
+        "raw": "12",
+        "normalized": "12",
+        "valid": false,
+        "reason": "length 2 is not a plate length (8-10)"
+      },
+      {
+        "raw": "JK",
+        "normalized": "JK",
+        "valid": false,
+        "reason": "length 2 is not a plate length (8-10)"
+      },
+      {
+        "raw": "4567",
+        "normalized": "4567",
+        "valid": false,
+        "reason": "length 4 is not a plate length (8-10)"
+      },
+      {
+        "raw": "MH",
+        "normalized": "MH",
+        "valid": false,
+        "reason": "length 2 is not a plate length (8-10)"
+      },
+      {
+        "raw": "\u751f",
+        "normalized": "\u751f",
+        "valid": false,
+        "reason": "length 1 is not a plate length (8-10)"
+      },
+      {
+        "raw": "MH12JK4567",
+        "normalized": "MH12JK4567",
+        "valid": true,
+        "reason": "exact match, state code MH is a valid RTO code"
+      }
+    ]
+  },
+  "final": {
+    "plate": "MH12JK4567",
+    "confidence": 0.999,
+    "valid": true,
+    "uncertain": false,
+    "source": "crop",
+    "stage": "crop_preprocessed",
+    "reason": "exact match, state code MH is a valid RTO code",
+    "votes": {}
+  }
+}
