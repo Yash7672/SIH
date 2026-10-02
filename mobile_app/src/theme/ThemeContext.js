@@ -1,14 +1,14 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useColorScheme } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { lightColors, darkColors } from "../theme";
+import { fallbackColors, lightColors, darkColors } from "../theme";
 
 const ThemeContext = createContext({
   mode: "system",
   setMode: () => {},
   isDark: false,
   ready: false,
-  colors: lightColors,
+  colors: fallbackColors,
 });
 
 /** Shared with the two web clients so one preference key drives all three. */

@@ -132,7 +132,15 @@ export const darkColors = {
   },
 };
 
-const colors = lightColors;
+// Backwards-compatible aliases. `colors` is imported by name from a few files
+// (e.g. components/ScannerGuideFrame.js), so it has to be a real named export
+// and not only a key of the default export below - otherwise those imports
+// resolve to undefined and the first read of `colors.something` throws at
+// module-evaluation time, before any screen renders.
+export const colors = lightColors;
+
+/** Safe palette for useTheme() when no ThemeProvider is mounted. */
+export const fallbackColors = lightColors;
 
 /**
  * Complaint status mapping. Identical to STATUS_STYLES in the web
