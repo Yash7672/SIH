@@ -60,7 +60,15 @@ async function fetchJson(url, options = {}) {
     if (error.message && error.message.startsWith("HTTP ")) {
       throw error;
     }
-    throw new Error(`Network error | URL=${url} | Reason=${error.message || "unknown"} | Timeout=${timeoutMs}ms`);
+    const reason = error?.message || "unknown";
+    // A fetch that rejects while BUILDING the request never touched the network
+    // ("Unsupported FormDataPart implementation" and friends). Only RN's
+    // "Network request failed" means the request went out and the link failed,
+    // so the two must not share a message or the real cause gets hidden.
+    if (/unsupported formdatapart|failed to construct|unsupported body|unsupported request|invalid formdata/i.test(reason)) {
+      throw new Error(`Request error: ${reason}`);
+    }
+    throw new Error(`Network error | URL=${url} | Reason=${reason} | Timeout=${timeoutMs}ms`);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -218,17 +226,26 @@ function describeHttpFailure(status, detail) {
   return `HTTP ${status}: ${detail}`;
 }
 
-async function request(method, path, { body, formData, retried = false, timeoutMs } = {}) {
+/**
+ * The one HTTP entry point: JSON in, JSON out, Bearer token attached.
+ *
+ * There is deliberately no multipart branch. Expo SDK 58's ambient fetch has its
+ * own FormData whose parts reject React Native's `{ uri, name, type }` file
+ * object with `Unsupported FormDataPart implementation`, thrown before the
+ * request leaves the phone. Upload binary data as base64 JSON instead - see
+ * scanImage(). Keeping the option alive would only be an accident waiting to
+ * happen.
+ */
+async function request(method, path, { body, retried = false, timeoutMs } = {}) {
   // Make sure a persisted token is loaded before the header is built.
   await restoreSessionOnce();
 
   const headers = {};
   if (session.token) headers.Authorization = `Bearer ${session.token}`;
   authDebug("request start", { method, path, authorizationAttached: !!session.token, retried });
+
   let payload;
-  if (formData) {
-    payload = formData;
-  } else if (body) {
+  if (body !== undefined && body !== null) {
     headers["Content-Type"] = "application/json";
     payload = JSON.stringify(body);
   }
@@ -251,7 +268,7 @@ async function request(method, path, { body, formData, retried = false, timeoutM
       throw error;
     }
     authDebug("retrying original request after refresh", { method, path });
-    return request(method, path, { body, formData, retried: true, timeoutMs });
+    return request(method, path, { body, retried: true, timeoutMs });
   }
 
   if (!response.ok) {
@@ -289,50 +306,56 @@ export async function registerDevice(name) {
   });
 }
 
-/** CPU OCR plus the lazy YOLO/OCR model load; see api.js healthCheck for the
- *  reasoning behind the cold/warm budget split. */
-export const SCAN_TIMEOUT_MS = 45000;
+/** Scan timeouts. The host runs CPU OCR and loads the YOLO + OCR models lazily,
+ *  so the very first scan after a backend restart pays a cold start measured at
+ *  ~14 s on the dev PC (more with a phone upload on top). Every later scan is
+ *  warm at ~4-6 s. */
+export const SCAN_TIMEOUT_COLD_MS = 45000;
+export const SCAN_TIMEOUT_WARM_MS = 30000;
 
-export async function scanImage(uri) {
-  const startedAt = Date.now();
+let scansCompleted = 0;
 
-  const send = async (part) => {
-    const formData = new FormData();
-    formData.append("image", part);
-    // No explicit Content-Type: React Native has to add the multipart boundary
-    // itself, and setting the header by hand is what produces "Network request
-    // failed" because the server then cannot find the part boundary.
-    return request("POST", "/scanner/scan", { formData, timeoutMs: SCAN_TIMEOUT_MS });
-  };
+/** Timeout for the next scan: generous on the first call, tighter afterwards. */
+export function scanTimeoutMs() {
+  return scansCompleted === 0 ? SCAN_TIMEOUT_COLD_MS : SCAN_TIMEOUT_WARM_MS;
+}
 
+/**
+ * Read a captured frame as bare base64 (no `data:` prefix).
+ * Failure here is a capture-side fault, so it is labelled as such rather than
+ * being allowed to look like a network problem.
+ */
+export async function frameToBase64(uri) {
   try {
-    const data = await send({ uri, name: "frame.jpg", type: "image/jpeg" });
-    return { ...data, elapsedMs: Date.now() - startedAt, uploadVia: "file-uri" };
+    return await new File(uri).base64();
   } catch (error) {
-    // Only a transport-level failure is worth re-encoding: an HTTP status means
-    // the server already answered, so re-sending the bytes cannot help.
-    const message = String(error?.message || error);
-    if (!/network error/i.test(message)) throw error;
-
-    // React Native resolves a multipart file part by streaming the file:// path
-    // itself. When that resolution fails the whole fetch() rejects as
-    // "Network request failed" even though GET /health and the JSON
-    // POST /sightings on the same host both work. Re-sending the same JPEG as a
-    // base64 data URI sidesteps the file-part resolution entirely.
-    console.warn(`[RAKSHAK] scan upload failed as file-uri (${message}); retrying as base64 data URI`);
-    let base64;
-    try {
-      base64 = await new File(uri).base64();
-    } catch (readError) {
-      throw new Error(`Captured image could not be read: ${readError?.message || readError} (upload failed: ${message})`);
-    }
-    try {
-      const data = await send({ uri: `data:image/jpeg;base64,${base64}`, name: "frame.jpg", type: "image/jpeg" });
-      return { ...data, elapsedMs: Date.now() - startedAt, uploadVia: "base64-fallback" };
-    } catch (retryError) {
-      throw new Error(`${retryError?.message || retryError} (file-uri attempt also failed: ${message})`);
-    }
+    throw new Error(`Could not prepare image: ${error?.message || error}`);
   }
+}
+
+/**
+ * POST one or more frames to /scanner/scan as JSON base64.
+ *
+ * Deliberately NOT multipart: Expo SDK 58's ambient fetch (expo/fetch via the
+ * winter runtime) has its own FormData implementation, and appending React
+ * Native's legacy `{ uri, name, type }` object to it throws
+ * `Unsupported FormDataPart implementation` before the request is ever sent.
+ * Base64 JSON has no FormData at all and behaves identically on every SDK.
+ *
+ * @param {string[]} base64Frames bare base64 JPEGs, 1-3 of them
+ */
+export async function scanImage(base64Frames) {
+  const frames = Array.isArray(base64Frames) ? base64Frames.filter(Boolean) : [base64Frames];
+  if (!frames.length) throw new Error("Could not prepare image: empty frame");
+
+  const startedAt = Date.now();
+  const payload = frames.length === 1 ? { image_b64: frames[0] } : { images_b64: frames };
+  const data = await request("POST", "/scanner/scan", {
+    body: payload,
+    timeoutMs: scanTimeoutMs(),
+  });
+  scansCompleted += 1;
+  return { ...data, elapsedMs: Date.now() - startedAt, uploadVia: "base64-json", framesSent: frames.length };
 }
 
 export async function reportSighting(sighting) {

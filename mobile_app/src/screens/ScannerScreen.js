@@ -2,14 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import { AppState, Vibration } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
-import { API_BASE, SCAN_TIMEOUT_MS, healthCheck, normalizePlate, registerDevice, reportSighting, scanImage } from "../services/api";
+import { API_BASE, frameToBase64, healthCheck, normalizePlate, registerDevice, reportSighting, scanImage, scanTimeoutMs } from "../services/api";
 import { getLocation } from "../services/location";
 import ScannerScreenView from "../components/ScannerScreenNew";
 
 const DEVICE_KEY = "rakshak_device_id";
 const SIM_PLATES = ["TS09AB1234", "MH12JK4567"];
-const MAX_UPLOAD_WIDTH = 1600;
-const CAPTURE_QUALITY = 0.85;
+// ~1280 px wide at JPEG 0.8 keeps a frame near 120-250 KB. The detector finds
+// the plate in the whole frame, so there is no reason to ship a 12 MP original
+// over the LAN, and base64 encoding would inflate it by another 4/3.
+const MAX_UPLOAD_WIDTH = 1280;
+const CAPTURE_QUALITY = 0.8;
 const VOTE_FRAMES = 3;
 const VOTE_INTERVAL_MS = 350;
 const EARLY_EXIT_CONFIDENCE = 0.85;
@@ -35,13 +38,13 @@ function mapErrorToState(e) {
   if (/capture failed/i.test(msg)) {
     return { state: "camera", message: `Could not capture photo: ${msg.replace(/^.*?:\s*/, "")}` };
   }
-  if (/could not be read/i.test(msg)) {
-    return { state: "camera", message: `Captured image unreadable: ${msg.replace(/^.*?:\s*/, "")}` };
+  if (/could not prepare image/i.test(msg)) {
+    return { state: "camera", message: `Could not prepare image: ${msg.replace(/^.*?:\s*/, "")}` };
   }
 
   // Session / auth.
   if (/HTTP 401/i.test(msg)) {
-    return { state: "session", message: "Session expired — log in again." };
+    return { state: "session", message: "Session expired, log in again." };
   }
   if (/HTTP 403/i.test(msg)) {
     return { state: "forbidden", message: "Not allowed — this account cannot file sightings." };
@@ -50,18 +53,23 @@ function mapErrorToState(e) {
   // Server answered with a status: report it verbatim, detail included.
   const m = msg.match(/HTTP (\d{3})/);
   if (m) {
-    if (m[1] === "413") return { state: "server", message: "Photo too large (413) — the scanner already resized it." };
     const detail = msg.slice(msg.indexOf(":") + 1).trim();
     return { state: "server", message: `Server error ${m[1]}: ${detail || "no detail returned"}` };
   }
 
   // Timeout is not a network fault; say which call ran out of time.
   if (/timeout after/i.test(msg)) {
-    return { state: "slow", message: `Scan timed out after ${SCAN_TIMEOUT_MS / 1000}s — the first scan loads the AI models, try again.` };
+    return { state: "slow", message: "Scan timed out, try again." };
   }
 
-  // Transport failure. fetchJson encodes the URL and the reason, so surface it
-  // instead of replacing it with boilerplate advice.
+  // Thrown while BUILDING the request, so nothing was sent. Reporting this as a
+  // network failure is what made the FormDataPart bug look like a dead backend.
+  if (/request error/i.test(msg)) {
+    const reason = msg.replace(/^.*?Request error:\s*/, "");
+    return { state: "request", message: `Request error: ${reason}` };
+  }
+
+  // Genuine transport failure: the request went out and the link failed.
   if (/network error/i.test(msg)) {
     const reason = (msg.match(/Reason=([^|]*)/) || [, "unknown"])[1].trim();
     return { state: "network", message: `Network error: ${reason} (${API_BASE})` };
@@ -115,20 +123,32 @@ export default function ScannerScreen({ user, onLogout }) {
     };
   }, []);
 
-  async function shrinkForUpload(photo) {
+  /**
+   * Resize to MAX_UPLOAD_WIDTH, compress, and return bare base64.
+   *
+   * The resize step also normalises EXIF rotation, which matters because a
+   * portrait phone frame arrives rotated and OCR would then read garbage.
+   * The WHOLE frame is sent: the backend detector finds the plate itself, so no
+   * crop of the on-screen guide rectangle is applied.
+   */
+  async function prepareFrame(photo) {
     const uri = photo?.uri;
-    if (!uri) return uri;
+    if (!uri) throw new Error("Camera did not return an image");
     try {
       const actions = photo.width && photo.width > MAX_UPLOAD_WIDTH ? [{ resize: { width: MAX_UPLOAD_WIDTH } }] : [];
       const result = await manipulateAsync(uri, actions, { compress: CAPTURE_QUALITY, format: SaveFormat.JPEG });
-      return result?.uri || uri;
-    } catch {
-      return uri;
+      return await frameToBase64(result?.uri || uri);
+    } catch (error) {
+      // prepareFrame's own errors already say "Could not prepare image"; do not
+      // relabel a manipulator fault as a read fault.
+      throw String(error?.message || "").startsWith("Could not prepare image")
+        ? error
+        : new Error(`Could not prepare image: ${error?.message || error}`);
     }
   }
 
   async function captureFrames(camRef) {
-    const uris = [];
+    const frames = [];
     for (let i = 0; i < VOTE_FRAMES; i += 1) {
       let photo;
       try {
@@ -142,10 +162,10 @@ export default function ScannerScreen({ user, onLogout }) {
       if (!photo || !photo.uri) {
         throw new Error(i === 0 ? "Camera did not return an image" : `Camera returned no image on frame ${i + 1}`);
       }
-      uris.push(await shrinkForUpload(photo));
+      frames.push(await prepareFrame(photo));
       if (i < VOTE_FRAMES - 1) await new Promise((r) => setTimeout(r, VOTE_INTERVAL_MS));
     }
-    return uris;
+    return frames;
   }
 
   function voteReads(reads) {
@@ -194,11 +214,11 @@ export default function ScannerScreen({ user, onLogout }) {
     if (processing.current || !focused) throw new Error("Camera is not ready");
     processing.current = true;
     try {
-      const uris = await captureFrames(camRef);
-      if (!uris.length) throw new Error("Camera did not return an image");
+      const frames = await captureFrames(camRef);
+      if (!frames.length) throw new Error("Camera did not return an image");
       const reads = [];
-      for (const uri of uris) {
-        const res = await scanImage(uri);
+      for (const frame of frames) {
+        const res = await scanImage([frame]);
         if (res && res.plate) {
           reads.push(res);
           if (!res.uncertain && Number(res.confidence || 0) >= EARLY_EXIT_CONFIDENCE) break;
@@ -209,7 +229,7 @@ export default function ScannerScreen({ user, onLogout }) {
       const normalized = normalizePlate(raw);
       const confidence = Number(best?.confidence || 0);
       const uncertain = Boolean(best?.uncertain) || !best?.valid || confidence < 0.5;
-      if (!raw) return { state: "none", frames: reads.length, message: "No plate detected — move closer and hold steady." };
+      if (!raw) return { state: "none", frames: reads.length, message: "No plate found, move closer and hold steady." };
       if (uncertain) {
         return {
           state: "uncertain",

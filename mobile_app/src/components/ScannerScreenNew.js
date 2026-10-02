@@ -118,14 +118,18 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
       setResult(scanResult);
       const pct = Math.round((scanResult.confidence || 0) * 100);
       const ok = scanResult.state === "success" || scanResult.state === "uncertain" || scanResult.state === "none";
-      // A scan that never reached the server is proof the backend is not usable
-      // right now, whatever the periodic health probe last reported.
-      if (scanResult.state === "network") setBackendState({ status: "OFFLINE", error: scanResult.message });
+      // The status pill belongs to the health check alone, never to one scan. A
+      // connection-level scan failure is confirmed with an immediate re-check:
+      // only if that also fails does the backend count as unreachable.
+      if (scanResult.state === "network") {
+        appendLog("scan: connection failed - confirming with a health check");
+        await runHealth(false);
+      }
       appendLog(
         `scan: ${scanResult.plate || "no plate"} ${pct}% frames=${scanResult.frames ?? 0} votes={${formatVotes(scanResult.votes)}} ` +
-          `state=${scanResult.state} http=${ok ? 200 : scanResult.state} ` +
-          `${scanResult.elapsedMs ? `upload=${scanResult.elapsedMs}ms via=${scanResult.uploadVia}` : `total=${totalMs}ms`} ` +
-          `${scanResult.message && !ok ? `| ${scanResult.message}` : ""}`.trim()
+          `state=${scanResult.state} ` +
+          `${scanResult.elapsedMs ? `${scanResult.elapsedMs}ms via=${scanResult.uploadVia}` : `${totalMs}ms`}` +
+          `${scanResult.message && !ok ? ` | ${scanResult.message}` : ""}`
       );
       if (scanResult.hotlist) {
         try {
@@ -138,7 +142,7 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
     } finally {
       setScanning(false);
     }
-  }, [scanning, camReady, focused, onScan, appendLog]);
+  }, [scanning, camReady, focused, onScan, appendLog, runHealth]);
 
   const simulate = useCallback(async () => {
     try {
@@ -246,6 +250,16 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
             <Text style={[s.offlineText, { color: colors.onDark.body }]} numberOfLines={2}>
               Backend unreachable{backendState.error ? `: ${backendState.error}` : ""}
             </Text>
+          </View>
+        ) : null}
+
+        {/* Scan faults get their own block. It sits inside the scroll content
+            with a top margin, so it can never slide under the fixed-height
+            camera container the way the old absolutely-positioned banner did. */}
+        {isErrorState(result) ? (
+          <View style={[s.errorBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
+            <Ionicons name="alert-circle-outline" size={15} color={colors.danger} />
+            <Text style={[s.offlineText, { color: colors.onDark.body }]}>{result.message}</Text>
           </View>
         ) : null}
 
@@ -388,7 +402,15 @@ function resultPill(result) {
   if (result.state === "success" && result.plate) return { tone: "#22C55E", text: result.plate };
   if (result.state === "uncertain") return { tone: "#F59E0B", text: `${result.plate || "?"} · uncertain` };
   if (result.state === "none") return { tone: "#EF4444", text: "NO PLATE" };
+  if (result.state === "network") return { tone: "#EF4444", text: "NO CONNECTION" };
+  if (result.message) return { tone: "#EF4444", text: result.state === "camera" ? "CAMERA" : "REQUEST FAILED" };
   return null;
+}
+
+/** True for states that represent a fault rather than a scan outcome. */
+function isErrorState(result) {
+  if (!result) return false;
+  return ["camera", "network", "request", "server", "slow", "session", "forbidden", "error"].includes(result.state);
 }
 
 function DebugRow({ label, value, valueColor, s, colors }) {
@@ -565,6 +587,18 @@ function makeStyles(colors) {
       gap: spacing.sm,
       margin: spacing.lg,
       marginBottom: 0,
+      padding: spacing.md,
+      borderRadius: radius.md,
+      borderWidth: 1,
+    },
+    // Normal flow block: a real top margin, no negative offset, so the banner
+    // starts below the camera rather than underneath it.
+    errorBanner: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      gap: spacing.sm,
+      marginHorizontal: spacing.lg,
+      marginTop: spacing.md,
       padding: spacing.md,
       borderRadius: radius.md,
       borderWidth: 1,

@@ -15,6 +15,7 @@ NO_MOBILE=0
 RESET=0
 FORCE_SEED=0
 SKIP_FIREWALL=0
+PHONE_STATE="not-checked"   # authorized | unauthorized | none | no-adb | not-checked
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -674,6 +675,58 @@ run_seeding() {
 # --------------------------------------------------------------------------- #
 # Step 9 - Expo (always on the host)
 # --------------------------------------------------------------------------- #
+# Keep the native modules on the SDK the installed `expo` expects, then report
+# doctor failures only - a wall of passing checks is noise in a start script.
+sync_expo_sdk() {
+  local cli="$MOBILE_DIR/node_modules/expo/bin/cli"
+  [ -f "$cli" ] || return 0
+
+  local out
+  out="$( cd "$MOBILE_DIR" && node "$cli" install --check 2>&1 || true )"
+  if printf '%s' "$out" | grep -qE 'should be updated|expected version'; then
+    step "mobile_app: native modules do not match this SDK - running expo install --fix"
+    ( cd "$MOBILE_DIR" && node "$cli" install --fix >"$LOG_DIR/npm-mobile_app.log" 2>&1 ) || true
+    ok "mobile_app: native modules realigned to the installed Expo SDK"
+  fi
+
+  # SDK 58 removed `expo doctor`; the standalone binary is the only route.
+  local doctor
+  doctor="$MOBILE_DIR/node_modules/.bin/expo-doctor"
+  if [ ! -x "$doctor" ]; then
+    warn "mobile_app: expo-doctor is not installed - run: npx expo install expo-doctor -- --save-dev"
+    return 0
+  fi
+  out="$( cd "$MOBILE_DIR" && "$doctor" 2>&1 || true )"
+  local line; line="$(printf '%s' "$out" | grep -Eo '[0-9]+/[0-9]+ checks passed' | head -n1)"
+  if [ -n "$line" ]; then
+    local passed total
+    passed="${line%%/*}"
+    total="$(printf '%s' "$line" | cut -d/ -f2 | cut -d' ' -f1)"
+    if [ "$passed" = "$total" ]; then
+      ok "mobile_app: expo-doctor $line"
+    else
+      warn "mobile_app: expo-doctor $line"
+      printf '%s' "$out" | grep -E '^[[:space:]]*(✖|Advice:|Install |Missing |npx expo )' | sed 's/^/    /' || true
+    fi
+  else
+    warn "mobile_app: expo-doctor produced no summary line"
+  fi
+}
+
+# authorized | unauthorized | none | no-adb. Never fails: no phone is normal.
+phone_state() {
+  local adb; adb="$(command -v adb 2>/dev/null || true)"
+  if [ -z "$adb" ] && [ -x "$STATE_DIR/platform-tools/adb" ]; then
+    adb="$STATE_DIR/platform-tools/adb"
+  fi
+  if [ -z "$adb" ]; then echo "no-adb"; return; fi
+
+  local out; out="$("$adb" devices 2>/dev/null || true)"
+  printf '%s' "$out" | grep -q 'unauthorized' && { echo "unauthorized"; return; }
+  printf '%s' "$out" | grep -qE '^device[[:space:]]' && { echo "authorized"; return; }
+  echo "none"
+}
+
 start_expo() {
   if [ "$NO_MOBILE" -eq 1 ]; then info "mobile app skipped (--no-mobile)"; return; fi
 
@@ -683,11 +736,32 @@ start_expo() {
     return
   fi
   npm_deps "$MOBILE_DIR" mobile-lock yes
+  sync_expo_sdk
   assert_port_free "$PORT_EXPO" expo prompt
 
-  # Metro must run on the HOST: a container breaks LAN/QR discovery.
+  # --clear when anything that shapes the bundle changed since the last run.
+  local cfg prev
+  cfg="$(hash_of "$MOBILE_DIR/package.json")$(hash_of "$MOBILE_DIR/app.json")$(hash_of "$MOBILE_DIR/.env")"
+  prev="$(hash_recorded expo-config)"
   local args="start --lan"
-  [ "$REBUILD" -eq 1 ] && args="$args --clear"
+  if [ "$REBUILD" -eq 1 ] || [ "$cfg" != "$prev" ]; then
+    args="$args --clear"
+    info "mobile_app: config changed since last run - starting Metro with --clear"
+  fi
+  record_hash expo-config "$cfg"
+
+  # A USB-attached phone lets the CLI install/open the matching Expo Go on it.
+  PHONE_STATE="$(phone_state)"
+  case "$PHONE_STATE" in
+    authorized)
+      ok "phone detected over USB - Expo CLI will open the app on it"
+      args="$args --android"
+      ;;
+    unauthorized)
+      warn 'phone seen but not authorised - tap "Allow USB debugging" on it, then re-run start.sh'
+      ;;
+  esac
+
   if [ -f "$MOBILE_DIR/node_modules/expo/bin/cli" ]; then
     start_process expo "Expo Metro" "$MOBILE_DIR" node node_modules/expo/bin/cli $args
   else
@@ -746,7 +820,31 @@ print_summary() {
   fi
   printf '  %-20s %-34s %-24s %s\n' "PostgreSQL" "localhost:5432" "localhost:5432" "PASS"
   printf '  %-20s %-34s %-24s %s\n' "Redis" "localhost:6379" "localhost:6379" "PASS"
+  case "$PHONE_STATE" in
+    authorized)   phone_status="CONNECTED" ;;
+    unauthorized) phone_status="TAP ALLOW" ;;
+    no-adb)       phone_status="NO ADB" ;;
+    not-checked)  phone_status="SKIPPED" ;;
+    *)            phone_status="NOT PLUGGED" ;;
+  esac
+  printf '  %-20s %-34s %-24s %s\n' "Phone over USB" "-" "-" "$phone_status"
   echo "---------------------------------------------------------------------------"
+
+  echo
+  echo "  Mobile app"
+  local sdk="unknown"
+  if [ -f "$MOBILE_DIR/package.json" ]; then
+    sdk="$(grep -o '"expo"[[:space:]]*:[[:space:]]*"[^"]*"' "$MOBILE_DIR/package.json" | head -n1 | cut -d'"' -f4)"
+  fi
+  echo "    Expo SDK   : ${sdk:-unknown}"
+  echo "    Expo URL   : exp://${LAN_IP}:8081"
+  api_url="$(grep -m1 '^EXPO_PUBLIC_API_URL=' "$MOBILE_DIR/.env" 2>/dev/null | cut -d= -f2- || true)"
+  echo "    API target : ${api_url:-not set}"
+  if [ "$NO_MOBILE" -eq 0 ] && [ "$PHONE_STATE" != "authorized" ]; then
+    echo
+    echo "  To install Expo Go SDK 58: plug the phone in by USB, enable USB debugging,"
+    echo "  tap Allow, then run start.sh again (only needed once)."
+  fi
 
   echo
   echo "  Swagger API docs : http://${LAN_IP}:8000/docs"

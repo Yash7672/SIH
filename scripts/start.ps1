@@ -88,6 +88,8 @@ $script:EffectiveMode = 'local'
 $script:Fresh = $true     # $false => every tracked service was already running
 $script:ExpoPending = $false
 $script:ExpoRunning = $false
+$script:PhoneState = 'not-checked'   # authorized | unauthorized | none | no-adb
+$script:AdbDownloaded = $false
 
 # --------------------------------------------------------------------------- #
 # Output helpers
@@ -1190,6 +1192,121 @@ function Invoke-Seeding {
 # --------------------------------------------------------------------------- #
 # Step 9 - Expo (always on the host)
 # --------------------------------------------------------------------------- #
+function Resolve-Adb {
+    <#
+        adb is not always on PATH. Look in the three places that matter, and if
+        none of them has it, fetch Google's platform-tools into .rakshak so no
+        admin rights or Android Studio install are needed.
+    #>
+    $candidates = @()
+    $onPath = Test-Command 'adb'
+    if ($onPath) { $candidates += $onPath }
+
+    $local = Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'
+    if (Test-Path -LiteralPath $local) { $candidates += $local }
+
+    $vendored = Join-Path $StateDir 'platform-tools\adb.exe'
+    if (Test-Path -LiteralPath $vendored) { $candidates += $vendored }
+
+    if ($candidates.Count -gt 0) { return @($candidates)[0] }
+
+    if ($script:AdbDownloaded) { return $null }
+    $script:AdbDownloaded = $true
+
+    Write-Step 'adb not found - downloading Google platform-tools (one time, no admin needed)'
+    $zip = Join-Path $StateDir 'platform-tools.zip'
+    try {
+        New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip' `
+            -OutFile $zip -UseBasicParsing -TimeoutSec 180
+        Expand-Archive -LiteralPath $zip -DestinationPath $StateDir -Force
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warn2 ("could not download adb: {0}" -f $_.Exception.Message)
+        return $null
+    }
+
+    if (Test-Path -LiteralPath $vendored) {
+        Write-Ok 'adb installed into .rakshak\platform-tools'
+        return $vendored
+    }
+    return $null
+}
+
+function Get-PhoneConnection {
+    <#
+        Returns 'authorized', 'unauthorized' or 'none'. Never throws: a phone
+        being absent is the normal case, not a failure.
+    #>
+    $adb = Resolve-Adb
+    if (-not $adb) { return 'no-adb' }
+
+    $out = ''
+    try {
+        $out = (& $adb devices 2>&1 | Out-String)
+    } catch {
+        return 'no-adb'
+    }
+
+    if ($out -match 'unauthorized') { return 'unauthorized' }
+    if ($out -match '(?m)^\s*device\s+\S+') { return 'authorized' }
+    return 'none'
+}
+
+function Sync-ExpoSdk {
+    <#
+        Keep the native modules on the SDK the installed `expo` expects, then
+        report doctor failures only - a wall of passing checks is noise in a
+        start script.
+    #>
+    $launcher = Get-NodeLauncher -Dir $MobileDir -RelativeJs 'expo/bin/cli' -CliArgs @('--version')
+    if ($null -eq $launcher) { return }
+
+    Push-Location $MobileDir
+    try {
+        $check = & $launcher.FilePath @($launcher.Arguments + @('install', '--check')) 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $check -match 'should be updated|expected version') {
+            Write-Step 'mobile_app: native modules do not match this SDK - running expo install --fix'
+            & $launcher.FilePath @($launcher.Arguments + @('install', '--fix')) 2>&1 | Out-Null
+            Write-Ok 'mobile_app: native modules realigned to the installed Expo SDK'
+        }
+
+        # SDK 58 removed the `expo doctor` subcommand ("not supported in the
+        # local CLI, please use npx expo-doctor instead"), so the standalone
+        # binary is the only way to run the checks.
+        $doctorBin = Join-Path $MobileDir 'node_modules\.bin\expo-doctor.cmd'
+        if (-not (Test-Path -LiteralPath $doctorBin)) {
+            $doctorBin = Join-Path $MobileDir 'node_modules\.bin\expo-doctor'
+        }
+        if (-not (Test-Path -LiteralPath $doctorBin)) {
+            Write-Warn2 'mobile_app: expo-doctor is not installed - run: npx expo install expo-doctor -- --save-dev'
+            return
+        }
+
+        $doctor = & $doctorBin 2>&1 | Out-String
+        if ($doctor -match '(\d+)/(\d+) checks passed') {
+            $passed = $Matches[1]; $total = $Matches[2]
+            if ([int]$passed -eq [int]$total) {
+                Write-Ok ("mobile_app: expo-doctor {0}/{1} passed" -f $passed, $total)
+            } else {
+                Write-Warn2 ("mobile_app: expo-doctor {0}/{1} passed" -f $passed, $total)
+                foreach ($line in ($doctor -split "`r?`n")) {
+                    if ($line -match '^\s*(✖|Advice:|Install |Missing |npx expo )') {
+                        Write-Warn2 ("    " + $line.Trim())
+                    }
+                }
+            }
+        } else {
+            Write-Warn2 'mobile_app: expo-doctor produced no summary line'
+        }
+    } catch {
+        Write-Warn2 ("mobile_app: expo check failed: {0}" -f $_.Exception.Message)
+    } finally {
+        Pop-Location
+    }
+}
+
 function Start-Expo {
     if ($NoMobile) {
         Write-Info 'mobile app skipped (-NoMobile)'
@@ -1204,12 +1321,41 @@ function Start-Expo {
     }
 
     Initialize-NodeDeps -Dir $MobileDir -Key 'mobile-lock' -AllowInstall | Out-Null
+    Sync-ExpoSdk
     Assert-PortFree -Port $Ports.expo -ServiceName 'expo' | Out-Null
+
+    # --clear whenever something that shapes the bundle changed since the last
+    # run: package.json, app.json or the API URL. A stale Metro cache is the
+    # classic "my edit did nothing" cause. Hash-checked rather than always on so
+    # repeat start-ups stay quick.
+    $hashes = Get-StateMap -Path $HashesPath -Property 'hashes'
+    $configHash = Get-CombinedHash @(
+        (Join-Path $MobileDir 'package.json'),
+        (Join-Path $MobileDir 'app.json'),
+        (Join-Path $MobileDir '.env')
+    )
+    $prevConfig = if ($hashes.ContainsKey('expo-config')) { [string]$hashes['expo-config'] } else { '' }
+    $configChanged = ($prevConfig -ne $configHash)
+    $hashes['expo-config'] = $configHash
+    Write-JsonFile $HashesPath ([pscustomobject]@{ hashes = $hashes })
 
     # Metro has to run on the HOST: a container breaks LAN/QR discovery, which is
     # exactly how the phone finds the demo server.
     $cliArgs = @('start', '--lan')
-    if ($Rebuild) { $cliArgs += '--clear' }
+    if ($Rebuild -or $configChanged) {
+        $cliArgs += '--clear'
+        Write-Info 'mobile_app: config changed since last run - starting Metro with --clear'
+    }
+
+    # A USB-attached phone lets the CLI install/open the matching Expo Go on it.
+    # Without one the QR path is used and the phone needs no cable at all.
+    $script:PhoneState = Get-PhoneConnection
+    if ($script:PhoneState -eq 'authorized') {
+        Write-Ok 'phone detected over USB - Expo CLI will open the app on it'
+        $cliArgs += '--android'
+    } elseif ($script:PhoneState -eq 'unauthorized') {
+        Write-Warn2 'phone seen but not authorised - tap "Allow USB debugging" on it, then re-run start.bat'
+    }
     $launcher = Get-NodeLauncher -Dir $MobileDir -RelativeJs 'expo/bin/cli' -CliArgs $cliArgs
     if ($null -eq $launcher) {
         Write-Warn2 'expo CLI not installed - start Metro manually:  cd mobile_app; npx expo start --lan'
@@ -1358,7 +1504,8 @@ function Write-SummaryTable {
         @{ Service = 'Police dashboard';  Lan = "${lan}:5174";             Local = 'http://localhost:5174';     Status = $null },
         @{ Service = 'Expo Metro';        Lan = "${lan}:8081";             Local = 'http://localhost:8081';     Status = $null },
         @{ Service = 'PostgreSQL';        Lan = 'localhost:5432';          Local = 'localhost:5432';            Status = $null },
-        @{ Service = 'Redis';             Lan = 'localhost:6379';          Local = 'localhost:6379';            Status = $null }
+        @{ Service = 'Redis';             Lan = 'localhost:6379';          Local = 'localhost:6379';            Status = $null },
+        @{ Service = 'Phone over USB';    Lan = '-';                       Local = '-';                         Status = $null }
     )
 
     foreach ($row in $rows) {
@@ -1370,6 +1517,14 @@ function Write-SummaryTable {
             $row.Status = if ($hit.Ok) { 'PASS' } else { 'FAIL' }
         } elseif ($row.Service -eq 'Expo Metro' -and $NoMobile) {
             $row.Status = 'SKIPPED'
+        } elseif ($row.Service -eq 'Phone over USB') {
+            $row.Status = switch ($script:PhoneState) {
+                'authorized'   { 'CONNECTED' }
+                'unauthorized' { 'TAP ALLOW' }
+                'no-adb'       { 'NO ADB' }
+                'not-checked'  { 'SKIPPED' }
+                default        { 'NOT PLUGGED' }
+            }
         } else {
             $row.Status = 'n/a'
         }
@@ -1449,6 +1604,43 @@ function Write-FinalSummary {
     Write-Host "http://${Ip}:8000/docs" -ForegroundColor Cyan
     Write-Host '  Backend health   : ' -NoNewline -ForegroundColor DarkGray
     Write-Host "http://${Ip}:8000/health" -ForegroundColor Cyan
+
+    Write-Host ''
+    Write-Host '  Mobile app' -ForegroundColor Yellow
+    $expoSdk = 'unknown'
+    try {
+        $pkgPath = Join-Path $MobileDir 'package.json'
+        if (Test-Path -LiteralPath $pkgPath) {
+            $expoSdk = [string]((Get-Content -LiteralPath $pkgPath -Raw | ConvertFrom-Json).dependencies.expo)
+        }
+    } catch { $expoSdk = 'unknown' }
+    Write-Host '    Expo SDK   : ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $expoSdk -ForegroundColor Cyan
+    Write-Host '    Expo URL   : ' -NoNewline -ForegroundColor DarkGray
+    Write-Host "exp://${Ip}:8081" -ForegroundColor Cyan
+    Write-Host '    API target : ' -NoNewline -ForegroundColor DarkGray
+    $apiUrl = 'not set'
+    try {
+        $mobileEnv = Join-Path $MobileDir '.env'
+        if (Test-Path -LiteralPath $mobileEnv) {
+            $line = Select-String -LiteralPath $mobileEnv -Pattern 'EXPO_PUBLIC_API_URL' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($line) { $apiUrl = ($line.Line -split '=', 2)[1].Trim() }
+        }
+    } catch { $apiUrl = 'not set' }
+    Write-Host $apiUrl -ForegroundColor Cyan
+
+    if (-not $NoMobile) {
+        # Exactly one line, and only when it is actually needed.
+        if ($script:PhoneState -eq 'authorized') {
+            Write-Host '    Phone      : ' -NoNewline -ForegroundColor DarkGray
+            Write-Host 'connected over USB - Expo CLI opens the app for you' -ForegroundColor Green
+        } else {
+            Write-Host ''
+            Write-Host '  To install Expo Go SDK 58: plug the phone in by USB, enable USB debugging,' -ForegroundColor Yellow
+            Write-Host '  tap Allow, then run start.bat again (only needed once).' -ForegroundColor Yellow
+        }
+    }
 
     Write-Host ''
     Write-Host '  Demo logins' -ForegroundColor Yellow
@@ -1640,7 +1832,10 @@ try {
     Resolve-ExpoPid
 
     # Expo readiness is checked here (it did not exist during Test-Readiness).
-    $expoResults = Test-ExpoReadiness
+    # @() is load-bearing: a one-element array returned from a function is
+    # unrolled to a bare object, and a bare object's .Count is $null, so the
+    # result was silently dropped and the summary showed "n/a".
+    $expoResults = @(Test-ExpoReadiness)
     if ($expoResults.Count -gt 0) {
         $results += $expoResults
         if (-not $expoResults[0].Ok) { $exitCode = 1 }
