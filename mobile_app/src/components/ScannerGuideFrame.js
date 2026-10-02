@@ -22,8 +22,14 @@ function Corner({ position, pulse }) {
   return <Animated.View style={style} />;
 }
 
-function ScannerGuideFrameBase({ scanning, hint }) {
-  const { width, height } = useWindowDimensions();
+function ScannerGuideFrameBase({ scanning, hint, containerWidth, containerHeight }) {
+  const window = useWindowDimensions();
+
+  // The overlay is absolutely positioned inside the camera container, so it has
+  // to be laid out against THAT box. Sizing it against the window put the frame
+  // ~100px below the bottom of the viewfinder and let it cover the debug card.
+  const width = containerWidth || window.width;
+  const height = containerHeight || window.height;
 
   // Frame width adapts to the viewport so it is usable on a 5" phone and does
   // not look lost on a tablet.
@@ -60,7 +66,8 @@ function ScannerGuideFrameBase({ scanning, hint }) {
   }, [pulse, scanning]);
 
   const left = (width - frameWidth) / 2;
-  const top = Math.max((height - frameHeight) / 2 - height * 0.06, spacing.xl);
+  // Nudged above centre so the hint strip at the bottom of the preview has room.
+  const top = Math.max((height - frameHeight) / 2 - height * 0.08, spacing.xs);
 
   return (
     <View pointerEvents="none" style={StyleSheet.absoluteFill}>

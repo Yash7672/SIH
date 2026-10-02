@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AppState, Vibration } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
-import { API_BASE, healthCheck, normalizePlate, registerDevice, reportSighting, scanImage } from "../services/api";
+import { API_BASE, SCAN_TIMEOUT_MS, healthCheck, normalizePlate, registerDevice, reportSighting, scanImage } from "../services/api";
 import { getLocation } from "../services/location";
 import ScannerScreenView from "../components/ScannerScreenNew";
 
@@ -14,23 +14,61 @@ const VOTE_FRAMES = 3;
 const VOTE_INTERVAL_MS = 350;
 const EARLY_EXIT_CONFIDENCE = 0.85;
 
-/** Map an exception to the sheet's state and message. */
+/**
+ * Map an exception to a distinct, honest state.
+ *
+ * Every branch keeps the underlying reason. The old version collapsed anything
+ * unmatched into the same "Cannot reach backend" text, which hid the actual
+ * cause behind a generic network message and made a capture fault look like a
+ * firewall problem.
+ */
 function mapErrorToState(e) {
   const msg = String((e && e.message) || e || "unknown error");
-  if (/timeout after/i.test(msg)) {
-    return { state: "network", message: "Server took too long — first scan can load the AI models, try again." };
+
+  // Camera-side faults happen before any request leaves the phone.
+  if (/camera is not ready/i.test(msg)) {
+    return { state: "camera", message: "Camera not ready — wait for the preview, then scan." };
   }
-  if (/network error/i.test(msg)) {
-    return { state: "network", message: `Cannot reach backend at ${API_BASE}. Check Wi-Fi and firewall.` };
+  if (/did not return an image/i.test(msg)) {
+    return { state: "camera", message: "Camera returned no image — hold steady and try again." };
   }
+  if (/capture failed/i.test(msg)) {
+    return { state: "camera", message: `Could not capture photo: ${msg.replace(/^.*?:\s*/, "")}` };
+  }
+  if (/could not be read/i.test(msg)) {
+    return { state: "camera", message: `Captured image unreadable: ${msg.replace(/^.*?:\s*/, "")}` };
+  }
+
+  // Session / auth.
+  if (/HTTP 401/i.test(msg)) {
+    return { state: "session", message: "Session expired — log in again." };
+  }
+  if (/HTTP 403/i.test(msg)) {
+    return { state: "forbidden", message: "Not allowed — this account cannot file sightings." };
+  }
+
+  // Server answered with a status: report it verbatim, detail included.
   const m = msg.match(/HTTP (\d{3})/);
   if (m) {
-    if (m[1] === "413") return { state: "server", message: "Photo too large — the scanner resized it, try again." };
-    if (m[1] === "401") return { state: "session", message: "Session expired — log in again." };
-    if (m[1] === "403") return { state: "forbidden", message: "Not allowed — this account cannot file sightings." };
-    return { state: "server", message: `Server error ${m[1]}.` };
+    if (m[1] === "413") return { state: "server", message: "Photo too large (413) — the scanner already resized it." };
+    const detail = msg.slice(msg.indexOf(":") + 1).trim();
+    return { state: "server", message: `Server error ${m[1]}: ${detail || "no detail returned"}` };
   }
-  return { state: "network", message: msg };
+
+  // Timeout is not a network fault; say which call ran out of time.
+  if (/timeout after/i.test(msg)) {
+    return { state: "slow", message: `Scan timed out after ${SCAN_TIMEOUT_MS / 1000}s — the first scan loads the AI models, try again.` };
+  }
+
+  // Transport failure. fetchJson encodes the URL and the reason, so surface it
+  // instead of replacing it with boilerplate advice.
+  if (/network error/i.test(msg)) {
+    const reason = (msg.match(/Reason=([^|]*)/) || [, "unknown"])[1].trim();
+    return { state: "network", message: `Network error: ${reason} (${API_BASE})` };
+  }
+
+  // Anything else keeps its own text rather than borrowing the network message.
+  return { state: "error", message: msg };
 }
 
 /**
@@ -92,8 +130,18 @@ export default function ScannerScreen({ user, onLogout }) {
   async function captureFrames(camRef) {
     const uris = [];
     for (let i = 0; i < VOTE_FRAMES; i += 1) {
-      const photo = await camRef.takePictureAsync({ quality: CAPTURE_QUALITY });
-      if (!photo || !photo.uri) break;
+      let photo;
+      try {
+        photo = await camRef.takePictureAsync({ quality: CAPTURE_QUALITY });
+      } catch (e) {
+        // takePictureAsync rejects for camera-side reasons (viewfinder not
+        // mounted, ref released, hardware busy). Say so instead of letting the
+        // generic network mapper claim the backend is unreachable.
+        throw new Error(`Capture failed: ${e?.message || e}`);
+      }
+      if (!photo || !photo.uri) {
+        throw new Error(i === 0 ? "Camera did not return an image" : `Camera returned no image on frame ${i + 1}`);
+      }
       uris.push(await shrinkForUpload(photo));
       if (i < VOTE_FRAMES - 1) await new Promise((r) => setTimeout(r, VOTE_INTERVAL_MS));
     }
@@ -172,6 +220,8 @@ export default function ScannerScreen({ user, onLogout }) {
           frames: reads.length,
           votes: best?.votes,
           reason: best?.reason || "low confidence",
+          elapsedMs: best?.elapsedMs,
+          uploadVia: best?.uploadVia,
           message: "Hold the plate inside the frame and scan again.",
         };
       }
@@ -194,6 +244,8 @@ export default function ScannerScreen({ user, onLogout }) {
           valid: true,
           frames: reads.length,
           votes: best?.votes,
+          elapsedMs: best?.elapsedMs,
+          uploadVia: best?.uploadVia,
           message: hotlist ? "Reported to police — active hotlist match." : "Sighting recorded — not on the hotlist.",
         };
       } catch (e) {

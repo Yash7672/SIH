@@ -1,4 +1,5 @@
 import Constants from "expo-constants";
+import { File } from "expo-file-system";
 
 import { clearSession, loadSession, saveTokens } from "../storage/store";
 
@@ -288,13 +289,50 @@ export async function registerDevice(name) {
   });
 }
 
+/** CPU OCR plus the lazy YOLO/OCR model load; see api.js healthCheck for the
+ *  reasoning behind the cold/warm budget split. */
+export const SCAN_TIMEOUT_MS = 45000;
+
 export async function scanImage(uri) {
-  const formData = new FormData();
-  formData.append("image", { uri, name: "frame.jpg", type: "image/jpeg" });
-  // The host runs CPU OCR and loads the YOLO + OCR models lazily on the very
-  // first scan; the default 15s budget is not enough for that cold start (it
-  // measured ~12s on the dev PC and a phone upload adds more). Give it 45s.
-  return request("POST", "/scanner/scan", { formData, timeoutMs: 45000 });
+  const startedAt = Date.now();
+
+  const send = async (part) => {
+    const formData = new FormData();
+    formData.append("image", part);
+    // No explicit Content-Type: React Native has to add the multipart boundary
+    // itself, and setting the header by hand is what produces "Network request
+    // failed" because the server then cannot find the part boundary.
+    return request("POST", "/scanner/scan", { formData, timeoutMs: SCAN_TIMEOUT_MS });
+  };
+
+  try {
+    const data = await send({ uri, name: "frame.jpg", type: "image/jpeg" });
+    return { ...data, elapsedMs: Date.now() - startedAt, uploadVia: "file-uri" };
+  } catch (error) {
+    // Only a transport-level failure is worth re-encoding: an HTTP status means
+    // the server already answered, so re-sending the bytes cannot help.
+    const message = String(error?.message || error);
+    if (!/network error/i.test(message)) throw error;
+
+    // React Native resolves a multipart file part by streaming the file:// path
+    // itself. When that resolution fails the whole fetch() rejects as
+    // "Network request failed" even though GET /health and the JSON
+    // POST /sightings on the same host both work. Re-sending the same JPEG as a
+    // base64 data URI sidesteps the file-part resolution entirely.
+    console.warn(`[RAKSHAK] scan upload failed as file-uri (${message}); retrying as base64 data URI`);
+    let base64;
+    try {
+      base64 = await new File(uri).base64();
+    } catch (readError) {
+      throw new Error(`Captured image could not be read: ${readError?.message || readError} (upload failed: ${message})`);
+    }
+    try {
+      const data = await send({ uri: `data:image/jpeg;base64,${base64}`, name: "frame.jpg", type: "image/jpeg" });
+      return { ...data, elapsedMs: Date.now() - startedAt, uploadVia: "base64-fallback" };
+    } catch (retryError) {
+      throw new Error(`${retryError?.message || retryError} (file-uri attempt also failed: ${message})`);
+    }
+  }
 }
 
 export async function reportSighting(sighting) {

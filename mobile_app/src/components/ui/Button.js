@@ -87,7 +87,12 @@ export default function Button({
       ) : (
         <View style={styles.contentRow}>
           {icon ? <View style={styles.icon}>{icon}</View> : null}
-          <Text style={[styles.text, { color: spec.fg, fontSize: s.text }, textStyle]} numberOfLines={1}>
+          <Text
+            style={[styles.text, { color: spec.fg, fontSize: s.text }, textStyle]}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.75}
+          >
             {label}
           </Text>
         </View>

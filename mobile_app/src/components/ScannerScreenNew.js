@@ -38,6 +38,9 @@ import { useTheme } from "../theme/ThemeContext";
 const LOG_LIMIT = 20;
 const HEALTH_INTERVAL_MS = 30000;
 const CAMERA_HEIGHT_RATIO = 0.4;
+// The 40% share is too small to aim with on a short phone, so the preview never
+// drops below this. 360x640 would otherwise get a 256 px strip.
+const MIN_CAMERA_HEIGHT = 260;
 
 export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLogout, deviceReady, user }) {
   const { colors, isDark, setMode } = useTheme();
@@ -108,15 +111,21 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
     if (scanning || !camRef.current || !camReady || !focused) return;
     setScanning(true);
     setResult(null);
+    const startedAt = Date.now();
     try {
       const scanResult = await onScan(camRef.current);
+      const totalMs = Date.now() - startedAt;
       setResult(scanResult);
       const pct = Math.round((scanResult.confidence || 0) * 100);
-      const votes = formatVotes(scanResult.votes);
+      const ok = scanResult.state === "success" || scanResult.state === "uncertain" || scanResult.state === "none";
+      // A scan that never reached the server is proof the backend is not usable
+      // right now, whatever the periodic health probe last reported.
+      if (scanResult.state === "network") setBackendState({ status: "OFFLINE", error: scanResult.message });
       appendLog(
-        `scan: ${scanResult.plate || "none"} (${pct}%) frames=${scanResult.frames ?? 0} votes={${votes}}${
-          scanResult.state === "uncertain" ? " uncertain" : ""
-        }`
+        `scan: ${scanResult.plate || "no plate"} ${pct}% frames=${scanResult.frames ?? 0} votes={${formatVotes(scanResult.votes)}} ` +
+          `state=${scanResult.state} http=${ok ? 200 : scanResult.state} ` +
+          `${scanResult.elapsedMs ? `upload=${scanResult.elapsedMs}ms via=${scanResult.uploadVia}` : `total=${totalMs}ms`} ` +
+          `${scanResult.message && !ok ? `| ${scanResult.message}` : ""}`.trim()
       );
       if (scanResult.hotlist) {
         try {
@@ -124,8 +133,8 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
         } catch {}
       }
     } catch (e) {
-      setResult({ state: "network", message: e.message });
-      appendLog(`error: ${e.message}`);
+      setResult({ state: "error", message: e.message });
+      appendLog(`scan FAILED total=${Date.now() - startedAt}ms | ${e.message}`);
     } finally {
       setScanning(false);
     }
@@ -171,7 +180,7 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
   }
 
   const pill = resultPill(result);
-  const cameraHeight = Math.round(height * CAMERA_HEIGHT_RATIO);
+  const cameraHeight = Math.round(Math.max(MIN_CAMERA_HEIGHT, height * CAMERA_HEIGHT_RATIO));
 
   return (
     <View style={[s.fill, { backgroundColor: colors.dark[900] }]}>
@@ -179,32 +188,39 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
       <StatusBar style="light" translucent />
 
       <View style={[s.header, { backgroundColor: colors.dark[800], borderBottomColor: colors.dark[600], paddingTop: insets.top + spacing.sm }]}>
-        <View style={s.headerText}>
+        {/* Row 1: title only, so it never has to share width with buttons. */}
+        <View style={s.headerRow}>
           <Text style={[s.title, { color: colors.onDark.strong }]} numberOfLines={1}>
             RAKSHAK Scanner
           </Text>
+          <View style={s.headerActions}>
+            <Pressable
+              onPress={() => setMode(isDark ? "light" : "dark")}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel={isDark ? "Switch to light theme" : "Switch to dark theme"}
+              style={({ pressed }) => [s.iconBtn, { opacity: pressed ? 0.6 : 1 }]}
+            >
+              <Ionicons name={isDark ? "sunny" : "moon"} size={19} color={colors.onDark.body} />
+            </Pressable>
+            <Pressable
+              onPress={onLogout}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Log out"
+              style={({ pressed }) => [s.iconBtn, { opacity: pressed ? 0.6 : 1 }]}
+            >
+              <Ionicons name="log-out-outline" size={19} color={colors.onDark.body} />
+            </Pressable>
+          </View>
+        </View>
+
+        {/* Row 2: who is scanning, and whether the backend is answering. */}
+        <View style={s.headerRow}>
           <Text style={[s.subtitle, { color: colors.onDark.muted }]} numberOfLines={1}>
             {user?.name} · {String(user?.role || "VOLUNTEER").toUpperCase()}
           </Text>
-        </View>
-        <View style={s.headerActions}>
           <ConnPill status={backendState.status} s={s} />
-          <Pressable
-            onPress={() => setMode(isDark ? "light" : "dark")}
-            hitSlop={8}
-            accessibilityRole="button"
-            accessibilityLabel={isDark ? "Switch to light theme" : "Switch to dark theme"}
-            style={({ pressed }) => [s.iconBtn, { borderColor: colors.dark[500], opacity: pressed ? 0.7 : 1 }]}
-          >
-            <Ionicons name={isDark ? "sunny" : "moon"} size={17} color={colors.onDark.body} />
-          </Pressable>
-          <Button
-            label="Logout"
-            size="sm"
-            variant="ghost"
-            onPress={onLogout}
-            icon={<Ionicons name="log-out-outline" size={15} color={colors.onDark.muted} />}
-          />
         </View>
       </View>
 
@@ -247,7 +263,7 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
             icon={<Ionicons name="camera" size={19} color="#FFFFFF" />}
           />
           <Button
-            label="Simulate detection"
+            label="Simulate"
             size="lg"
             variant="secondary"
             onPress={simulate}
@@ -316,10 +332,29 @@ function ConnPill({ status, s }) {
  * re-renders the camera. Only `pill` and `scanning` reach it.
  */
 const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady }) {
+  // The overlay must be laid out against the preview box, so the box measures
+  // itself and hands the result down. `height` is the intended height, used
+  // until the first onLayout lands.
+  const [box, setBox] = useState({ width: 0, height });
+  const measure = useCallback(
+    (e) => {
+      const { width: w, height: h } = e.nativeEvent.layout;
+      if (w > 0 && h > 0 && (w !== box.width || h !== box.height)) setBox({ width: w, height: h });
+    },
+    [box.width, box.height]
+  );
+
   return (
-    <View style={[s.cameraWrap, { height }]}>
+    <View style={[s.cameraWrap, { height }]} onLayout={measure}>
       {focused ? (
-        <CameraView ref={camRef} style={StyleSheet.absoluteFill} facing="back" autofocus="on" onCameraReady={onCameraReady} />
+        <CameraView
+          ref={camRef}
+          style={StyleSheet.absoluteFill}
+          facing="back"
+          autofocus="on"
+          zoom={0}
+          onCameraReady={onCameraReady}
+        />
       ) : null}
 
       {pill ? (
@@ -330,11 +365,19 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
         </View>
       ) : null}
 
-      {/* The hint lives in a flush bottom strip below, not in a floating pill. */}
-      <ScannerGuideFrame scanning={scanning} hint={null} />
+      {/* Sized from the measured preview box, so the frame can never spill over
+          the cards below. */}
+      <ScannerGuideFrame
+        scanning={scanning}
+        hint={null}
+        containerWidth={box.width || undefined}
+        containerHeight={box.height || height}
+      />
 
       <View style={s.hintStrip} pointerEvents="none">
-        <Text style={s.hintStripText}>Align plate in the viewfinder, then press Scan</Text>
+        <Text style={s.hintStripText} numberOfLines={1}>
+          Align plate in the viewfinder, then press Scan
+        </Text>
       </View>
     </View>
   );
@@ -460,23 +503,21 @@ function makeStyles(colors) {
     fill: { flex: 1 },
 
     header: {
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "space-between",
       paddingHorizontal: spacing.lg,
       paddingBottom: spacing.sm,
       borderBottomWidth: 1,
-      gap: spacing.sm,
+      gap: spacing.xs,
     },
-    headerText: { flex: 1, gap: 1 },
-    title: { fontSize: fontSize.lg, fontWeight: fontWeight.heavy, letterSpacing: 0.3 },
-    subtitle: { fontSize: fontSize.xs },
-    headerActions: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+    // Row 1 = title, row 2 = identity + connection. Splitting them is what
+    // stops "RAKSHAK Scanner" being truncated by the buttons beside it.
+    headerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: spacing.sm },
+    title: { flex: 1, fontSize: fontSize.lg, fontWeight: fontWeight.heavy, letterSpacing: 0.3 },
+    subtitle: { flex: 1, fontSize: fontSize.xs },
+    headerActions: { flexDirection: "row", alignItems: "center", gap: spacing.xs },
     iconBtn: {
-      width: 32,
-      height: 32,
-      borderRadius: 9,
-      borderWidth: 1,
+      width: 44,
+      height: 44,
+      borderRadius: 12,
       alignItems: "center",
       justifyContent: "center",
     },
