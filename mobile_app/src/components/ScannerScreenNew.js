@@ -1,10 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AppState,
-  FlatList,
-  Modal,
   Pressable,
-  SafeAreaView,
+  ScrollView,
   StyleSheet,
   Text,
   Vibration,
@@ -13,13 +11,14 @@ import {
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { StatusBar } from "expo-status-bar";
-import { ScannerGuideFrame } from "../components/ScannerGuideFrame";
-import { ScanResultSheet } from "../components/ScanResultSheet";
-import Button from "../components/ui/Button";
-import { Card } from "../components/ui/Card";
-import { ConnectionDot } from "../components/ui/StatusChip";
-import { Banner, LoadingState } from "../components/ui/Banner";
-import { ThemeModePicker } from "../components/ThemeToggle";
+// Import the single icon set directly: the package root pulls in all six font
+// families (~2.2 MB of assets) even though the scanner only uses Ionicons.
+import Ionicons from "@expo/vector-icons/Ionicons";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { ScannerGuideFrame } from "./ScannerGuideFrame";
+import Button from "./ui/Button";
+import { Card } from "./ui/Card";
+import { LoadingState } from "./ui/Banner";
 import { fontSize, fontWeight, radius, spacing } from "../theme";
 import { useTheme } from "../theme/ThemeContext";
 
@@ -27,359 +26,566 @@ import { useTheme } from "../theme/ThemeContext";
  * The scanner is deliberately always dark in both themes: a bright chrome next
  * to the viewfinder makes the plate the least readable thing on screen, and the
  * volunteer is holding the phone outdoors. Only the chrome tints follow the
- * palette, and the theme preference itself is chosen from the settings sheet.
+ * palette.
  *
- * No watermark here on purpose - text over the viewfinder can lower plate-read
- * accuracy. The result sheet has none either, for the same reason.
+ * Everything lives on ONE scrolling page - debug card, actions, backend check,
+ * last detection and the activity log - so nothing useful hides behind a menu.
+ *
+ * No watermark over the viewfinder: text on top of the plate preview lowers
+ * plate-read accuracy.
  */
+
+const LOG_LIMIT = 20;
+const HEALTH_INTERVAL_MS = 30000;
+const CAMERA_HEIGHT_RATIO = 0.4;
+
 export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLogout, deviceReady, user }) {
-  const { colors } = useTheme();
+  const { colors, isDark, setMode } = useTheme();
+  const insets = useSafeAreaInsets();
   const [perm, requestPerm] = useCameraPermissions();
   const camRef = useRef(null);
   const [camReady, setCamReady] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [backendState, setBackendState] = useState({ status: "UNKNOWN", error: null });
+  const [backendState, setBackendState] = useState({ status: "CHECKING", error: null });
   const [result, setResult] = useState(null);
   const [log, setLog] = useState([]);
-  const [tapCount, setTapCount] = useState(0);
-  const [devDetails, setDevDetails] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const tapTimer = useRef(null);
+  const [showDebug, setShowDebug] = useState(true);
   // react-navigation is not installed, so focus comes from AppState: the camera
   // must not run inference while the app sits in the background.
   const [focused, setFocused] = useState(true);
   const { height } = useWindowDimensions();
+
+  const s = useMemo(() => makeStyles(colors), [colors]);
+
+  const appendLog = useCallback((line) => {
+    setLog((prev) => [line, ...prev].slice(0, LOG_LIMIT));
+  }, []);
 
   useEffect(() => {
     const sub = AppState.addEventListener("change", (state) => setFocused(state === "active"));
     return () => sub?.remove?.();
   }, []);
 
+  // Losing focus invalidates the camera handle: the preview unmounts, so a
+  // stale "ready" flag would let a scan press fire against a dead ref.
   useEffect(() => {
     if (!focused) setCamReady(false);
   }, [focused]);
 
+  // Backend health: first call on mount, again on every focus, then every 30 s
+  // while focused and in the foreground. The interval is torn down on blur and
+  // on unmount so a backgrounded app never polls.
+  const runHealth = useCallback(
+    async (logIt) => {
+      if (logIt) setTesting(true);
+      setBackendState((prev) => (prev.status === "CONNECTED" ? prev : { status: "CHECKING", error: null }));
+      try {
+        const state = await onTestBackend();
+        const next = { status: state.status === "CONNECTED" ? "CONNECTED" : "OFFLINE", error: state.error || null };
+        setBackendState(next);
+        if (logIt) appendLog(`backend health -> ${next.status}${next.error ? ` ${next.error}` : ""}`);
+      } catch (e) {
+        setBackendState({ status: "OFFLINE", error: e.message });
+        if (logIt) appendLog(`backend health -> OFFLINE ${e.message}`);
+      } finally {
+        if (logIt) setTesting(false);
+      }
+    },
+    [onTestBackend, appendLog]
+  );
+
   useEffect(() => {
-    return () => {
-      if (tapTimer.current) clearTimeout(tapTimer.current);
-    };
-  }, []);
+    if (!focused) return undefined;
+    runHealth(false);
+    const id = setInterval(() => runHealth(false), HEALTH_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [focused, runHealth]);
 
-  const appendLog = (line) => {
-    setLog((prev) => [line, ...prev].slice(0, 20));
-  };
+  const handleTestBackend = useCallback(() => runHealth(true), [runHealth]);
 
-  const handleTestBackend = async () => {
-    setTesting(true);
-    try {
-      const state = await onTestBackend();
-      setBackendState(state);
-      appendLog(`backend: ${state.status}${state.error ? ` — ${state.error}` : ""}`);
-    } catch (e) {
-      setBackendState({ status: "FAILED", error: e.message });
-      appendLog(`backend: FAILED — ${e.message}`);
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const capture = async () => {
+  const capture = useCallback(async () => {
     if (scanning || !camRef.current || !camReady || !focused) return;
     setScanning(true);
     setResult(null);
     try {
       const scanResult = await onScan(camRef.current);
       setResult(scanResult);
-      appendLog(`scan: ${scanResult.plate || "none"} (${Math.round((scanResult.confidence || 0) * 100)}%)`);
+      const pct = Math.round((scanResult.confidence || 0) * 100);
+      const votes = formatVotes(scanResult.votes);
+      appendLog(
+        `scan: ${scanResult.plate || "none"} (${pct}%) frames=${scanResult.frames ?? 0} votes={${votes}}${
+          scanResult.state === "uncertain" ? " uncertain" : ""
+        }`
+      );
       if (scanResult.hotlist) {
-        try { Vibration.vibrate([40, 120, 80]); } catch {}
+        try {
+          Vibration.vibrate([40, 120, 80]);
+        } catch {}
       }
     } catch (e) {
-      const r = { state: "network", message: e.message };
-      setResult(r);
+      setResult({ state: "network", message: e.message });
       appendLog(`error: ${e.message}`);
     } finally {
       setScanning(false);
     }
-  };
+  }, [scanning, camReady, focused, onScan, appendLog]);
 
-  const simulate = async () => {
-    const r = await onSimulate();
-    setResult(r);
-    appendLog(`simulate: ${r.plate}`);
-    if (r.hotlist) {
-      try { Vibration.vibrate([40, 120, 80]); } catch {}
+  const simulate = useCallback(async () => {
+    try {
+      const r = await onSimulate();
+      setResult(r);
+      appendLog(`simulate: ${r.plate} votes={${formatVotes(r.votes)}}`);
+      if (r.hotlist) {
+        try {
+          Vibration.vibrate([40, 120, 80]);
+        } catch {}
+      }
+    } catch (e) {
+      setResult({ state: "network", message: e.message });
+      appendLog(`error: ${e.message}`);
     }
-  };
+  }, [onSimulate, appendLog]);
 
-  const onTitleTap = () => {
-    const next = tapCount + 1;
-    setTapCount(next);
-    if (tapTimer.current) clearTimeout(tapTimer.current);
-    tapTimer.current = setTimeout(() => setTapCount(0), 2000);
-    if (next === 5) {
-      setTapCount(0);
-      setDevDetails((v) => !v);
-      appendLog(`dev details: ${!devDetails ? "on" : "off"}`);
-    }
-  };
-
-  const renderLogItem = ({ item }) => (
-    <Text style={[styles.logLine, { color: colors.onDark.muted }]} numberOfLines={1}>
-      {item}
-    </Text>
-  );
-
-  if (!deviceReady) {
-    return <LoadingState label="Registering device…" />;
-  }
+  if (!deviceReady) return <LoadingState label="Registering device…" />;
 
   if (!perm?.granted) {
     return (
-      <SafeAreaView style={[styles.center, { backgroundColor: colors.surface.bg }]}>
-        <View style={styles.permission}>
-          <Text style={[styles.permissionTitle, { color: colors.surface.text }]}>Camera access needed</Text>
-          <Text style={[styles.permissionText, { color: colors.surface.muted }]}>
+      <View style={[s.fill, { backgroundColor: colors.surface.bg, paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+        <View style={s.permission}>
+          <Text style={[s.permissionTitle, { color: colors.surface.text }]}>Camera access needed</Text>
+          <Text style={[s.permissionText, { color: colors.surface.muted }]}>
             The scanner needs the camera to read vehicle number plates. No video is uploaded — only a single still
             frame per scan.
           </Text>
-          <Button label="Grant camera access" size="lg" appearance="surface" onPress={requestPerm} />
+          <Button
+            label="Grant camera access"
+            size="lg"
+            appearance="surface"
+            onPress={requestPerm}
+            icon={<Ionicons name="camera" size={18} color={colors.solid} />}
+          />
         </View>
-      </SafeAreaView>
+      </View>
     );
   }
 
-  const connected = backendState.status === "CONNECTED";
-  const failed = backendState.status === "FAILED";
+  const pill = resultPill(result);
+  const cameraHeight = Math.round(height * CAMERA_HEIGHT_RATIO);
 
   return (
-    <View style={[styles.container, { backgroundColor: colors.dark[900] }]}>
-      <StatusBar style="light" />
-      <SafeAreaView style={[styles.safeTop, { backgroundColor: colors.dark[800] }]} edges={["top"]}>
-        <View
-          style={[
-            styles.topBar,
-            { backgroundColor: colors.dark[800], borderBottomColor: colors.dark[700] },
-          ]}
-        >
-          <View style={styles.topLeft}>
-            <Pressable onPress={onTitleTap} hitSlop={6} accessibilityRole="button" accessibilityLabel="RAKSHAK">
-              <Text style={[styles.appName, { color: colors.onDark.strong }]}>RAKSHAK</Text>
-            </Pressable>
-            <Text style={[styles.user, { color: colors.onDark.muted }]} numberOfLines={1}>
-              {user?.name} · {user?.role || "VOLUNTEER"}
-            </Text>
-          </View>
-          <View style={styles.topRight}>
-            <ConnectionDot connected={connected} label={backendState.status} />
-            <Pressable
-              onPress={() => setMenuOpen(true)}
-              accessibilityRole="button"
-              accessibilityLabel="Open settings menu"
-              hitSlop={8}
-              style={({ pressed }) => [
-                styles.menuBtn,
-                { borderColor: colors.dark[500], opacity: pressed ? 0.7 : 1 },
-              ]}
-            >
-              <Text style={[styles.menuBtnText, { color: colors.onDark.body }]}>⋯</Text>
-            </Pressable>
-          </View>
+    <View style={[s.fill, { backgroundColor: colors.dark[900] }]}>
+      {/* Edge-to-edge on Android: the header applies insets.top itself. */}
+      <StatusBar style="light" translucent />
+
+      <View style={[s.header, { backgroundColor: colors.dark[800], borderBottomColor: colors.dark[600], paddingTop: insets.top + spacing.sm }]}>
+        <View style={s.headerText}>
+          <Text style={[s.title, { color: colors.onDark.strong }]} numberOfLines={1}>
+            RAKSHAK Scanner
+          </Text>
+          <Text style={[s.subtitle, { color: colors.onDark.muted }]} numberOfLines={1}>
+            {user?.name} · {String(user?.role || "VOLUNTEER").toUpperCase()}
+          </Text>
         </View>
-
-        {failed && backendState.error ? (
-          <Banner tone="danger" title="Cannot reach backend" message={backendState.error} style={styles.banner} />
-        ) : null}
-
-        {devDetails ? (
-          <Card tone="dark" style={styles.devCard}>
-            <Text style={[styles.devTitle, { color: colors.onDark.strong }]}>Debug</Text>
-            <Text style={[styles.devText, { color: colors.onDark.muted }]}>
-              Tap 5 times on the title to toggle this panel.
-            </Text>
-          </Card>
-        ) : null}
-      </SafeAreaView>
-
-      <View style={[styles.cameraWrap, { height: height * 0.48 }]}>
-        {focused ? (
-          <CameraView
-            ref={camRef}
-            style={StyleSheet.absoluteFill}
-            facing="back"
-            onCameraReady={() => setCamReady(true)}
-          />
-        ) : null}
-        <ScannerGuideFrame scanning={scanning} hint="Align the number plate inside the frame" />
-      </View>
-
-      <SafeAreaView style={[styles.bottom, { backgroundColor: colors.dark[900] }]} edges={["bottom", "left", "right"]}>
-        <View style={styles.controls}>
+        <View style={s.headerActions}>
+          <ConnPill status={backendState.status} s={s} />
+          <Pressable
+            onPress={() => setMode(isDark ? "light" : "dark")}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={isDark ? "Switch to light theme" : "Switch to dark theme"}
+            style={({ pressed }) => [s.iconBtn, { borderColor: colors.dark[500], opacity: pressed ? 0.7 : 1 }]}
+          >
+            <Ionicons name={isDark ? "sunny" : "moon"} size={17} color={colors.onDark.body} />
+          </Pressable>
           <Button
-            label={scanning ? "Reading plate…" : "Scan"}
-            size="lg"
-            loading={scanning}
-            onPress={capture}
-            disabled={!camReady || !focused}
-            style={styles.scanBtn}
-          />
-          <Button label="Simulate" size="lg" variant="secondary" onPress={simulate} style={styles.simBtn} />
-        </View>
-
-        <View style={styles.healthRow}>
-          <Button
-            label={testing ? "Testing…" : "Test backend"}
+            label="Logout"
             size="sm"
             variant="ghost"
-            loading={testing}
-            onPress={handleTestBackend}
-            loadingLabel="Testing…"
-          />
-          <FlatList
-            data={log}
-            keyExtractor={(_, i) => String(i)}
-            renderItem={renderLogItem}
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.logList}
+            onPress={onLogout}
+            icon={<Ionicons name="log-out-outline" size={15} color={colors.onDark.muted} />}
           />
         </View>
-      </SafeAreaView>
+      </View>
 
-      <ScanResultSheet
-        result={result}
-        onDismiss={() => setResult(null)}
-        onRescan={capture}
-        onDetailsLongPress={() => setDevDetails((v) => !v)}
-      />
-
-      <SettingsSheet
-        visible={menuOpen}
-        onClose={() => setMenuOpen(false)}
-        onTestBackend={() => {
-          setMenuOpen(false);
-          handleTestBackend();
-        }}
-        onLogout={() => {
-          setMenuOpen(false);
-          onLogout();
-        }}
+      <CameraSection
+        height={cameraHeight}
         colors={colors}
+        s={s}
+        focused={focused}
+        scanning={scanning}
+        pill={pill}
+        camRef={camRef}
+        onCameraReady={() => setCamReady(true)}
       />
+
+      <ScrollView
+        style={s.scroll}
+        contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
+        keyboardShouldPersistTaps="handled"
+      >
+        {backendState.status === "OFFLINE" ? (
+          <View style={[s.offlineBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
+            <Ionicons name="warning-outline" size={15} color={colors.danger} />
+            <Text style={[s.offlineText, { color: colors.onDark.body }]} numberOfLines={2}>
+              Backend unreachable{backendState.error ? `: ${backendState.error}` : ""}
+            </Text>
+          </View>
+        ) : null}
+
+        <AnprDebugCard result={result} visible={showDebug} onToggle={() => setShowDebug((v) => !v)} colors={colors} s={s} />
+
+        <View style={s.actions}>
+          <Button
+            label="Scan plate"
+            size="lg"
+            onPress={capture}
+            disabled={!camReady || !focused}
+            loading={scanning}
+            loadingLabel="Reading plate..."
+            style={s.flex}
+            icon={<Ionicons name="camera" size={19} color="#FFFFFF" />}
+          />
+          <Button
+            label="Simulate detection"
+            size="lg"
+            variant="secondary"
+            onPress={simulate}
+            disabled={scanning}
+            style={s.flex}
+            icon={<Ionicons name="dice" size={19} color={colors.onDark.body} />}
+          />
+        </View>
+
+        <View style={s.backendRow}>
+          <Button
+            label="TEST BACKEND CONNECTION"
+            size="md"
+            variant="secondary"
+            onPress={handleTestBackend}
+            loading={testing}
+            loadingLabel="Testing..."
+            style={s.flex}
+            icon={<Ionicons name="pulse" size={17} color={colors.accent[300]} />}
+          />
+          <Text
+            style={[
+              s.backendStatus,
+              {
+                color:
+                  backendState.status === "CONNECTED"
+                    ? colors.success
+                    : backendState.status === "CHECKING"
+                      ? colors.warning
+                      : colors.danger,
+              },
+            ]}
+          >
+            {backendState.status}
+          </Text>
+        </View>
+
+        <LastDetectionCard result={result} colors={colors} s={s} />
+
+        <ActivityLog log={log} colors={colors} s={s} />
+      </ScrollView>
     </View>
   );
 }
 
-/** Bottom sheet holding the three-option theme picker and account actions. */
-function SettingsSheet({ visible, onClose, onTestBackend, onLogout, colors }) {
+function formatVotes(votes) {
+  if (!votes || typeof votes !== "object") return "";
+  const parts = Object.keys(votes).map((k) => `${k}:${votes[k]}`);
+  return parts.length ? parts.join(",") : "";
+}
+
+/** Three-state backend pill: CHECKING amber, CONNECTED green, OFFLINE red. */
+function ConnPill({ status, s }) {
+  const { colors } = useTheme();
+  const tone = status === "CONNECTED" ? colors.success : status === "CHECKING" ? colors.warning : colors.danger;
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable
-        style={[styles.scrim, { backgroundColor: "rgba(2,6,17,0.6)" }]}
-        onPress={onClose}
-        accessibilityRole="button"
-        accessibilityLabel="Close menu"
-      />
-      <View style={[styles.sheet, { backgroundColor: colors.dark[800], borderColor: colors.dark[600] }]}>
-        <View style={[styles.grabber, { backgroundColor: colors.dark[500] }]} />
-
-        <Text style={[styles.sheetTitle, { color: colors.onDark.strong }]}>Appearance</Text>
-        <Text style={[styles.sheetHint, { color: colors.onDark.muted }]}>
-          Applies to the login screen. The scanner viewfinder stays dark so the plate reads clearly outdoors.
-        </Text>
-        <ThemeModePicker style={styles.picker} />
-
-        <View style={[styles.sheetActions, { borderTopColor: colors.dark[600] }]}>
-          <Button label="Test backend" size="md" variant="secondary" onPress={onTestBackend} style={styles.flex} />
-          <Button label="Close" size="md" variant="ghost" onPress={onClose} style={styles.flex} />
-          <Button label="Log out" size="md" variant="danger" onPress={onLogout} style={styles.flex} />
-        </View>
-      </View>
-    </Modal>
+    <View style={[s.pill, { borderColor: tone }]}>
+      <View style={[s.pillDot, { backgroundColor: tone }]} />
+      <Text style={[s.pillText, { color: tone }]}>{status}</Text>
+    </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  safeTop: {},
-  topBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-    borderBottomWidth: 1,
-  },
-  topLeft: { flex: 1, gap: 2 },
-  appName: { fontSize: fontSize.lg, fontWeight: fontWeight.heavy, letterSpacing: 1 },
-  user: { fontSize: fontSize.xs },
-  topRight: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
-  menuBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
-    borderWidth: 1,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  menuBtnText: { fontSize: 18, lineHeight: 22, fontWeight: fontWeight.bold },
-  banner: { marginHorizontal: spacing.lg, marginBottom: spacing.sm },
-  devCard: { marginHorizontal: spacing.lg, marginBottom: spacing.sm },
-  devTitle: { fontWeight: fontWeight.bold },
-  devText: { fontSize: fontSize.sm },
-  cameraWrap: { backgroundColor: "#000" },
-  bottom: { flex: 1, justifyContent: "space-between" },
-  controls: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: spacing.md,
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.lg,
-  },
-  scanBtn: { flex: 1, minHeight: 64 },
-  simBtn: { width: 120 },
-  healthRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-    gap: spacing.md,
-  },
-  logList: { paddingHorizontal: spacing.sm },
-  logLine: { fontSize: fontSize.xs, fontFamily: "monospace" },
-  center: { flex: 1, justifyContent: "center" },
-  permission: { paddingHorizontal: spacing.xl, gap: spacing.lg, alignItems: "center" },
-  permissionTitle: { fontSize: fontSize.xl, fontWeight: fontWeight.bold },
-  permissionText: { textAlign: "center", lineHeight: 22 },
-  scrim: { ...StyleSheet.absoluteFillObject },
-  sheet: {
-    marginTop: "auto",
-    borderTopLeftRadius: radius.xl,
-    borderTopRightRadius: radius.xl,
-    borderTopWidth: 1,
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.sm,
-    paddingBottom: spacing.xl,
-    gap: spacing.sm,
-  },
-  grabber: {
-    alignSelf: "center",
-    width: 40,
-    height: 4,
-    borderRadius: 2,
-    marginBottom: spacing.sm,
-  },
-  sheetTitle: { fontSize: fontSize.lg, fontWeight: fontWeight.bold },
-  sheetHint: { fontSize: fontSize.xs, lineHeight: 16 },
-  picker: { marginTop: spacing.xs },
-  sheetActions: {
-    flexDirection: "row",
-    gap: spacing.sm,
-    marginTop: spacing.md,
-    paddingTop: spacing.md,
-    borderTopWidth: 1,
-  },
-  flex: { flex: 1 },
+/**
+ * Camera preview plus its overlays, memoised so a new activity-log line never
+ * re-renders the camera. Only `pill` and `scanning` reach it.
+ */
+const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady }) {
+  return (
+    <View style={[s.cameraWrap, { height }]}>
+      {focused ? (
+        <CameraView ref={camRef} style={StyleSheet.absoluteFill} facing="back" autofocus="on" onCameraReady={onCameraReady} />
+      ) : null}
+
+      {pill ? (
+        <View style={[s.resultPill, { borderColor: pill.tone, backgroundColor: "rgba(4,8,20,0.66)" }]}>
+          <Text style={[s.resultPillText, { color: pill.tone }]} numberOfLines={1}>
+            {pill.text}
+          </Text>
+        </View>
+      ) : null}
+
+      {/* The hint lives in a flush bottom strip below, not in a floating pill. */}
+      <ScannerGuideFrame scanning={scanning} hint={null} />
+
+      <View style={s.hintStrip} pointerEvents="none">
+        <Text style={s.hintStripText}>Align plate in the viewfinder, then press Scan</Text>
+      </View>
+    </View>
+  );
 });
+
+function resultPill(result) {
+  if (!result) return null;
+  if (result.state === "success" && result.plate) return { tone: "#22C55E", text: result.plate };
+  if (result.state === "uncertain") return { tone: "#F59E0B", text: `${result.plate || "?"} · uncertain` };
+  if (result.state === "none") return { tone: "#EF4444", text: "NO PLATE" };
+  return null;
+}
+
+function DebugRow({ label, value, valueColor, s, colors }) {
+  return (
+    <View style={s.debugRow}>
+      <Text style={[s.debugLabel, { color: colors.onDark.muted }]}>{label}</Text>
+      <Text style={[s.debugValue, { color: valueColor || colors.onDark.strong }]} numberOfLines={2}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function AnprDebugCard({ result, visible, onToggle, colors, s }) {
+  const detected = Boolean(result && result.plate);
+  const pct = result && result.confidence ? `${Math.round(result.confidence * 100)}%` : "—";
+  const yes = (v) => (v ? "YES" : "NO");
+  return (
+    <Card tone="dark" style={s.block}>
+      <View style={s.blockHeader}>
+        <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>ANPR DEBUG</Text>
+        <Pressable onPress={onToggle} hitSlop={8} accessibilityRole="button" accessibilityLabel="Toggle ANPR debug card">
+          <Ionicons name={visible ? "chevron-up" : "chevron-down"} size={17} color={colors.onDark.muted} />
+        </Pressable>
+      </View>
+      {visible ? (
+        <View style={s.debugBody}>
+          <DebugRow
+            label="Plate detected"
+            value={yes(detected)}
+            valueColor={detected ? colors.success : colors.danger}
+            s={s}
+            colors={colors}
+          />
+          <DebugRow label="Raw OCR" value={result?.raw || "—"} s={s} colors={colors} />
+          <DebugRow label="Normalized" value={result?.normalized || result?.plate || "—"} s={s} colors={colors} />
+          <DebugRow label="Confidence" value={pct} s={s} colors={colors} />
+          <DebugRow
+            label="Valid plate"
+            value={yes(Boolean(result?.valid))}
+            valueColor={result?.valid ? colors.success : colors.danger}
+            s={s}
+            colors={colors}
+          />
+        </View>
+      ) : null}
+    </Card>
+  );
+}
+
+function LastDetectionCard({ result, colors, s }) {
+  if (!result) {
+    return (
+      <Card tone="dark" style={s.block}>
+        <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>LAST DETECTION</Text>
+        <Text style={[s.emptyText, { color: colors.onDark.muted }]}>No detection yet — press Scan plate.</Text>
+      </Card>
+    );
+  }
+
+  const pct = result.confidence ? `${Math.round(result.confidence * 100)}% confidence` : "";
+  const valid = Boolean(result.valid);
+  const sub = result.state === "success" ? `${pct} · valid plate` : result.state === "uncertain" ? `${pct} · uncertain, scan again` : result.message || "";
+
+  return (
+    <Card tone="dark" style={s.block}>
+      <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>LAST DETECTION</Text>
+      {result.plate ? (
+        <Text style={[s.plateMono, { color: colors.onDark.strong }]} numberOfLines={1} adjustsFontSizeToFit>
+          {result.plate}
+        </Text>
+      ) : null}
+      <Text style={[s.detSub, { color: valid ? colors.success : colors.warning }]}>{sub}</Text>
+
+      {result.hotlist ? (
+        <View style={[s.hotlist, { backgroundColor: colors.solidDanger, borderColor: colors.danger }]}>
+          <Ionicons name="shield" size={16} color="#FFFFFF" />
+          <Text style={s.hotlistText}>HOTLIST MATCH, reported to police</Text>
+        </View>
+      ) : null}
+
+      {!valid && result.state === "none" ? (
+        <Text style={[s.detNote, { color: colors.danger }]}>
+          No plate detected{result.frames ? ` across ${result.frames} frame(s)` : ""} — move closer and hold steady.
+        </Text>
+      ) : null}
+    </Card>
+  );
+}
+
+function ActivityLog({ log, colors, s }) {
+  return (
+    <Card tone="dark" style={s.block}>
+      <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>ACTIVITY LOG</Text>
+      {log.length === 0 ? (
+        <Text style={[s.emptyText, { color: colors.onDark.muted }]}>Nothing yet.</Text>
+      ) : (
+        <View style={s.logBody}>
+          {log.map((line, i) => (
+            <Text key={`${i}-${line.slice(0, 24)}`} style={[s.logLine, { color: colors.onDark.muted }]}>
+              {line}
+            </Text>
+          ))}
+        </View>
+      )}
+    </Card>
+  );
+}
+
+function makeStyles(colors) {
+  return StyleSheet.create({
+    fill: { flex: 1 },
+
+    header: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: spacing.lg,
+      paddingBottom: spacing.sm,
+      borderBottomWidth: 1,
+      gap: spacing.sm,
+    },
+    headerText: { flex: 1, gap: 1 },
+    title: { fontSize: fontSize.lg, fontWeight: fontWeight.heavy, letterSpacing: 0.3 },
+    subtitle: { fontSize: fontSize.xs },
+    headerActions: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+    iconBtn: {
+      width: 32,
+      height: 32,
+      borderRadius: 9,
+      borderWidth: 1,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    pill: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 5,
+      borderWidth: 1,
+      borderRadius: radius.pill,
+      paddingHorizontal: spacing.sm,
+      paddingVertical: 3,
+    },
+    pillDot: { width: 7, height: 7, borderRadius: 4 },
+    pillText: { fontSize: 10, fontWeight: fontWeight.bold, letterSpacing: 0.4 },
+
+    cameraWrap: { backgroundColor: "#000", width: "100%", overflow: "hidden" },
+    resultPill: {
+      position: "absolute",
+      top: spacing.md,
+      alignSelf: "center",
+      borderWidth: 2,
+      borderRadius: radius.pill,
+      paddingHorizontal: spacing.lg,
+      paddingVertical: 5,
+      zIndex: 2,
+    },
+    resultPillText: { fontSize: fontSize.base, fontWeight: fontWeight.bold, letterSpacing: 1 },
+    hintStrip: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      bottom: 0,
+      backgroundColor: "rgba(4,8,20,0.66)",
+      paddingVertical: spacing.sm,
+      alignItems: "center",
+    },
+    hintStripText: { color: "#E2E8F0", fontSize: fontSize.sm, fontWeight: fontWeight.medium },
+
+    scroll: { flex: 1 },
+    flex: { flex: 1 },
+
+    offlineBanner: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: spacing.sm,
+      margin: spacing.lg,
+      marginBottom: 0,
+      padding: spacing.md,
+      borderRadius: radius.md,
+      borderWidth: 1,
+    },
+    offlineText: { flex: 1, fontSize: fontSize.sm },
+
+    block: { marginHorizontal: spacing.lg, marginTop: spacing.md },
+    blockHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+    blockTitle: {
+      fontSize: fontSize.sm,
+      fontWeight: fontWeight.bold,
+      letterSpacing: 1.1,
+    },
+    emptyText: { marginTop: spacing.sm, fontSize: fontSize.sm },
+
+    debugBody: { marginTop: spacing.md, gap: spacing.xs },
+    debugRow: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", gap: spacing.md },
+    debugLabel: { fontSize: fontSize.sm },
+    debugValue: {
+      flex: 1,
+      textAlign: "right",
+      fontSize: fontSize.sm,
+      fontWeight: fontWeight.semibold,
+      fontFamily: "monospace",
+    },
+
+    actions: { flexDirection: "row", gap: spacing.md, marginHorizontal: spacing.lg, marginTop: spacing.md },
+
+    backendRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: spacing.md,
+      marginHorizontal: spacing.lg,
+      marginTop: spacing.md,
+    },
+    backendStatus: { fontSize: fontSize.sm, fontWeight: fontWeight.bold, letterSpacing: 0.4 },
+
+    plateMono: {
+      marginTop: spacing.md,
+      fontSize: fontSize.display,
+      fontWeight: fontWeight.heavy,
+      fontFamily: "monospace",
+      letterSpacing: 2,
+    },
+    detSub: { marginTop: spacing.xs, fontSize: fontSize.sm, fontWeight: fontWeight.semibold },
+    detNote: { marginTop: spacing.sm, fontSize: fontSize.sm },
+    hotlist: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: spacing.sm,
+      marginTop: spacing.md,
+      padding: spacing.md,
+      borderRadius: radius.md,
+      borderWidth: 1,
+    },
+    hotlistText: { color: "#FFFFFF", fontSize: fontSize.sm, fontWeight: fontWeight.bold, letterSpacing: 0.3, flex: 1 },
+
+    logBody: { marginTop: spacing.md, gap: 3 },
+    logLine: { fontSize: 12.5, lineHeight: 18, fontFamily: "monospace" },
+
+    permission: { flex: 1, justifyContent: "center", paddingHorizontal: spacing.xl, gap: spacing.lg, alignItems: "center" },
+    permissionTitle: { fontSize: fontSize.xl, fontWeight: fontWeight.bold },
+    permissionText: { textAlign: "center", lineHeight: 22 },
+  });
+}

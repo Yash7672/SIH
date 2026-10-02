@@ -27,6 +27,7 @@ export default function Button({
   loading = false,
   disabled = false,
   loadingLabel,
+  icon = null,
   style,
   textStyle,
   accessibilityLabel,
@@ -84,9 +85,12 @@ export default function Button({
           {loadingLabel ? <Text style={[styles.text, { color: spec.fg, fontSize: s.text }]}>{loadingLabel}</Text> : null}
         </View>
       ) : (
-        <Text style={[styles.text, { color: spec.fg, fontSize: s.text }, textStyle]} numberOfLines={1}>
-          {label}
-        </Text>
+        <View style={styles.contentRow}>
+          {icon ? <View style={styles.icon}>{icon}</View> : null}
+          <Text style={[styles.text, { color: spec.fg, fontSize: s.text }, textStyle]} numberOfLines={1}>
+            {label}
+          </Text>
+        </View>
       )}
     </Pressable>
   );
@@ -104,4 +108,6 @@ const styles = StyleSheet.create({
     letterSpacing: 0.2,
   },
   loadingRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  contentRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  icon: { marginRight: 2 },
 });

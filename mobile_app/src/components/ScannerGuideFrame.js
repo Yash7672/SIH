@@ -83,11 +83,13 @@ function ScannerGuideFrameBase({ scanning, hint }) {
         ) : null}
       </View>
 
-      <View style={[styles.hintWrap, { top: top + frameHeight + spacing.lg }]}>
-        <Text style={styles.hint} numberOfLines={2}>
-          {hint}
-        </Text>
-      </View>
+      {hint ? (
+        <View style={[styles.hintWrap, { top: top + frameHeight + spacing.lg }]}>
+          <Text style={styles.hint} numberOfLines={2}>
+            {hint}
+          </Text>
+        </View>
+      ) : null}
     </View>
   );
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, StyleSheet, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import LoginScreen from "./src/screens/LoginScreen";
 import ScannerScreen from "./src/screens/ScannerScreen";
 import { clearSession, loadSession } from "./src/storage/store";
@@ -73,8 +74,13 @@ function AppInner() {
 
 export default function App() {
   return (
-    <ThemeProvider>
-      <AppInner />
-    </ThemeProvider>
+    // SDK 57 on Android draws edge to edge, so every screen has to apply the
+    // status-bar / navigation-bar insets itself. SafeAreaProvider measures them
+    // once for the whole tree; useSafeAreaInsets() reads them per screen.
+    <SafeAreaProvider>
+      <ThemeProvider>
+        <AppInner />
+      </ThemeProvider>
+    </SafeAreaProvider>
   );
 }

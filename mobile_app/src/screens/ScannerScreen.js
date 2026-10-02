@@ -118,7 +118,11 @@ export default function ScannerScreen({ user, onLogout }) {
         const sb = score(b);
         for (let i = 0; i < sa.length; i += 1) if (sa[i] !== sb[i]) return sb[i] - sa[i];
         return 0;
-      })[0];
+      })
+      // Attach the tally to the winner. Without this the caller read
+      // `best.votes`, which the sorted read object never had, so the activity
+      // log always printed an empty/undefined vote count even on a real vote.
+      .map((winner) => ({ ...winner, votes: { ...counts } }))[0];
   }
 
   async function submitSighting(rawPlate, confidence, jitter = 0) {
@@ -157,7 +161,7 @@ export default function ScannerScreen({ user, onLogout }) {
       const normalized = normalizePlate(raw);
       const confidence = Number(best?.confidence || 0);
       const uncertain = Boolean(best?.uncertain) || !best?.valid || confidence < 0.5;
-      if (!raw) return { state: "none", message: "No plate detected — move closer and hold steady." };
+      if (!raw) return { state: "none", frames: reads.length, message: "No plate detected — move closer and hold steady." };
       if (uncertain) {
         return {
           state: "uncertain",
@@ -183,6 +187,13 @@ export default function ScannerScreen({ user, onLogout }) {
           plate: s.normalized,
           confidence,
           hotlist,
+          // Surfaced for the ANPR DEBUG card; the voting decision above is
+          // unchanged.
+          raw,
+          normalized,
+          valid: true,
+          frames: reads.length,
+          votes: best?.votes,
           message: hotlist ? "Reported to police — active hotlist match." : "Sighting recorded — not on the hotlist.",
         };
       } catch (e) {
@@ -209,6 +220,11 @@ export default function ScannerScreen({ user, onLogout }) {
         plate: s.normalized,
         confidence: 0.97,
         hotlist,
+        raw: plate,
+        normalized: s.normalized,
+        valid: true,
+        frames: 0,
+        votes: { [plate]: 1 },
         message: hotlist ? "Simulated hotlist match — reported to police." : "Simulated sighting recorded.",
       };
     } catch (e) {
