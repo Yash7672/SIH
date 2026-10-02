@@ -9,17 +9,19 @@
     "doctor": "expo-doctor"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.1.2",
-    "expo": "~53.0.0",
-    "expo-camera": "~16.1.0",
-    "expo-constants": "~17.1.0",
-    "expo-image-manipulator": "~13.1.7",
-    "expo-location": "~18.1.6",
-    "expo-status-bar": "~2.2.1",
-    "react": "19.0.0",
-    "react-native": "0.79.6"
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "^57.0.26",
+    "expo-camera": "~57.0.6",
+    "expo-constants": "~57.0.20",
+    "expo-image-manipulator": "~57.0.20",
+    "expo-location": "~57.0.20",
+    "expo-splash-screen": "~57.0.9",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
   },
   "devDependencies": {
-    "@babel/core": "^7.25.0"
+    "@babel/core": "^7.25.0",
+    "babel-preset-expo": "~57.0.0"
   }
 }
