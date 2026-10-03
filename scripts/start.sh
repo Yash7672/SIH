@@ -2,7 +2,7 @@
 # RAKSHAK - one command startup (Linux / macOS).
 # Mirrors scripts/start.ps1: same modes, same detection, same env files.
 #   ./scripts/start.sh [-m docker|local] [--host-ip x.x.x.x] [--rebuild]
-#                       [--no-mobile] [--reset] [--force-seed]
+#                       [--no-mobile] [--reset] [--reset-db] [--force-seed]
 set -uo pipefail
 
 # --------------------------------------------------------------------------- #
@@ -13,6 +13,7 @@ HOST_IP=""
 REBUILD=0
 NO_MOBILE=0
 RESET=0
+RESET_DB=0
 FORCE_SEED=0
 SKIP_FIREWALL=0
 PHONE_STATE="not-checked"   # authorized | unauthorized | none | no-adb | not-checked
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
     --rebuild)        REBUILD=1; shift ;;
     --no-mobile)      NO_MOBILE=1; shift ;;
     --reset)          RESET=1; shift ;;
+    --reset-db)       RESET_DB=1; shift ;;
     --force-seed)     FORCE_SEED=1; shift ;;
     --skip-firewall)  SKIP_FIREWALL=1; shift ;;
     -h|--help)
@@ -621,9 +623,72 @@ init_python_venv() {
 
 run_alembic() {
   step "applying database migrations (alembic upgrade head)"
-  ( cd "$BACKEND_DIR" && "$alembic" upgrade head ) >"$LOG_DIR/alembic.log" 2>&1 \
-    || die "alembic upgrade head failed - see logs/alembic.log"
+  ( cd "$BACKEND_DIR" && "$VENV_DIR/bin/alembic" upgrade head ) >"$LOG_DIR/alembic.log" 2>&1
+  if [ $? -ne 0 ]; then
+    err "alembic upgrade head failed - see logs/alembic.log"
+    echo
+    info "last lines of logs/alembic.log:"
+    [ -f "$LOG_DIR/alembic.log" ] && tail -n 15 "$LOG_DIR/alembic.log" | sed 's/^/    /'
+    echo
+    if grep -q "Can't locate revision" "$LOG_DIR/alembic.log" 2>/dev/null; then
+      warn "The database was created by a different version of the code. Run ./scripts/start.sh --reset-db to recreate the dev database."
+    elif grep -qE 'already exists|duplicate column' "$LOG_DIR/alembic.log" 2>/dev/null; then
+      warn "The tables exist but Alembic has no record of them. Run ./scripts/start.sh --reset-db to recreate the dev database."
+    else
+      warn "Read the lines above; logs/alembic.log has the full output."
+    fi
+    die "startup aborted."
+  fi
   ok "database schema is up to date"
+}
+
+# Drops and recreates ONLY the dev database. rakshak_test, rakshak_app,
+# rakshak_scratch and the template databases are never touched.
+reset_local_database() {
+  if ! psql_cmd >/dev/null; then
+    die "psql not found - cannot recreate the database"
+  fi
+  local psql user pass db answer backup
+  psql="$(psql_cmd)"
+  user="${POSTGRES_USER:-postgres}"
+  pass="${POSTGRES_PASSWORD:-postgres}"
+  db="${POSTGRES_DB:-rakshak}"
+
+  case "$db" in
+    postgres|template0|template1|rakshak_test|rakshak_app|rakshak_scratch)
+      die "refusing to recreate '$db': it is a protected database, not the dev database" ;;
+  esac
+
+  warn "This DELETES all tables and all data in the dev database '$db'."
+  info "Demo users and demo data are recreated automatically at startup. Other databases are never touched."
+  printf "  Type YES to drop and recreate '%s': " "$db"
+  read -r answer
+  if [ "$(printf '%s' "${answer:-}" | tr '[:lower:]' '[:upper:]')" != "YES" ]; then
+    die "ResetDb cancelled - nothing was changed."
+  fi
+
+  if PGPASSWORD="$pass" "$psql" -h localhost -U "$user" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" 2>/dev/null | grep -q 1; then
+    # Best-effort backup before destroying anything.
+    if command -v pg_dump >/dev/null 2>&1; then
+      backup="$STATE_DIR/backup_${db}.sql"
+      if PGPASSWORD="$pass" pg_dump -h localhost -U "$user" -d "$db" -f "$backup" 2>/dev/null; then
+        ok "backup written to $backup"
+      else
+        warn "pg_dump failed - the backup at $backup may be incomplete"
+      fi
+    else
+      warn "pg_dump not found - continuing without a backup"
+    fi
+    step "dropping database '$db'"
+    PGPASSWORD="$pass" "$psql" -h localhost -U "$user" -d postgres -tAc "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
+
+  step "creating database '$db'"
+  if PGPASSWORD="$pass" "$psql" -h localhost -U "$user" -d postgres -tAc "CREATE DATABASE $db" >/dev/null 2>&1; then
+    ok "database '$db' recreated"
+  else
+    die "could not recreate '$db'"
+  fi
 }
 
 npm_deps() { # dir, key, install (yes/no)
@@ -1084,6 +1149,7 @@ if [ "$EFFECTIVE_MODE" = "docker" ]; then
   start_docker
 else
   init_local_database
+  [ "$RESET_DB" -eq 1 ] && reset_local_database
   init_python_venv
   run_alembic
   start_backend_local

@@ -7,6 +7,7 @@ REM     start.bat -Mode docker
 REM     start.bat -HostIp 192.168.1.20
 REM     start.bat -NoMobile
 REM     start.bat -Reset
+REM     start.bat -ResetDb
 REM ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"

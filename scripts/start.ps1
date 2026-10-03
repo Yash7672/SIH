@@ -50,6 +50,8 @@ param(
 
     [switch] $Reset,
 
+    [switch] $ResetDb,
+
     [switch] $ForceSeed,
 
     [switch] $SkipFirewall,
@@ -482,6 +484,24 @@ function Resolve-PsqlPath {
                 Sort-Object Name -Descending |
                 ForEach-Object {
                     $p = Join-Path $_.FullName 'bin\psql.exe'
+                    if (Test-Path -LiteralPath $p) { $candidates += $p }
+                }
+        }
+    }
+    if ($candidates.Count -gt 0) { return $candidates[0] }
+    return $null
+}
+
+function Resolve-PgDumpPath {
+    $candidates = @()
+    $found = Test-Command 'pg_dump'
+    if ($found) { $candidates += $found }
+    foreach ($base in @('C:\Program Files\PostgreSQL', 'C:\Program Files (x86)\PostgreSQL')) {
+        if (Test-Path -LiteralPath $base) {
+            Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object {
+                    $p = Join-Path $_.FullName 'bin\pg_dump.exe'
                     if (Test-Path -LiteralPath $p) { $candidates += $p }
                 }
         }
@@ -1239,6 +1259,57 @@ function Initialize-LocalDatabase {
     }
 }
 
+function Reset-LocalDatabase {
+    # Drops and recreates ONLY the dev database from DATABASE_URL.
+    # rakshak_test, rakshak_app, rakshak_scratch and the template databases are
+    # never touched: the name is checked against a protected list before any
+    # DROP is issued.
+    $psql = Resolve-PsqlPath
+    if (-not $psql) { Die 'psql.exe not found - cannot recreate the database.' }
+
+    $user = if ($env:POSTGRES_USER) { $env:POSTGRES_USER } else { 'postgres' }
+    $pass = if ($env:POSTGRES_PASSWORD) { $env:POSTGRES_PASSWORD } else { 'postgres' }
+    $dbName = Get-DbNameFromUrl -Url $env:DATABASE_URL -Fallback 'rakshak'
+
+    $protected = @('postgres', 'template0', 'template1', 'rakshak_test', 'rakshak_app', 'rakshak_scratch')
+    if ($protected -contains $dbName.ToLower()) {
+        Die ("Refusing to recreate '{0}': it is a protected database, not the dev database." -f $dbName)
+    }
+
+    Write-Warn2 ("This DELETES all tables and all data in the dev database '{0}'." -f $dbName)
+    Write-Info  ("Demo users and demo data are recreated automatically at startup. Other databases are never touched.")
+    $typed = ''
+    try { $typed = Read-Host ("  Type YES to drop and recreate '{0}'" -f $dbName) } catch { $typed = '' }
+    if ($typed.Trim().ToUpper() -ne 'YES') {
+        Die 'ResetDb cancelled - nothing was changed.'
+    }
+
+    $exists = Invoke-Psql -Psql $psql -Sql "SELECT 1 FROM pg_database WHERE datname='$dbName';" -User $user -Password $pass -DbName 'postgres'
+    if ((($exists | Out-String) -match '1')) {
+        # Best-effort backup before destroying anything.
+        $dump = Resolve-PgDumpPath
+        if ($dump) {
+            $backup = Join-Path $StateDir ("backup_{0}.sql" -f $dbName)
+            $env:PGPASSWORD = $pass
+            & $dump -h 'localhost' -p 5432 -U $user -d $dbName -f $backup 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { Write-Ok ("backup written to {0}" -f $backup) }
+            else { Write-Warn2 ("pg_dump failed - the backup at {0} may be incomplete" -f $backup) }
+        } else {
+            Write-Warn2 'pg_dump.exe not found - continuing without a backup'
+        }
+        Write-Step ("dropping database '{0}'" -f $dbName)
+        Invoke-Psql -Psql $psql -Sql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$dbName' AND pid<>pg_backend_pid();" -User $user -Password $pass -DbName 'postgres' | Out-Null
+        Invoke-Psql -Psql $psql -Sql "DROP DATABASE IF EXISTS $dbName;" -User $user -Password $pass -DbName 'postgres' | Out-Null
+    }
+
+    Write-Step ("creating database '{0}'" -f $dbName)
+    $created = Invoke-Psql -Psql $psql -Sql "CREATE DATABASE $dbName;" -User $user -Password $pass -DbName 'postgres'
+    if (-not ((($created | Out-String) -match 'CREATE DATABASE'))) {
+        Die ("could not recreate '{0}': {1}" -f $dbName, (($created | Out-String).Trim()))
+    }
+    Write-Ok ("database '{0}' recreated" -f $dbName)
+}
+
 function Initialize-PythonVenv {
     # Always use the interpreter OUTSIDE .venv to (re)build .venv.
     $basePython = Get-BasePythonCommand
@@ -1321,8 +1392,25 @@ function Invoke-AlembicUpgrade {
         Pop-Location
     }
     if ($code -ne 0) {
-        Write-TextFile (Join-Path $LogDir 'alembic.log') (($out | Out-String))
-        Die 'alembic upgrade head failed - see logs/alembic.log'
+        $logPath = Join-Path $LogDir 'alembic.log'
+        Write-TextFile $logPath (($out | Out-String))
+        Write-Err 'alembic upgrade head failed - see logs/alembic.log'
+        Write-Host ''
+        Write-Host '  last lines of logs/alembic.log:' -ForegroundColor Gray
+        if (Test-Path -LiteralPath $logPath) {
+            Get-Content -LiteralPath $logPath -Tail 15 | ForEach-Object { Write-Host ('    ' + $_) -ForegroundColor Gray }
+        }
+        Write-Host ''
+        $logText = ''
+        if (Test-Path -LiteralPath $logPath) { $logText = (Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue) }
+        if ($logText -match "Can't locate revision") {
+            Write-Warn2 "The database was created by a different version of the code. Run start.bat -ResetDb to recreate the dev database."
+        } elseif ($logText -match 'relation .* already exists|already exists|duplicate column') {
+            Write-Warn2 "The tables exist but Alembic has no record of them. Run start.bat -ResetDb to recreate the dev database."
+        } else {
+            Write-Warn2 'Read the lines above; logs/alembic.log has the full output.'
+        }
+        Die 'startup aborted.'
     }
     Write-Ok 'database schema is up to date'
 }
@@ -2339,6 +2427,9 @@ try {
         Start-BackendDocker
     } else {
         Initialize-LocalDatabase
+        if ($ResetDb) {
+            Reset-LocalDatabase
+        }
         Initialize-PythonVenv
         Invoke-AlembicUpgrade
         Start-BackendLocal
