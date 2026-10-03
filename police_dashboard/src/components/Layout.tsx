@@ -16,8 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { AlertEvent, clearSession } from "../services/api";
-import { usePoliceSocket, SocketStatus } from "../hooks/usePoliceSocket";
-import { SocketStateProvider } from "../hooks/SocketState";
+import { usePoliceSocket } from "../hooks/usePoliceSocket";
 import { Wordmark } from "./Brand";
 import { Button } from "./ui/Button";
 import { formatCoords, platePath, timeAgo } from "../lib/format";
@@ -33,57 +32,25 @@ const NAV = [
   { to: "/analytics", label: "Analytics", icon: BarChart3, end: false },
 ] as const;
 
-/**
- * Live / Reconnecting / Disconnected, with the reason in the tooltip.
- *
- * The previous pill was a two-state light. A socket cycling through its backoff
- * rendered as "Disconnected", which reads like a hard failure and hides the fact
- * that recovery is already under way.
- */
-export const SOCKET_LABELS: Record<SocketStatus, string> = {
-  connecting: "Connecting",
-  live: "Live",
-  reconnecting: "Reconnecting",
-  offline: "Disconnected",
-};
-
-function ConnectionPill({
-  status,
-  detail,
-  onRetry,
-}: {
-  status: SocketStatus;
-  detail: string | null;
-  onRetry: () => void;
-}) {
-  const connected = status === "live";
-  const tone = connected
-    ? "bg-success/10 text-success ring-success/30"
-    : status === "reconnecting" || status === "connecting"
-      ? "bg-warning/10 text-warning ring-warning/30"
-      : "bg-danger/10 text-danger ring-danger/30";
-  const dot = connected ? "bg-success" : status === "offline" ? "bg-danger" : "bg-warning";
-  const title = detail ? `${SOCKET_LABELS[status]} - ${detail}` : SOCKET_LABELS[status];
-
+function ConnectionPill({ connected }: { connected: boolean }) {
   return (
-    <button
-      type="button"
-      onClick={onRetry}
-      title={`${title} (click to reconnect now)`}
+    <span
       className={[
         "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ring-1 ring-inset",
-        tone,
-        "cursor-pointer",
+        connected ? "bg-success/10 text-success ring-success/30" : "bg-danger/10 text-danger ring-danger/30",
       ].join(" ")}
+      title={connected ? "WebSocket connected" : "Reconnecting to the alert stream"}
     >
       <span className="relative flex h-2 w-2">
         {connected ? (
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
         ) : null}
-        <span className={["relative inline-flex h-2 w-2 rounded-full", dot].join(" ")} />
+        <span
+          className={["relative inline-flex h-2 w-2 rounded-full", connected ? "bg-success" : "bg-danger"].join(" ")}
+        />
       </span>
-      {SOCKET_LABELS[status]}
-    </button>
+      {connected ? "Live" : "Disconnected"}
+    </span>
   );
 }
 
@@ -96,8 +63,7 @@ export default function Layout({
 }) {
   const nav = useNavigate();
   const user = JSON.parse(localStorage.getItem("rakshak_user") || "null");
-  const socket = usePoliceSocket(onAlert);
-  const { status, connected, detail, reconnectNow } = socket;
+  const { connected } = usePoliceSocket(onAlert);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -151,9 +117,6 @@ export default function Layout({
 
   return (
     <PageBackground>
-      {/* One socket for the whole console; pages read its state from here rather
-          than opening their own (see hooks/SocketState.tsx). */}
-      <SocketStateProvider value={socket}>
       <div className="min-h-screen">
         {/* Mobile drawer backdrop */}
         {drawerOpen ? (
@@ -226,15 +189,11 @@ export default function Layout({
             <div className="border-t border-dark-700 px-3 py-3">
               <div className={["flex items-center gap-2", collapsed ? "lg:justify-center" : ""].join(" ")}>
                 <span
-                  className={[
-                    "h-2 w-2 shrink-0 rounded-full",
-                    connected ? "bg-success" : status === "offline" ? "bg-danger" : "bg-warning",
-                  ].join(" ")}
+                  className={["h-2 w-2 shrink-0 rounded-full", connected ? "bg-success" : "bg-danger"].join(" ")}
                   aria-hidden
                 />
                 <span className={["text-xs", collapsed ? "lg:hidden" : "text-dark-600"].join(" ")}>
-                  {SOCKET_LABELS[status]}
-                  {detail && !collapsed ? `: ${detail}` : ""}
+                  {connected ? "Alert stream live" : "Reconnecting…"}
                 </span>
               </div>
               <button
@@ -273,7 +232,7 @@ export default function Layout({
                 </div>
 
                 <div className="ml-auto flex items-center gap-3">
-                  <ConnectionPill status={status} detail={detail} onRetry={reconnectNow} />
+                  <ConnectionPill connected={connected} />
                   <ThemeToggle />
 
                   {user ? (
@@ -367,7 +326,6 @@ export default function Layout({
           </div>
         </div>
       </div>
-      </SocketStateProvider>
     </PageBackground>
   );
 }

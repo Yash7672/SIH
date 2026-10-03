@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
-import { AlertEvent, fetchRecentAlerts, mergeAlerts } from "./services/api";
+import { AlertEvent } from "./services/api";
 import { PageSkeleton } from "./components/ui/Feedback";
 
 // Route-level code splitting: the map/chart libraries (leaflet, recharts) are
@@ -68,33 +68,6 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, []);
-
-  /**
-   * Hydrate from GET /alerts on mount.
-   *
-   * The alert list used to exist only in memory, so a browser refresh wiped it
-   * and the operator could not see what had already been detected while they
-   * were away. Live events arriving during the fetch are merged by sighting id,
-   * so nothing is lost or duplicated at the seam.
-   */
-  useEffect(() => {
-    let cancelled = false;
-
-    fetchRecentAlerts()
-      .then((history) => {
-        if (cancelled) return;
-        setLiveAlerts((prev) => mergeAlerts(prev, history, MAX_ALERTS));
-      })
-      .catch((error) => {
-        // Not fatal: the socket is the primary feed, so the page still goes live.
-        // Surfaced in the console because the visible symptom is an empty list.
-        if (!cancelled) console.warn("[rakshak] could not load recent alerts:", error);
-      });
-
-    return () => {
-      cancelled = true;
     };
   }, []);
 

@@ -71,7 +71,7 @@ api.interceptors.request.use((config) => {
 // same time, so a batch of requests only renews the token once.
 let refreshInFlight: Promise<string> | null = null;
 
-export async function refreshAccessToken(): Promise<string> {
+async function refreshAccessToken(): Promise<string> {
   const refreshToken = localStorage.getItem(REFRESH_KEY);
   if (!refreshToken) throw new Error("no refresh token");
   const { data } = await axios.post<TokenResponse>(`${API_BASE}/api/v1/auth/refresh`, {
@@ -79,49 +79,6 @@ export async function refreshAccessToken(): Promise<string> {
   });
   saveSession(data);
   return data.access_token;
-}
-
-/**
- * Read a JWT's `exp` claim without verifying it.
- * Used only to decide *when* to refresh proactively; the server remains the
- * authority on validity.
- */
-function tokenExpiresAt(token: string): number | null {
-  const parts = token.split(".");
-  if (parts.length < 2) return null;
-  try {
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * A token that is valid *right now*, refreshing proactively when it is expired
- * or about to expire.
- *
- * The alert socket needs this: it authenticates at connect time, and access
- * tokens only live 30 minutes. A dashboard left open across that boundary used
- * to reconnect forever with a dead token and never recover.
- */
-export async function getValidAccessToken(skewMs = 60000): Promise<string | null> {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (!token) return null;
-
-  const expiresAt = tokenExpiresAt(token);
-  if (expiresAt !== null && expiresAt - Date.now() > skewMs) return token;
-
-  try {
-    return await (refreshInFlight = refreshInFlight || refreshAccessToken()).finally(() => {
-      refreshInFlight = null;
-    });
-  } catch {
-    // A dead refresh token means the session is gone; clearing it stops the
-    // socket from reconnecting in a loop and lets the UI send the user to login.
-    clearSession();
-    return null;
-  }
 }
 
 function forceLogin() {
@@ -242,52 +199,3 @@ export const COMPLAINT_STATUS_COLORS: Record<string, string> = {
   HOTLISTED: "chip-danger",
   CLOSED: "chip-neutral",
 };
-
-/**
- * Recent hotlist detections, newest first.
- *
- * The alert list used to live only in memory, so a browser refresh emptied it
- * and the operator had no way to see what they had already missed. Hydrating
- * from GET /alerts on load makes the page survivable; the socket then keeps it
- * up to date. De-duplication against live events happens in the merge helper.
- */
-export async function fetchRecentAlerts(): Promise<AlertEvent[]> {
-  // No params: GET /alerts returns the 50 most recent hotlist detections from the
-  // last 24 hours, which is the window the dashboard shows.
-  const { data } = await api.get<AlertEvent[]>("/alerts");
-  return Array.isArray(data) ? data : [];
-}
-
-/** Stable identity for an alert, used to merge history with live events. */
-export function alertKey(a: Pick<AlertEvent, "sighting_id" | "plate" | "timestamp">): string {
-  return a.sighting_id || `${a.plate}::${a.timestamp}`;
-}
-
-/**
- * Merge freshly-fetched history into the live list.
- *
- * Newest first, de-duplicated by sighting id, capped. A live event that is
- * already present in the history must not appear twice, which is what happens on
- * every reconnect because the backend keeps sending detections the socket missed
- * while the page was closed.
- */
-export function mergeAlerts(live: AlertEvent[], history: AlertEvent[], cap = 100): AlertEvent[] {
-  const seen = new Set<string>();
-  const out: AlertEvent[] = [];
-
-  for (const item of [...live, ...history]) {
-    if (!item || !item.plate) continue;
-    const key = alertKey(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
-  }
-
-  out.sort((a, b) => {
-    const at = Date.parse(a.timestamp || "") || 0;
-    const bt = Date.parse(b.timestamp || "") || 0;
-    return bt - at;
-  });
-
-  return out.slice(0, cap);
-}
