@@ -77,6 +77,7 @@ $PidsPath = Join-Path $StateDir 'pids.json'
 $HashesPath = Join-Path $StateDir 'hashes.json'
 $StatePath = Join-Path $StateDir 'state.json'
 $SeedMarkerPath = Join-Path $StateDir 'seed.done'
+$TrafficMarkerPath = Join-Path $StateDir 'seed-traffic.done'
 
 $BackendDir = Join-Path $RepoRoot 'backend'
 $CitizenDir = Join-Path $RepoRoot 'citizen_web'
@@ -1694,6 +1695,61 @@ function Invoke-Seeding {
 }
 
 # --------------------------------------------------------------------------- #
+# Traffic density seeding
+# --------------------------------------------------------------------------- #
+# The Maps page reads traffic_cells, which only fills up once a phone is actually
+# scanning a road. On a fresh database that means an empty map, so a clearly
+# labelled synthetic grid is seeded instead. Guarded by its own marker so a real
+# accumulated grid is never overwritten, and by --purge so re-seeding replaces
+# rather than doubles up.
+function Invoke-TrafficSeeding {
+    param([switch] $Force)
+
+    $seedScript = Join-Path $RepoRoot 'scripts\seed_traffic.py'
+    if (-not (Test-Path -LiteralPath $seedScript)) { return }
+    $seedHash = Get-FileHashHex $seedScript
+
+    if (-not $Force -and -not $ForceSeed -and (Test-Path -LiteralPath $TrafficMarkerPath)) {
+        $marker = (Get-Content -LiteralPath $TrafficMarkerPath -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($marker -eq $seedHash) {
+            Write-Ok 'traffic density already seeded (skipping - idempotent, runs once)'
+            Write-Info 'to re-seed: .\start.bat -Reset  (or -ForceSeed)'
+            return
+        }
+    }
+
+    $python = Get-PythonCommand
+    if (-not $python) { return }
+
+    # Skipped in docker mode: the traffic grid is demo-only and the backend
+    # container has no reason to carry a synthetic heatmap.
+    if ($script:EffectiveMode -eq 'docker') {
+        Write-Info 'traffic density seeding skipped in docker mode'
+        return
+    }
+
+    Push-Location $RepoRoot
+    try {
+        # -purge keeps this idempotent: the previous synthetic grid is removed
+        # first, so a re-seed does not double every count.
+        $out = & $python $seedScript --hours 24 --purge 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    $text = ($out | Out-String).Trim()
+    if ($code -ne 0) {
+        Write-Warn2 ("traffic seeding exited with code {0}" -f $code)
+        Write-Warn2 $text
+        Write-Warn2 'the Maps page will show an empty grid until a phone scans a road'
+        return
+    }
+    Write-TextFile (Join-Path $LogDir 'seed_traffic.log') $text
+    Write-Ok 'traffic density seeded (synthetic, tagged in the database)'
+    Write-TextFile $TrafficMarkerPath $seedHash
+}
+
+# --------------------------------------------------------------------------- #
 # Step 9 - Expo (always on the host)
 # --------------------------------------------------------------------------- #
 function Resolve-Adb {
@@ -2349,6 +2405,7 @@ function Invoke-Reset {
         try { & docker compose down -v 2>&1 | Out-String | Write-Info } finally { Pop-Location }
         Write-Ok 'docker volumes removed'
         Remove-Item -LiteralPath $SeedMarkerPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $TrafficMarkerPath -Force -ErrorAction SilentlyContinue
         return
     }
 
@@ -2376,6 +2433,7 @@ function Invoke-Reset {
         }
     }
     Remove-Item -LiteralPath $SeedMarkerPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TrafficMarkerPath -Force -ErrorAction SilentlyContinue
     Write-Ok 'reset finished - the services will start again in a moment'
 }
 
@@ -2497,8 +2555,12 @@ try {
     $backendUp = ($results | Where-Object { $_.Service -eq 'Backend API' }).Ok
     if ($backendUp) {
         Invoke-Seeding
+        # After demo seeding: the traffic grid needs no users, but running it
+        # second means the Maps page has data the moment the dashboard is opened.
+        Invoke-TrafficSeeding
     } else {
         Write-Warn2 'backend is not healthy - skipping demo seeding'
+        Write-Warn2 'the Maps page will start empty'
     }
 
     # --- Step 9 -------------------------------------------------------------- #

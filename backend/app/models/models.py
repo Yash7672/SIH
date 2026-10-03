@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     JSON,
     Boolean,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -185,6 +186,39 @@ class Sighting(Base):
         Index("idx_sightings_created_at", "created_at"),
         # Covers the vehicle timeline/route queries (filter by hotlist, order by time).
         Index("idx_sightings_hotlist_detected", "hotlist_id", "detected_at"),
+    )
+
+
+class TrafficCell(Base):
+    """One hour of vehicle counts for one ~110 m grid cell.
+
+    Counts only: no plate, no image, no device id. The whole point of the grid is
+    that a density figure cannot be traced back to a single vehicle, so those
+    columns must never be added here.
+    """
+
+    __tablename__ = "traffic_cells"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    cell_lat: Mapped[float] = mapped_column(Float, nullable=False)
+    cell_lng: Mapped[float] = mapped_column(Float, nullable=False)
+    hour_bucket: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Counts processed frames even when no vehicle was seen, so an empty road is
+    # low density rather than absent.
+    frames: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    two_wheeler: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    car: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    bus: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    truck: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Demo rows are tagged so `seed_traffic.py --purge` can remove exactly them.
+    synthetic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "cell_lat", "cell_lng", "hour_bucket", "synthetic", name="uq_traffic_cells_cell_hour"
+        ),
+        Index("idx_traffic_cells_hour_bucket", "hour_bucket"),
+        Index("idx_traffic_cells_lng_lat", "cell_lng", "cell_lat"),
     )
 
 

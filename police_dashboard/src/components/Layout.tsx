@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   ListChecks,
   LogOut,
+  Map as MapIcon,
   PanelLeft,
   Radio,
   Search,
@@ -25,6 +26,9 @@ import { PageBackground } from "./ui/PageBackground";
 
 const NAV = [
   { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
+  // Density sits directly under Overview: it is the same operational question
+  // ("where is the activity?") asked geographically rather than numerically.
+  { to: "/maps", label: "Maps", icon: MapIcon, end: false },
   { to: "/alerts", label: "Live Alerts", icon: Siren, end: false, badge: "alerts" },
   { to: "/complaints", label: "Complaints", icon: ListChecks, end: false },
   { to: "/hotlist", label: "Hotlist", icon: ShieldAlert, end: false },

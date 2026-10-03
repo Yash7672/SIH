@@ -179,6 +179,37 @@ export interface Overview {
   active_devices: number;
 }
 
+export type HeatLayerName = "traffic" | "stolen";
+
+export type HeatVehicleClass = "two_wheeler" | "car" | "bus" | "truck";
+
+/**
+ * One grid cell from GET /geo/heat.
+ *
+ * `w` means different things per layer: vehicles visible per processed frame
+ * for `traffic`, and the time-decayed sighting count for `stolen`. Both are
+ * normalised to 0..1 client-side against `max`, which is why the two can share
+ * one renderer.
+ */
+export interface HeatCell {
+  lat: number;
+  lng: number;
+  w: number;
+  /** Frames or sightings behind this cell. */
+  n: number;
+}
+
+export interface HeatResponse {
+  cells: HeatCell[];
+  max: number;
+  min: number;
+  /** Present on the traffic layer: rows are hour buckets. */
+  bucket?: "hour";
+  /** Present on the stolen layer: the decay constant that was applied. */
+  tau_hours?: number;
+  generated_at: string;
+}
+
 /* Legacy dark-console pill classes, kept so any straggler call site still
    resolves. New code should prefer the chip-* classes from
    components/ui/StatusChip.tsx and components/ui/HotlistChip.tsx, which are

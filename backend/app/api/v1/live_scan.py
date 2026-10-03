@@ -19,6 +19,7 @@ from app.db.session import SessionLocal
 from app.models.models import Device, Role
 from app.services.hotlist_service import HotlistService
 from app.services.sighting_service import SightingService
+from app.services.traffic_service import traffic_accumulator
 from app.ws.manager import alert_manager
 
 # AI dependencies
@@ -147,7 +148,6 @@ def decode_and_infer(jpeg_bytes: bytes):
                     
     ms = int((time.perf_counter() - t0) * 1000)
     return w, h, ms, vehicles, plates, crops
-
 def run_ocr(crop_bgr: np.ndarray):
     """Read one plate crop. Runs off the frame path on ocr_pool, never inline.
 
@@ -320,7 +320,15 @@ async def ws_live_scan(websocket: WebSocket):
                         w, h, ms, vehicles, plates, crops = await loop.run_in_executor(
                             inference_pool, decode_and_infer, jpeg
                         )
-                        
+
+                        # Density hook for the Maps heatmap. Counts per class in
+                        # every processed frame - including frames that saw
+                        # nothing, so an empty road still registers as low
+                        # density. Lat/lng come from the phone; a missing, 0/0 or
+                        # non-Indian fix is counted but not credited to a cell.
+                        # No plate, image or device id is passed here by design.
+                        traffic_accumulator.add(lat, lng, vehicles)
+
                         await websocket.send_text(json.dumps({
                             "type": "boxes",
                             "seq": seq,
@@ -441,5 +449,20 @@ async def ws_live_scan(websocket: WebSocket):
     finally:
         for _t in ocr_tasks:
             _t.cancel()
+        # Flush on disconnect too: the periodic worker may be up to 5 s behind,
+        # and the cells counted in that window are real observations that should
+        # not sit in memory waiting for the next flush.
+        if traffic_accumulator.pending_cells:
+            db = None
+            try:
+                db = SessionLocal()
+                written = traffic_accumulator.flush(db)
+                if written:
+                    logger.info("Traffic flush on disconnect wrote %d cells", written)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Traffic flush on disconnect failed: %s", exc)
+            finally:
+                if db is not None:
+                    db.close()
         ACTIVE_CONNECTIONS -= 1
 

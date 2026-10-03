@@ -8,6 +8,8 @@ import { PageSkeleton } from "./components/ui/Feedback";
 // only downloaded when the officer opens those pages.
 const Login = lazy(() => import("./pages/Login"));
 const Overview = lazy(() => import("./pages/Overview"));
+// Maps pulls in Leaflet + leaflet.heat, so it stays behind its own lazy chunk.
+const Maps = lazy(() => import("./pages/Maps"));
 const Complaints = lazy(() => import("./pages/Complaints"));
 const Hotlist = lazy(() => import("./pages/Hotlist"));
 const LiveAlerts = lazy(() => import("./pages/LiveAlerts"));
@@ -84,6 +86,7 @@ export default function App() {
           }
         >
           <Route index element={<Overview alerts={liveAlerts} />} />
+          <Route path="maps" element={<Maps />} />
           <Route path="complaints" element={<Complaints />} />
           <Route path="hotlist" element={<Hotlist />} />
           <Route path="alerts" element={<LiveAlerts alerts={liveAlerts} />} />

@@ -7,6 +7,7 @@ from app.models.models import (
     HotlistStatus,
     Role,
     Sighting,
+    TrafficCell,
     User,
     utcnow,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "Hotlist",
     "HotlistStatus",
     "Sighting",
+    "TrafficCell",
     "AuditLog",
     "Role",
     "utcnow",

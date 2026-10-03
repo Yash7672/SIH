@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     MAX_UPLOAD_MB: int = 5
     RATE_LIMIT_DETECTIONS_PER_MINUTE: int = 60
     RATE_LIMIT_AUTH_PER_MINUTE: int = 20
+    # Time-decay constant for the stolen-sighting heat layer: a sighting 6 h ago
+    # counts half as much as one just now.
+    HEAT_TAU_HOURS: float = 6.0
 
     @property
     def cors_origins_list(self) -> List[str]:

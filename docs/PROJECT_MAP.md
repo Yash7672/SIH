@@ -1,6 +1,7 @@
 # Project Map
 
 reviewed at commit `live-detect` (branch) — see `git log -1`
+Last full review: 2026-10-04, after the live-detection and Maps-heatmap work.
 
 ## Architecture Overview
 
@@ -91,6 +92,7 @@ Roles are enforced by `app/api/deps.py` (`require_cop`, `require_volunteer`, `re
 | GET | `/api/v1/alerts` | COP, ADMIN |
 | GET | `/api/v1/analytics/{overview,detections,hotlist-matches,locations}` | COP, ADMIN |
 | POST | `/api/v1/scanner/scan` | VOLUNTEER, COP |
+| GET | `/api/v1/geo/heat` | COP, ADMIN |
 
 ## WebSocket Endpoints
 
@@ -125,13 +127,78 @@ Protocol:
   15 fps per device, 300 KB per frame.
 - Privacy: a plate that is **not** hot-listed is read, returned to that one phone, and
   then discarded. It is never stored, never counted anywhere, and never broadcast.
+- Every processed frame also feeds the density grid: `traffic_accumulator.add(lat, lng,
+  vehicles)` is called right after inference. It receives a coordinate and a per-class
+  tally only — no plate, no image, no device id.
+
+## Maps Heatmap
+
+### `GET /api/v1/geo/heat` — COP/ADMIN only
+A density grid for the police dashboard. Two layers behind one response shape.
+
+| Param | Meaning |
+| --- | --- |
+| `layer` | `traffic` (default) or `stolen` |
+| `from`, `to` | ISO timestamps. Default: the last 15 minutes. Max span 7 days. |
+| `vehicle_class` | `two_wheeler` \| `car` \| `bus` \| `truck`. Traffic layer only. |
+| `bbox` | `south,west,north,east`. |
+
+Returns `{cells: [{lat, lng, w, n}], max, min, generated_at}`.
+
+- `w` is **vehicles per processed frame** for `traffic`, and the **time-decayed sighting
+  count** (`exp(-age_hours / HEAT_TAU_HOURS)`) for `stolen`. Both are normalised to 0..1
+  client-side, which is why one renderer draws both.
+- Per-frame average, not a raw total: a cell watched for ten minutes and one watched for a
+  minute have to be comparable, and only the per-frame average is.
+- A cell needs ≥ 3 frames before it is shown, so one frame with two cars does not paint as
+  bright as a junction with 200.
+- Redis-cached for 10 s; a cache outage degrades to a direct read, never a failure.
+- RBAC is the point: 401 with no token, 403 for CITIZEN and VOLUNTEER.
+
+### `traffic_cells`
+One row per (cell, UTC hour, real-or-synthetic).
+
+```
+id, cell_lat, cell_lng, hour_bucket, frames,
+two_wheeler, car, bus, truck, synthetic
+```
+
+Counts only. No plate, no image, no device id, not even the raw lat/lng — a density grid
+that can be joined back to a single vehicle is not a density grid.
+
+- `frames` counts every processed frame, including frames that saw nothing, so an empty
+  road reads as low density rather than as missing data.
+- `synthetic` is part of the unique key, so demo rows can never merge into real ones and
+  `--purge` can remove exactly them.
+- Cells are ~110 m (0.001°), deliberately coarser than a phone's GPS error.
+- `synthetic is false` rows appear automatically once a phone scans a road.
+
+### Timezone gotcha (cost real debugging time, worth keeping in mind)
+`hour_bucket` buckets in **UTC**. `date_trunc('hour', ts)` on a `timestamptz` truncates in
+the **session** timezone, which here is `Asia/Calcutta` — so a UTC-bucketed table and an
+IST-truncated window disagree by 5½ hours and the query silently returns nothing. `_utc_hour`
+in `backend/app/api/v1/geo.py` floors the window in Python instead. Do not reintroduce
+`date_trunc` on a timestamptz here.
+
+### Flushing
+15 fps × several phones would be thousands of statements a minute for data only ever read as
+an hourly aggregate. Counts accumulate in memory per (cell, hour, class) and flush as one
+upsert every 5 s, on socket disconnect, and at shutdown. A failed flush puts the batch back
+rather than dropping it. Retention (90 days) runs at startup.
+
+### `scripts/seed_traffic.py`
+Synthesises a Hyderabad-area grid (8 corridors, diurnal shape) so `/maps` is not empty on a
+fresh database. `--purge` before seeding keeps it idempotent; `--purge-only` and `--prune`
+are also available. Every row is tagged `synthetic = true`. `start.ps1` runs it once, guarded
+by its own `.rakshak/seed-traffic.done` marker.
 
 ## Database & Alembic
 
-- **Tables**: `users`, `devices`, `complaints`, `hotlist`, `sightings`, `audit_logs`.
-- **Chain**: `0001_initial` → `0002_perf_indexes` (**head**).
-- **Local DB** `alembic_version` = `0002_perf_indexes` (in sync with head).
-- `traffic_cells` **does not exist** — no `geo` router, no heat endpoint.
+- **Tables**: `users`, `devices`, `complaints`, `hotlist`, `sightings`, `audit_logs`,
+  `traffic_cells`.
+- **Chain**: `0001_initial` → `0002_perf_indexes` → `0003_traffic_cells` (**head**).
+- **Local DB** `alembic_version` = `0003_traffic_cells` (in sync with head). Upgrade and
+  downgrade round-trip verified.
 
 ## Environment Variables
 
@@ -142,7 +209,8 @@ Defined in `backend/app/core/config.py`, documented in `.env.example`:
 `DEMO_MODE`, `CORS_ORIGINS`, `CORS_ALLOW_PRIVATE_NETWORK`, `STORAGE_BACKEND`,
 `STORAGE_LOCAL_PATH`, `AI_MODEL_PATH`, `OCR_MODEL_PATH`, `API_BASE_URL`,
 `DETECTION_COOLDOWN_SECONDS`, `MAX_UPLOAD_MB`, `RATE_LIMIT_DETECTIONS_PER_MINUTE`,
-`RATE_LIMIT_AUTH_PER_MINUTE`, `VITE_API_URL`, `VITE_WS_URL`, `EXPO_PUBLIC_API_URL`.
+`RATE_LIMIT_AUTH_PER_MINUTE`, `HEAT_TAU_HOURS`, `VITE_API_URL`, `VITE_WS_URL`,
+`EXPO_PUBLIC_API_URL`.
 
 Web clients read `VITE_API_URL` / `VITE_WS_URL`; the mobile app reads
 `EXPO_PUBLIC_API_URL`. `mobile_app/.env` ships it **empty on purpose** — the app derives
@@ -161,9 +229,36 @@ PC on the network.
 | `test_plate.py` | plate normalisation, state-code whitelist |
 | `test_privacy.py` | 415 on video/multipart, no imagery columns on `sightings`, `/ws/scan` auth gate |
 | `test_sightings.py` | hot-list match, cooldown suppression, last-seen update, police WS alert |
+| `test_geo.py` | `/geo/heat` RBAC, bbox / window / class validation, hour-bucket window trap |
+| `test_heat_layers.py` | per-frame density, min-frames threshold, time decay, no-attribution |
+| `test_traffic_grid.py` | cell maths, GPS-fix rejection, batching, failed-flush retention, retention sweep |
+
+Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
 `scripts/live_scan_test.py` is the live-path check (needs the backend running).
 Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test.js`.
+
+## Police Dashboard Routes
+
+Lazy-loaded one-per-page in `src/App.tsx`, sidebar defined in `src/components/Layout.tsx`.
+
+| Path | Page | Notes |
+| --- | --- | --- |
+| `/` | Overview | |
+| `/maps` | **Maps** | Leaflet + `leaflet.heat`. Lazy because it pulls in Leaflet. |
+| `/alerts` | Live Alerts | fed by `usePoliceSocket`, unchanged |
+| `/complaints` | Complaints | |
+| `/hotlist` | Hotlist | |
+| `/search`, `/vehicles/:plate` | Vehicle Search / Detail | Detail's `VehicleMap.tsx` untouched |
+| `/analytics` | Analytics | Recharts behind its own chunk |
+| `/admin` | Admin | ADMIN only |
+
+`leaflet.heat@0.2.0` is pinned exact and is the only dependency added. It ships no types, so
+`src/types/leaflet.heat.d.ts` declares the `L.heatLayer` factory it installs.
+`src/components/map/HeatLayer.tsx` wraps it as a react-leaflet child and normalises weights
+client-side — the server's `max` spans the whole window, and the visible viewport may hold
+only the quietest tenth of the data, so server-side normalisation would paint the visible
+area uniformly pale.
 
 ## Conventions
 
@@ -176,8 +271,6 @@ Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test
 
 ## Found but not working or missing
 
-- **Maps heatmap**: missing. `traffic_cells`, `/api/v1/geo/heat`, `scripts/seed_traffic.py`
-  and the `/maps` route do not exist. `leaflet.heat` is not installed.
 - **Event bus**: source is **gone**. `backend/app/services/bus/` contains only stale
   `__pycache__` (`base`, `factory`, `kafka`, `redis_streams`, `__init__`); no `.py` files
   remain. Git history shows them in `9e2c419`/`d2a6196`, so the Python files were dropped
@@ -191,3 +284,13 @@ Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test
   running pytest or uvicorn from `backend/` creates a second uploads tree that the root
   `.gitignore` rule never matched. Now ignored explicitly.
 - **`tree.txt`** at the repo root is a leftover scratch file from an earlier session; untracked.
+- **`scripts/start.sh` is syntax-unverified**: no WSL on this machine, so `bash -n` cannot
+  run. The `PYTHONPATH` fix it carries is mirrored from `start.ps1` and untested there.
+- **Live-scan latency is ~240 ms p50 / ~570 ms p95**, not the 150 ms originally targeted.
+  Both models together are ~110 ms; the rest is JPEG decode, base64, JSON and thread
+  contention with the OCR pool on a 5-core i5. OCR is already off the hot path, so this is
+  a CPU budget, not an architecture problem. Roughly 3–4 effective fps per phone.
+- **The demo road video yields plate detections but no COCO vehicle detections**, so a live
+  `/ws/scan` run writes cells with `frames = N` and all vehicle counts zero. That is correct
+  (an empty road is low density, not missing data) but means real density needs a real road.
+  `scripts/seed_traffic.py` is what fills the map for a demo.

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
@@ -13,6 +14,12 @@ from app.db.session import SessionLocal, get_db
 from app.jobs.expiry import hotlist_expiry_worker
 from app.services.hotlist_service import HotlistService
 from app.services.seed import seed_demo_users
+from app.services.traffic_service import (
+    RETENTION_DAYS,
+    purge_older_than,
+    start_flush_worker,
+    traffic_accumulator,
+)
 
 logger = get_logger(__name__)
 
@@ -68,7 +75,46 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Live detection models not warmed: %s", exc)
 
+    # Density retention + the periodic batched flush for traffic_cells. The
+    # worker is a daemon thread that writes every 5 s; the shutdown flush below
+    # is what guarantees the last batch is not lost.
+    stop_event = threading.Event()
+    flush_thread = None
+    try:
+        def _retention():
+            db = SessionLocal()
+            try:
+                removed = purge_older_than(db)
+                if removed:
+                    logger.info("Removed %d traffic_cells older than %d days", removed, RETENTION_DAYS)
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_retention)
+    except Exception as exc:
+        logger.warning("Traffic retention step skipped: %s", exc)
+    try:
+        flush_thread = start_flush_worker(SessionLocal, stop_event)
+    except Exception as exc:
+        logger.warning("Traffic flush worker not started: %s", exc)
+
     yield
+
+    stop_event.set()
+    if flush_thread is not None:
+        flush_thread.join(timeout=10)
+    db = None
+    try:
+        db = SessionLocal()
+        written = traffic_accumulator.flush(db)
+        if written:
+            logger.info("Shutdown traffic flush wrote %d cells", written)
+    except Exception as exc:
+        logger.warning("Shutdown traffic flush failed: %s", exc)
+    finally:
+        if db is not None:
+            db.close()
+
     task.cancel()
 
 
