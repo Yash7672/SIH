@@ -1,30 +1,18 @@
 from fastapi import APIRouter
 
-from app.api.v1 import (
-    alerts,
-    analytics,
-    auth,
-    complaints,
-    devices,
-    health,
-    hotlist,
-    scanner,
-    sightings,
-    users,
-    vehicles,
-    ws,
-)
+from app.api.v1.auth import router as auth_router
+from app.api.v1.complaints import router as complaints_router
+from app.api.v1.devices import router as devices_router
+from app.api.v1.health import router as health_router
+from app.api.v1.hotlist import router as hotlist_router
+from app.api.v1.ingest import router as ingest_router
+from app.api.v1.sightings import router as sightings_router
 
 api_router = APIRouter()
-api_router.include_router(health.router, tags=["health"])
-api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
-api_router.include_router(complaints.router, prefix="/complaints", tags=["complaints"])
-api_router.include_router(hotlist.router, prefix="/hotlist", tags=["hotlist"])
-api_router.include_router(sightings.router, prefix="/sightings", tags=["sightings"])
-api_router.include_router(vehicles.router, prefix="/vehicles", tags=["vehicles"])
-api_router.include_router(devices.router, prefix="/devices", tags=["devices"])
-api_router.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
-api_router.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
-api_router.include_router(users.router, prefix="/users", tags=["users"])
-api_router.include_router(scanner.router, prefix="/scanner", tags=["scanner"])
-api_router.include_router(ws.router, prefix="/ws", tags=["ws"])
+api_router.include_router(health_router, prefix="/health", tags=["health"])
+api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
+api_router.include_router(complaints_router, prefix="/complaints", tags=["complaints"])
+api_router.include_router(devices_router, prefix="/devices", tags=["devices"])
+api_router.include_router(hotlist_router, prefix="/hotlist", tags=["hotlist"])
+api_router.include_router(sightings_router, prefix="/sightings", tags=["sightings"])
+api_router.include_router(ingest_router, prefix="/ingest", tags=["ingest"])

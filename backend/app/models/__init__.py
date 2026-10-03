@@ -1,12 +1,15 @@
 from app.models.models import (
     AuditLog,
+    Camera,
     Complaint,
     ComplaintStatus,
     Device,
     Hotlist,
     HotlistStatus,
+    ODFlow,
     Role,
     Sighting,
+    TrafficCell,
     User,
     utcnow,
 )
@@ -20,6 +23,9 @@ __all__ = [
     "HotlistStatus",
     "Sighting",
     "AuditLog",
+    "Camera",
+    "TrafficCell",
+    "ODFlow",
     "Role",
     "utcnow",
 ]
