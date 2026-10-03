@@ -123,19 +123,27 @@ export default function VehicleDetail() {
           </div>
         </div>
 
-        {h.status === "ACTIVE" || h.status === "FIR_CONFIRMED" ? (
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" loading={busy} onClick={() => patch("FIR_CONFIRMED")}>
-              Confirm FIR
-            </Button>
-            <Button size="sm" loading={busy} onClick={() => patch("RECOVERED")}>
-              Mark recovered
-            </Button>
-            <Button size="sm" variant="secondary" loading={busy} onClick={() => patch("CLOSED")}>
-              Close
-            </Button>
-          </div>
-        ) : null}
+        <div className="flex flex-wrap gap-2">
+          <Link
+            to={`/maps?plate=${encodeURIComponent(detail.plate)}`}
+            className="inline-flex items-center rounded-md border border-surface-border bg-surface-card px-3 py-2 text-sm font-medium text-surface-text transition-colors hover:bg-surface-bg"
+          >
+            View heat
+          </Link>
+          {h.status === "ACTIVE" || h.status === "FIR_CONFIRMED" ? (
+            <>
+              <Button size="sm" loading={busy} onClick={() => patch("FIR_CONFIRMED")}>
+                Confirm FIR
+              </Button>
+              <Button size="sm" loading={busy} onClick={() => patch("RECOVERED")}>
+                Mark recovered
+              </Button>
+              <Button size="sm" variant="secondary" loading={busy} onClick={() => patch("CLOSED")}>
+                Close
+              </Button>
+            </>
+          ) : null}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">

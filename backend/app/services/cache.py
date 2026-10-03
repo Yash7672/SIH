@@ -11,6 +11,8 @@ logger = get_logger(__name__)
 
 HOTLIST_CACHE_KEY = "rakshak:hotlist:active_plates"
 HOTLIST_TTL_SECONDS = 300
+# Prefix for the per-vehicle OD-flow link state (see set_od_state/get_od_state).
+OD_STATE_PREFIX = "rakshak:od:pseudonym"
 
 
 class CacheService:
@@ -131,6 +133,30 @@ class CacheService:
             return None
         try:
             raw = self._client.get(key)
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+
+    # -- OD-flow pseudonyms ------------------------------------------------
+    # The pseudonym is the *only* place a plate-derived identifier exists, it
+    # lives in Redis only, and it expires. It exists so two sightings of the
+    # same vehicle at consecutive cameras can be linked without ever storing
+    # the plate or a stable hash of it in PostgreSQL.
+    def set_od_state(self, pseudonym: str, value: dict, ttl: int) -> bool:
+        if not self.available:
+            return False
+        try:
+            self._client.setex(f"{OD_STATE_PREFIX}:{pseudonym}", ttl, json.dumps(value))
+            return True
+        except Exception as exc:
+            logger.warning("OD state write failed: %s", exc)
+            return False
+
+    def get_od_state(self, pseudonym: str) -> Optional[dict]:
+        if not self.available:
+            return None
+        try:
+            raw = self._client.get(f"{OD_STATE_PREFIX}:{pseudonym}")
             return json.loads(raw) if raw else None
         except Exception:
             return None

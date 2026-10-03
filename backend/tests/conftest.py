@@ -8,6 +8,9 @@ TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["REDIS_URL"] = TEST_REDIS_URL
 os.environ["DEMO_MODE"] = "true"
+# Tests build their own data and must stay deterministic: no background
+# synthetic traffic is published while the suite runs.
+os.environ["SIM_ENABLED"] = "false"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

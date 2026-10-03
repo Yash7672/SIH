@@ -10,6 +10,7 @@ const Login = lazy(() => import("./pages/Login"));
 const Overview = lazy(() => import("./pages/Overview"));
 const Complaints = lazy(() => import("./pages/Complaints"));
 const Hotlist = lazy(() => import("./pages/Hotlist"));
+const Maps = lazy(() => import("./pages/Maps"));
 const LiveAlerts = lazy(() => import("./pages/LiveAlerts"));
 const VehicleDetail = lazy(() => import("./pages/VehicleDetail"));
 const VehicleSearch = lazy(() => import("./pages/VehicleSearch"));
@@ -86,6 +87,7 @@ export default function App() {
           <Route index element={<Overview alerts={liveAlerts} />} />
           <Route path="complaints" element={<Complaints />} />
           <Route path="hotlist" element={<Hotlist />} />
+          <Route path="maps" element={<Maps />} />
           <Route path="alerts" element={<LiveAlerts alerts={liveAlerts} />} />
           <Route path="search" element={<VehicleSearch />} />
           <Route path="vehicles/:plate" element={<VehicleDetail />} />

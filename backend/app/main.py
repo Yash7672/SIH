@@ -9,10 +9,13 @@ from app.api.v1.health import healthz
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
-from app.db.session import SessionLocal, get_db
+from app.db.session import SessionLocal, get_db, engine
 from app.jobs.expiry import hotlist_expiry_worker
+from app.services.geo_support import postgis_available
 from app.services.hotlist_service import HotlistService
-from app.services.seed import seed_demo_users
+from app.services.ingest_consumer import bus_name, start_detection_consumer
+from app.services.seed import seed_cameras, seed_demo_users
+from app.services.traffic_sim import start_traffic_simulator
 
 logger = get_logger(__name__)
 
@@ -26,6 +29,14 @@ async def lifespan(app: FastAPI):
         logger.info("Demo users ensured")
     except Exception as exc:
         logger.warning("Seed skipped/failed: %s", exc)
+
+    # PostGIS is optional: probe once, never let a missing extension abort
+    # startup. geo_support.postgis_available() swallows its own errors.
+    try:
+        postgis_available(engine)
+    except Exception as exc:
+        logger.warning("PostGIS probe skipped: %s", exc)
+
     try:
         db = SessionLocal()
         try:
@@ -35,9 +46,62 @@ async def lifespan(app: FastAPI):
             db.close()
     except Exception as exc:
         logger.warning("Hotlist cache rebuild skipped: %s", exc)
-    task = asyncio.create_task(hotlist_expiry_worker())
+
+    # Demo cameras (idempotent). Workers need rows to report against, and the
+    # simulator iterates them.
+    try:
+        db = SessionLocal()
+        try:
+            created = seed_cameras(db)
+            if created:
+                logger.info("Seeded %d demo cameras", created)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Camera seed skipped: %s", exc)
+
+    tasks = [asyncio.create_task(hotlist_expiry_worker())]
+
+    # Detection consumer: turns bus events into aggregates, hot-list matches,
+    # sightings and OD flow. Off when the bus cannot be reached, so the API
+    # still serves on a machine with no Redis.
+    consumer = None
+    try:
+        consumer = await start_detection_consumer()
+        if consumer is not None:
+            tasks.append(asyncio.create_task(consumer.run()))
+            logger.info("Detection consumer started (bus=%s)", bus_name())
+        else:
+            logger.warning("Detection consumer disabled (event bus unavailable)")
+    except Exception as exc:
+        logger.warning("Detection consumer not started: %s", exc)
+
+    # Synthetic demo traffic so the maps are never empty on a fresh clone. It
+    # publishes through the same bus as a real worker; every event is flagged
+    # synthetic and can be excluded from the API.
+    simulator = None
+    try:
+        simulator = await start_traffic_simulator()
+        if simulator is not None:
+            tasks.append(asyncio.create_task(simulator.run()))
+            logger.info("Traffic simulator started (synthetic demo data)")
+        else:
+            logger.info("Traffic simulator off (SIM_ENABLED/DEMO_MODE not set)")
+    except Exception as exc:
+        logger.warning("Traffic simulator not started: %s", exc)
+
     yield
-    task.cancel()
+
+    if simulator is not None:
+        simulator.stop()
+    for t in tasks:
+        t.cancel()
+    if consumer is not None:
+        try:
+            await consumer.stop()
+        except Exception:
+            pass
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(

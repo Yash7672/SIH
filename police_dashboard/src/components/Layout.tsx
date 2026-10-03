@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   ListChecks,
   LogOut,
+  Map,
   PanelLeft,
   Radio,
   Search,
@@ -28,6 +29,7 @@ const NAV = [
   { to: "/alerts", label: "Live Alerts", icon: Siren, end: false, badge: "alerts" },
   { to: "/complaints", label: "Complaints", icon: ListChecks, end: false },
   { to: "/hotlist", label: "Hotlist", icon: ShieldAlert, end: false },
+  { to: "/maps", label: "Maps", icon: Map, end: false },
   { to: "/search", label: "Vehicle Search", icon: Search, end: false },
   { to: "/analytics", label: "Analytics", icon: BarChart3, end: false },
 ] as const;

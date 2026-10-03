@@ -232,6 +232,10 @@ class TrafficCell(Base):
     __table_args__ = (
         Index("idx_traffic_cells_hour_bucket", "hour_bucket"),
         Index("idx_traffic_cells_camera_hour", "camera_id", "hour_bucket"),
+        # postgresql_nulls_not_distinct makes the ON CONFLICT upsert correct
+        # for mobile detections, where camera_id IS NULL. Without it PostgreSQL
+        # treats each NULL as distinct and a mobile sighting inserts a new row
+        # every time instead of incrementing the existing one.
         Index(
             "uq_traffic_cells_unique",
             "cell_lat",
@@ -241,6 +245,7 @@ class TrafficCell(Base):
             "camera_id",
             "synthetic",
             unique=True,
+            postgresql_nulls_not_distinct=True,
         ),
     )
 
@@ -259,6 +264,16 @@ class ODFlow(Base):
     __table_args__ = (
         Index("idx_od_flows_hour", "hour_bucket"),
         Index("idx_od_flows_od_hour", "origin_camera_id", "dest_camera_id", "hour_bucket"),
+        # Backs the ON CONFLICT accumulator, so two consumers counting the same
+        # corridor in the same hour cannot lose an update.
+        Index(
+            "uq_od_flows_unique",
+            "origin_camera_id",
+            "dest_camera_id",
+            "hour_bucket",
+            "synthetic",
+            unique=True,
+        ),
     )
 
 

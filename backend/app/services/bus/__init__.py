@@ -1,4 +1,13 @@
-from .base import Event, EventBus
-from .factory import create_event_bus
+"""Detection event bus: one interface, Redis Streams (default) and Kafka (opt-in)."""
 
-__all__ = ["Event", "EventBus", "create_event_bus"]
+from app.services.bus.base import Delivery, DetectionEvent, EventBus, VEHICLE_CLASSES
+from app.services.bus.factory import build_bus, bus_name
+
+__all__ = [
+    "Delivery",
+    "DetectionEvent",
+    "EventBus",
+    "VEHICLE_CLASSES",
+    "build_bus",
+    "bus_name",
+]

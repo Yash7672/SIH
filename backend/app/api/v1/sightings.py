@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -57,6 +58,11 @@ async def create_sighting(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    # Mobile detections feed the same anonymous aggregate the cameras write to,
+    # so the traffic heatmap includes phones. Only the anonymous count is
+    # persisted; the plate is not (unless it was hot-listed, handled above).
+    record_mobile_aggregate(db, payload.latitude, payload.longitude, payload.timestamp)
+
     if sighting is None:
         # Not hotlisted or throttled — no sighting, no alert, nothing persisted.
         # 202: the detection was accepted and deliberately discarded.
@@ -87,6 +93,39 @@ def cache_allowed(user: User) -> bool:
     from app.services.cache import cache_service
 
     return cache_service.throttle(f"detect:{user.id}", settings.RATE_LIMIT_DETECTIONS_PER_MINUTE)
+
+
+def record_mobile_aggregate(db: Session, lat: float, lng: float, ts) -> None:
+    """Add one anonymous traffic count for a phone-reported detection.
+
+    Vehicle class is recorded as ``unknown`` because a phone scan reports a
+    plate, not the vehicle body. ``camera_id`` stays NULL (mobile, not a fixed
+    camera); the unique index is NULLS NOT DISTINCT so these collapse into one
+    row per cell/hour instead of one row per detection.
+    """
+    from app.services.ingest_service import IngestService
+
+    try:
+        IngestService(db).bump_cells([
+            (None, _cell(lat, lng)[0], _cell(lat, lng)[1], _bucket(ts), "unknown", 1, False)
+        ])
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Mobile traffic aggregate skipped: %s", exc)
+
+
+def _cell(lat: float, lng: float) -> tuple[float, float]:
+    from app.services.geo_support import snap_cell
+    from app.services.ingest_service import STORAGE_RESOLUTION
+
+    return snap_cell(float(lat), float(lng), STORAGE_RESOLUTION)
+
+
+def _bucket(ts) -> datetime:
+    from app.services.ingest_service import hour_bucket
+
+    return hour_bucket(ts)
 
 
 @router.get("", response_model=list[SightingOut])

@@ -1,12 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_cop
 from app.db.session import get_db
-from app.models import Complaint, ComplaintStatus, Device, Hotlist, HotlistStatus, Sighting, User
+from app.models import Camera, Complaint, ComplaintStatus, Device, Hotlist, HotlistStatus, Sighting, TrafficCell, User
 
 router = APIRouter()
 
@@ -81,3 +81,61 @@ def locations(_: User = Depends(require_cop), db: Session = Depends(get_db)):
         .limit(500)
     ).all()
     return [{"lat": r[0], "lng": r[1], "time": r[2].isoformat()} for r in rows]
+
+
+@router.get("/traffic")
+def traffic(
+    hours: int = Query(default=24, ge=1, le=168),
+    _: User = Depends(require_cop),
+    db: Session = Depends(get_db),
+):
+    """Anonymous traffic summary for the Operations dashboard."""
+    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    hourly_rows = db.execute(
+        select(
+            func.date_trunc("hour", TrafficCell.hour_bucket),
+            func.sum(TrafficCell.count),
+        )
+        .where(TrafficCell.hour_bucket >= start)
+        .group_by(func.date_trunc("hour", TrafficCell.hour_bucket))
+        .order_by(func.date_trunc("hour", TrafficCell.hour_bucket))
+    ).all()
+
+    by_hour = [
+        {"hour": r[0].isoformat() if r[0] else None, "count": int(r[1] or 0)}
+        for r in hourly_rows
+    ]
+
+    camera_rows = db.execute(
+        select(Camera.name, func.sum(TrafficCell.count))
+        .join(TrafficCell, TrafficCell.camera_id == Camera.id)
+        .where(TrafficCell.hour_bucket >= start)
+        .group_by(Camera.id, Camera.name)
+        .order_by(func.sum(TrafficCell.count).desc())
+    ).all()
+
+    class_rows = db.execute(
+        select(TrafficCell.vehicle_class, func.sum(TrafficCell.count))
+        .where(TrafficCell.hour_bucket >= start)
+        .group_by(TrafficCell.vehicle_class)
+        .order_by(func.sum(TrafficCell.count).desc())
+    ).all()
+
+    busiest_hour = max(by_hour, key=lambda item: item["count"], default={"hour": None, "count": 0})
+    total_volume = sum(item["count"] for item in by_hour)
+
+    return {
+        "hours": hours,
+        "total_volume": total_volume,
+        "busiest_hour": busiest_hour,
+        "by_hour": by_hour,
+        "by_camera": [
+            {"camera": camera_name, "count": int(count or 0)}
+            for camera_name, count in camera_rows
+        ],
+        "class_mix": [
+            {"vehicle_class": vehicle_class or "unknown", "count": int(count or 0)}
+            for vehicle_class, count in class_rows
+        ],
+    }
