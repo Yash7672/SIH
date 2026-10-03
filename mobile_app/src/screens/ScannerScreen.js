@@ -5,6 +5,7 @@ import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 import { API_BASE, frameToBase64, healthCheck, normalizePlate, registerDevice, reportSighting, scanImage, scanTimeoutMs } from "../services/api";
 import { getLocation } from "../services/location";
 import ScannerScreenView from "../components/ScannerScreenNew";
+import { LiveScanClient } from "../services/liveScan";
 
 const DEVICE_KEY = "rakshak_device_id";
 const SIM_PLATES = ["TS09AB1234", "MH12JK4567"];
@@ -92,12 +93,101 @@ export default function ScannerScreen({ user, onLogout }) {
   const [focused, setFocused] = useState(true);
   const processing = useRef(false);
 
+  const [autoDetect, setAutoDetect] = useState(true);
+  const [boxes, setBoxes] = useState(null);
+  const [liveScanState, setLiveScanState] = useState({ status: 'OFFLINE', fps: 0, ms: 0 });
+  const liveScanRef = useRef(null);
+  const camRef = useRef(null);
+  const frameCount = useRef(0);
+  const lastFpsTime = useRef(Date.now());
+  const onAutoResultRef = useRef(null);
+  // Hot-list match banner: set from the plate reply, cleared after a few seconds.
+  const [stolenPlate, setStolenPlate] = useState(null);
+  const stolenTimerRef = useRef(null);
+
   useEffect(() => {
     const sub = AppState.addEventListener("change", (state) => {
       setFocused(state === "active");
     });
     return () => sub?.remove?.();
   }, []);
+
+  useEffect(() => {
+    if (!deviceReady || !focused) return;
+    
+    const client = new LiveScanClient({
+      onStateChange: (status) => setLiveScanState(s => ({...s, status})),
+      onBoxes: (data) => {
+        setBoxes(data);
+        setLiveScanState(s => ({...s, ms: data.ms}));
+      },
+      onPlate: (data) => {
+        if (data.plate_id && data.text && data.valid && data.conf >= 0.6) {
+           const result = {
+             state: "success",
+             plate: data.norm,
+             confidence: data.conf,
+             hotlist: data.stolen,
+             raw: data.text,
+             normalized: data.norm,
+             valid: true,
+             frames: 1,
+             message: data.stolen ? "Reported to police — active hotlist match." : "Sighting recorded — not on the hotlist.",
+           };
+           if (data.stolen) {
+             try { Vibration.vibrate([40, 120, 80]); } catch {}
+             // The banner stays up for a few seconds rather than flashing past:
+             // the phone is held at arm's length from the car being checked.
+             setStolenPlate(data.norm);
+             if (stolenTimerRef.current) clearTimeout(stolenTimerRef.current);
+             stolenTimerRef.current = setTimeout(() => setStolenPlate(null), 6000);
+           }
+           if (onAutoResultRef.current) onAutoResultRef.current(result);
+        }
+      },
+      onError: (err) => console.log("LiveScan error:", err)
+    });
+    client.connect();
+    liveScanRef.current = client;
+    
+    return () => {
+      client.disconnect();
+      liveScanRef.current = null;
+      if (stolenTimerRef.current) clearTimeout(stolenTimerRef.current);
+      setStolenPlate(null);
+    };
+  }, [deviceReady, focused]);
+
+  useEffect(() => {
+    let active = true;
+    const loop = async () => {
+      while (active) {
+        if (autoDetect && focused && camRef.current && liveScanRef.current?.ready) {
+          try {
+            const photo = await camRef.current.takePictureAsync({ quality: 0.3, base64: true, skipProcessing: true, exif: false });
+            if (photo && photo.base64 && active && autoDetect) {
+              const loc = await getLocation().catch(() => ({}));
+              liveScanRef.current.sendFrame(photo.width, photo.height, loc.latitude || 0, loc.longitude || 0, photo.base64);
+              
+              frameCount.current += 1;
+              const now = Date.now();
+              if (now - lastFpsTime.current > 1000) {
+                setLiveScanState(s => ({...s, fps: frameCount.current}));
+                frameCount.current = 0;
+                lastFpsTime.current = now;
+              }
+            }
+          } catch(e) {
+            await new Promise(r => setTimeout(r, 100)); // sleep on error
+          }
+        } else {
+          await new Promise(r => setTimeout(r, 200)); // sleep if disabled
+        }
+      }
+    };
+    loop();
+    return () => { active = false; };
+  }, [autoDetect, focused, deviceReady]);
 
   useEffect(() => {
     let cancelled = false;
@@ -327,6 +417,13 @@ export default function ScannerScreen({ user, onLogout }) {
       onSimulate={onSimulate}
       onTestBackend={onTestBackend}
       onLogout={onLogoutClear}
+      liveScanState={liveScanState}
+      boxes={boxes}
+      stolenPlate={stolenPlate}
+      autoDetect={autoDetect}
+      onToggleAutoDetect={() => setAutoDetect(!autoDetect)}
+      externalCamRef={camRef}
+      onAutoResultRef={onAutoResultRef}
     />
   );
 }

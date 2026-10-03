@@ -76,6 +76,56 @@ def test_non_hotlist_plate_not_stored(client, demo_tokens):
     assert all(a["plate"] != "MH12JK4567" for a in alerts.json())
 
 
+def test_repeat_detection_is_cooldown_suppressed(client, demo_tokens):
+    """The live detector re-reads the same parked car every frame.
+
+    Without a cooldown one pass of the camera would produce a sighting per
+    frame, so the second detection of the same plate on the same device has to
+    be dropped while still returning success to the caller.
+    """
+    make_hotlist(client, demo_tokens)
+    dev = register_device(client, demo_tokens)
+    body = sighting_body("TS09AB1234", dev)
+
+    first = client.post("/api/v1/sightings", headers=auth(demo_tokens["volunteer"]), json=body)
+    assert first.status_code == 200, first.text
+    assert "id" in first.json()
+
+    second = client.post("/api/v1/sightings", headers=auth(demo_tokens["volunteer"]), json=body)
+    # A throttled detection is reported the same way an unrelated plate is:
+    # accepted, nothing stored, no error for the volunteer whose camera is still
+    # pointed at the same car.
+    assert second.status_code == 202, second.text
+    assert second.json()["accepted"] is False
+
+    rows = client.get("/api/v1/sightings", headers=auth(demo_tokens["cop"])).json()
+    mine = [s for s in rows if s.get("device_id") == dev]
+    assert len(mine) == 1, f"cooldown let {len(mine)} sightings through for one plate/device"
+
+
+def test_hotlist_detection_updates_last_seen(client, demo_tokens):
+    """A fresh sighting must move the hot-list entry's last-seen marker.
+
+    This is the only place a reported car's position is retained, so it is what
+    an officer reads off the hot-list screen.
+    """
+    make_hotlist(client, demo_tokens)
+    dev = register_device(client, demo_tokens)
+    r = client.post(
+        "/api/v1/sightings",
+        headers=auth(demo_tokens["volunteer"]),
+        json=sighting_body("TS09AB1234", dev, lat=17.4123, lng=78.4567),
+    )
+    assert r.status_code == 200, r.text
+
+    entry = client.get("/api/v1/hotlist", headers=auth(demo_tokens["cop"])).json()
+    mine = [e for e in entry if e["plate"] == "TS09AB1234"]
+    assert mine, "hot-list entry disappeared"
+    assert mine[0]["last_seen_at"] is not None
+    assert abs(mine[0]["last_seen_lat"] - 17.4123) < 1e-4
+    assert abs(mine[0]["last_seen_lng"] - 78.4567) < 1e-4
+
+
 def test_sighting_requires_volunteer(client, demo_tokens):
     make_hotlist(client, demo_tokens)
     dev = register_device(client, demo_tokens)

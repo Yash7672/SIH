@@ -1,70 +1,193 @@
 # Project Map
-reviewed at commit 18479edfdc66a841de45259b531166082e144ab8
+
+reviewed at commit `live-detect` (branch) — see `git log -1`
 
 ## Architecture Overview
-The system is a "Privacy-First Crowdsourced ANPR Vehicle Tracking System" named RAKSHAK.
-- **Backend**: FastAPI (Python), PostgreSQL (Relational DB), Redis (Caching/Messaging).
-- **Citizen Web**: Vite + React, for citizens to file complaints.
-- **Police Dashboard**: Vite + React, for police officers to view alerts, hotlists, and analytics.
-- **Mobile App**: Expo (React Native), for volunteers/police to scan vehicles and number plates.
-- **AI Engine**: YOLOv8 (vehicle/plate detection) and RapidOCR (plate text reading). Runs on the backend.
+
+RAKSHAK is a "Privacy-First Crowdsourced ANPR Vehicle Tracking System".
+
+- **Backend**: FastAPI (Python 3.12), PostgreSQL 17 (source of truth), Redis 7 (cache only).
+- **AI Engine**: YOLOv8n (`backend/models/yolov8n.pt`) for vehicles, a fine-tuned
+  YOLOv8n plate detector (`license-plate-finetune-v1n.pt`), RapidOCR (ONNX) for plate text.
+  Inference runs **on the PC backend**, never on the phone — Expo Go cannot run
+  native ML, and a frame that never leaves the process is a frame that cannot leak.
+- **citizen_web**: Vite + React 18 SPA for filing complaints.
+- **police_dashboard**: Vite + React 18 SPA for officers.
+- **mobile_app**: Expo SDK 58 / React Native app for volunteers and officers.
+
+Frames are held in memory for the duration of one inference and are never written to
+disk or logged. Only `plate + lat + lng + timestamp + confidence` can be persisted,
+and only for plates that are on the active hot-list.
 
 ## What start.bat does
-1. Invokes `scripts/start.ps1`.
-2. Checks prerequisites (Node, Python, Docker, PostgreSQL, Redis).
-3. Detects LAN IP to bind services and configure `.env` URLs.
-4. Generates `.env` and `mobile_app/.env` (if missing).
-5. Installs dependencies (`npm install`, `pip install`).
-6. Runs Alembic migrations.
-7. Starts Backend (`uvicorn`), Citizen Web (`vite`), Police Dashboard (`vite`), and Mobile App (`expo start`).
+
+`start.bat` invokes `scripts/start.ps1` (bash equivalent `scripts/start.sh`), which:
+
+1. Checks prerequisites (Node, Python venv, Docker).
+2. Detects the LAN IP and writes `.env` + `mobile_app/.env` (only if missing).
+3. Installs dependencies (`npm install`, `pip install -r requirements.txt`).
+4. Starts Postgres + Redis via `docker compose up -d`.
+5. Downloads `backend/models/yolov8n.pt` if absent (idempotent; skips gracefully offline).
+6. Runs `alembic upgrade head`.
+7. Seeds demo data (`scripts/seed_demo.py`), guarded by a hash marker so it runs once.
+8. Starts four processes: uvicorn `:8000`, citizen Vite `:5173`, police Vite `:5174`,
+   `expo start` `:8081`.
+
+`scripts/stop.ps1` / `stop.sh` tear all of it down.
+
+### Import-root gotcha (already fixed, worth knowing)
+
+`ai/` lives at the **repo root**, and `app/api/v1/live_scan.py` does `from ai.detector import …`.
+`start.ps1` runs uvicorn with `WorkingDirectory = backend\`, which leaves the repo root off
+`sys.path` and the backend dies at import with `ModuleNotFoundError: No module named 'ai'`.
+`Start-BackendLocal` therefore sets `PYTHONPATH` to the repo root **for the uvicorn child
+only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the same via
+`pythonpath = ..`. Docker was never affected: `backend/Dockerfile` copies `ai` into `/app`.
 
 ## Folder Purpose & Key Files
-- `backend/`: FastAPI application (`app/main.py`), database models (`app/models/models.py`), endpoints (`app/api/`), websocket (`app/ws/`).
-- `citizen_web/`: Citizen-facing React SPA.
-- `police_dashboard/`: Police-facing React SPA.
-- `mobile_app/`: React Native Expo app (`App.js`, `ScannerScreen.js`).
-- `scripts/`: Utilities (`seed_demo.py`, `start.ps1`, `health_check_models.py`).
-- `ai/`: ML models wrappers.
+
+| Folder | Purpose | Key files |
+| --- | --- | --- |
+| `backend/app/main.py` | App factory, CORS, privacy guard middleware, lifespan (seeds users, rebuilds hot-list cache, warms models) | `warm_live_models()` |
+| `backend/app/api/v1/` | HTTP + WebSocket routers | `live_scan.py`, `sightings.py`, `scanner.py`, `ws.py`, `hotlist.py` |
+| `backend/app/models/models.py` | SQLAlchemy models | `User`, `Device`, `Complaint`, `Hotlist`, `Sighting`, `AuditLog` |
+| `backend/app/services/` | Business logic | `hotlist_service.py`, `sighting_service.py`, `plate.py`, `cache.py`, `seed.py` |
+| `backend/app/ws/manager.py` | Police alert fan-out (`alert_manager`) | `broadcast()` |
+| `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
+| `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py` |
+| `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
+| `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
+| `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/components/LiveDetectionOverlay.js` |
+| `data/generated/` | Demo media for tests (gitignored) | `demo_road.mp4`, `plate_*.png` |
 
 ## API Route Table
-- `/api/v1/health` (GET)
-- `/api/v1/auth/login`, `/register`, `/me`
-- `/api/v1/complaints` (POST/GET - Roles: Citizen, Cop, Admin)
-- `/api/v1/hotlist` (POST/GET - Roles: Cop, Admin)
-- `/api/v1/sightings` (POST/GET - Roles: Volunteer, Cop)
-- `/api/v1/vehicles` (GET - search)
-- `/api/v1/devices` (GET/POST)
-- `/api/v1/analytics` (GET)
-- `/api/v1/scanner/scan` (POST - Single image upload)
+
+Roles are enforced by `app/api/deps.py` (`require_cop`, `require_volunteer`, `require_admin`).
+
+| Method | Path | Roles |
+| --- | --- | --- |
+| GET | `/api/v1/health`, `/api/v1/healthz` | public |
+| POST | `/api/v1/auth/login`, `/register` | public |
+| POST | `/api/v1/auth/refresh` | public (refresh token) |
+| GET | `/api/v1/auth/me` | any authenticated |
+| GET | `/api/v1/users` | ADMIN |
+| GET/POST | `/api/v1/complaints` | CITIZEN (post), COP/ADMIN (list) |
+| GET | `/api/v1/complaints/mine` | CITIZEN |
+| GET | `/api/v1/complaints/{id}` | owner, COP, ADMIN |
+| POST | `/api/v1/complaints/{id}/verify` | COP |
+| POST | `/api/v1/complaints/{id}/reject` | COP |
+| GET | `/api/v1/hotlist` | COP, ADMIN |
+| POST | `/api/v1/hotlist` | COP |
+| GET/PATCH | `/api/v1/hotlist/{id}` | COP |
+| DELETE | `/api/v1/hotlist/{id}` | ADMIN |
+| POST | `/api/v1/sightings` | VOLUNTEER, COP |
+| GET | `/api/v1/sightings`, `/{id}` | COP, ADMIN |
+| GET | `/api/v1/vehicles/{plate}` | COP, ADMIN |
+| GET | `/api/v1/vehicles/{plate}/timeline`, `/route` | COP, ADMIN |
+| GET | `/api/v1/devices` | owner, ADMIN |
+| POST | `/api/v1/devices/register` | VOLUNTEER, COP |
+| POST | `/api/v1/devices/{id}/revoke` | ADMIN |
+| GET | `/api/v1/alerts` | COP, ADMIN |
+| GET | `/api/v1/analytics/{overview,detections,hotlist-matches,locations}` | COP, ADMIN |
+| POST | `/api/v1/scanner/scan` | VOLUNTEER, COP |
 
 ## WebSocket Endpoints
-- `ws://.../api/v1/ws/police` - Dashboard real-time alerts. (Auth via token query param or initial auth message).
+
+### `/api/v1/ws/police` — dashboard alert stream
+Auth via `?token=` query param **or** a first `{type:"auth"}` message. Server pushes
+`{"type":"hotlist_detection","payload":{…}}`. The dashboard retries every 3 s
+(`src/hooks/usePoliceSocket.ts`) and shows "Reconnecting to the alert stream" while down.
+
+### `/api/v1/ws/scan` — live detection (volunteer phone)
+Only mounted when `DEMO_MODE` is true. Max 3 concurrent connections.
+
+Protocol:
+
+```
+→ {"type":"auth","token":"<jwt>","device_id":"<uuid>"}   (must be first; 10 s timeout)
+← {"type":"ready"}
+→ {"type":"frame","seq":1,"w":640,"h":480,"lat":17.36,"lng":78.51,"jpeg_b64":"…"}
+← {"type":"boxes","seq":1,"w":640,"h":480,"ms":244,"vehicles":[…],"plates":[…]}
+← {"type":"plate","plate_id":0,"seq":1,"text":"…","norm":"MH12JK4567","conf":0.99,"valid":true,"stolen":true}
+← {"type":"error","code":"size_limit"|"missing_model", …}
+← {"type":"ping"|"pong"}                                  (server pings every 20 s)
+```
+
+- The token travels in the first message, **never in the URL**.
+- Close codes: `4401` bad/missing token or auth timeout, `4403` role or device rejected.
+- Boxes are normalised 0..1 against the captured image. Vehicles `#FF8A00` @2.5 px,
+  plates `#FF1F1F` @3 px.
+- **Latency contract**: boxes go out as soon as detection finishes (~240 ms p50).
+  OCR costs ~2 s per crop on CPU, so plate text is decoded on a separate single-worker
+  thread pool and arrives later as a `plate` message. It never blocks the frame path.
+- Backpressure: latest-frame-wins (a frame arriving while one is in flight is dropped),
+  15 fps per device, 300 KB per frame.
+- Privacy: a plate that is **not** hot-listed is read, returned to that one phone, and
+  then discarded. It is never stored, never counted anywhere, and never broadcast.
 
 ## Database & Alembic
+
 - **Tables**: `users`, `devices`, `complaints`, `hotlist`, `sightings`, `audit_logs`.
-- **Alembic**: `0001_initial` -> `0002_perf_indexes (head)`.
+- **Chain**: `0001_initial` → `0002_perf_indexes` (**head**).
+- **Local DB** `alembic_version` = `0002_perf_indexes` (in sync with head).
+- `traffic_cells` **does not exist** — no `geo` router, no heat endpoint.
 
 ## Environment Variables
-- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`
-- `REDIS_URL`
-- `JWT_SECRET`, `JWT_EXPIRE_MINUTES`
-- `DEMO_MODE`, `CORS_ALLOW_PRIVATE_NETWORK`
 
-## Resolving API URL
-- Clients read from `VITE_API_URL` (Web) or `EXPO_PUBLIC_API_URL` (Mobile), mapped at startup by `start.ps1` to the PC's LAN IP.
+Defined in `backend/app/core/config.py`, documented in `.env.example`:
+
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, `REDIS_URL`,
+`JWT_SECRET`, `JWT_ACCESS_MINUTES`, `JWT_REFRESH_DAYS`, `HOTLIST_CONFIRMATION_HOURS`,
+`DEMO_MODE`, `CORS_ORIGINS`, `CORS_ALLOW_PRIVATE_NETWORK`, `STORAGE_BACKEND`,
+`STORAGE_LOCAL_PATH`, `AI_MODEL_PATH`, `OCR_MODEL_PATH`, `API_BASE_URL`,
+`DETECTION_COOLDOWN_SECONDS`, `MAX_UPLOAD_MB`, `RATE_LIMIT_DETECTIONS_PER_MINUTE`,
+`RATE_LIMIT_AUTH_PER_MINUTE`, `VITE_API_URL`, `VITE_WS_URL`, `EXPO_PUBLIC_API_URL`.
+
+Web clients read `VITE_API_URL` / `VITE_WS_URL`; the mobile app reads
+`EXPO_PUBLIC_API_URL`. `mobile_app/.env` ships it **empty on purpose** — the app derives
+the host from `Constants.expoConfig.hostUri` (Metro's LAN address) so the QR works from any
+PC on the network.
 
 ## Tests
-- Backend tests in `backend/tests/`: `test_auth.py`, `test_complaints.py`, `test_health.py`, `test_plate.py`, `test_privacy.py`, `test_sightings.py`.
+
+`backend/tests/`, run with `pytest` from `backend/` (`pythonpath = ..` in `pytest.ini`).
+
+| File | Covers |
+| --- | --- |
+| `test_auth.py` | login, refresh, role checks |
+| `test_complaints.py` | filing, verification, proof upload |
+| `test_health.py` | healthz |
+| `test_plate.py` | plate normalisation, state-code whitelist |
+| `test_privacy.py` | 415 on video/multipart, no imagery columns on `sightings`, `/ws/scan` auth gate |
+| `test_sightings.py` | hot-list match, cooldown suppression, last-seen update, police WS alert |
+
+`scripts/live_scan_test.py` is the live-path check (needs the backend running).
+Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test.js`.
 
 ## Conventions
-- Uses UUIDs for IDs.
-- Time in UTC.
-- Base64 image payload (to circumvent multiparts overhead on native).
+
+- UUID primary keys; all timestamps UTC in the database.
+- Redis is a **cache**, never a source of truth; every read degrades to PostgreSQL.
+- Images travel as base64 JSON, not multipart (multipart is rejected by middleware).
+- Roles: `CITIZEN`, `VOLUNTEER`, `COP`, `ADMIN`.
+- `privacy_guard` middleware returns `415` for any `multipart/form-data` or `video/*`
+  body outside `POST /api/v1/complaints`.
 
 ## Found but not working or missing
-- **Maps**: Missing (`traffic_cells` does not exist).
-- **Event Bus**: Missing/empty (`app/services/bus/` is empty).
-- **SDK 58**: Exists (Mobile is on Expo 58.0.2).
-- **Base64 Scanner Upload**: Exists (`frameToBase64` in `mobile_app/src/services/api.js`).
-- **State-code whitelist**: Exists (`VALID_STATE_CODES` in `plate.py`).
-- **WS /ws/scan**: Missing (only POST `/scanner/scan` exists).
+
+- **Maps heatmap**: missing. `traffic_cells`, `/api/v1/geo/heat`, `scripts/seed_traffic.py`
+  and the `/maps` route do not exist. `leaflet.heat` is not installed.
+- **Event bus**: source is **gone**. `backend/app/services/bus/` contains only stale
+  `__pycache__` (`base`, `factory`, `kafka`, `redis_streams`, `__init__`); no `.py` files
+  remain. Git history shows them in `9e2c419`/`d2a6196`, so the Python files were dropped
+  in the GitHub restore and the `.pyc` files survived. Nothing imports it, so the app is
+  unaffected — but the bus is not there.
+- **Expo SDK patch drift**: `expo-doctor` 19/20. Installed versions are one patch behind
+  what SDK 58 wants (`expo` 58.0.2 vs ~58.0.3, `expo-camera` 58.0.7 vs ~58.0.8,
+  `expo-font`, `expo-image-manipulator`, `expo-location`, `expo-splash-screen`). Everything
+  bundles and runs; left alone deliberately to avoid re-resolving `node_modules`.
+- **`backend/data/uploads/`**: `STORAGE_LOCAL_PATH` is the relative `./data/uploads`, so
+  running pytest or uvicorn from `backend/` creates a second uploads tree that the root
+  `.gitignore` rule never matched. Now ignored explicitly.
+- **`tree.txt`** at the repo root is a leftover scratch file from an earlier session; untracked.

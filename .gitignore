@@ -7,6 +7,9 @@ venv/
 data/uploads/
 data/generated/*
 !data/generated/.gitkeep
+# STORAGE_LOCAL_PATH is "./data/uploads", so running pytest or uvicorn from
+# backend/ creates a second uploads tree that the root rule above never matched.
+backend/data/uploads/
 dist/
 # Transient output of `npx expo export --output-dir .tmp-export`; rebuild-only.
 .tmp-export/

@@ -1468,10 +1468,33 @@ function Start-BackendLocal {
     }
 
     Assert-PortFree -Port $Ports.backend -ServiceName 'backend' | Out-Null
-    Start-TrackedProcess -Name 'backend' -Label 'FastAPI backend' `
-        -FilePath $VenvPython `
-        -Arguments @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', "$($Ports.backend)") `
-        -WorkingDirectory $BackendDir | Out-Null
+
+    # `ai` is a REPO-ROOT package (the shared ANPR code) and app/api/v1/live_scan.py
+    # imports it as `from ai.detector import ...`. Docker gets this for free: the
+    # build context is the repo root, so `ai/` lands next to `app/` under /app and
+    # both resolve from WORKDIR. Local mode has no such luck - uvicorn runs with
+    # WorkingDirectory backend\, so ONLY backend\ is importable and the backend
+    # dies during import with `ModuleNotFoundError: No module named 'ai'`. Nothing
+    # on :8000 ever listens, and every WebSocket client (police_dashboard
+    # usePoliceSocket, mobile_app liveScan) then retries every 3s forever, which
+    # is what "the website is always reconnecting" actually was.
+    #
+    # Putting the repo root back on PYTHONPATH reproduces the container layout:
+    # `app.*` still resolves from backend\, `ai.*` now resolves from the root.
+    # Scoped to this child process and restored afterwards so the rest of the
+    # script keeps its own environment (the same pattern Start-Expo uses for
+    # REACT_NATIVE_PACKAGER_HOSTNAME). SetEnvironmentVariable with a $null value
+    # removes the variable, which is the correct restore when it was unset.
+    $prevPythonPath = [System.Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
+    [System.Environment]::SetEnvironmentVariable('PYTHONPATH', $RepoRoot, 'Process')
+    try {
+        Start-TrackedProcess -Name 'backend' -Label 'FastAPI backend' `
+            -FilePath $VenvPython `
+            -Arguments @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', "$($Ports.backend)") `
+            -WorkingDirectory $BackendDir | Out-Null
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('PYTHONPATH', $prevPythonPath, 'Process')
+    }
 
     # Remember which .env this process was started with, for the check above.
     $hashes['backend_env'] = $envHash
@@ -1596,6 +1619,26 @@ function Invoke-DockerSeed {
         & docker compose exec -T backend python scripts/seed_demo.py 2>&1 | Out-String | Write-Info
     } finally {
         Pop-Location
+    }
+}
+
+function Invoke-DownloadModels {
+    Write-Step 'downloading YOLOv8n model for vehicle detection'
+    $yoloUrl = 'https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt'
+    $modelDir = Join-Path $RepoRoot 'backend\models'
+    $yoloPath = Join-Path $modelDir 'yolov8n.pt'
+    if (-not (Test-Path -LiteralPath $modelDir)) {
+        New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $yoloPath)) {
+        try {
+            Invoke-WebRequest -Uri $yoloUrl -OutFile $yoloPath -UseBasicParsing -ErrorAction Stop
+            Write-Ok 'YOLOv8n model downloaded'
+        } catch {
+            Write-Warn2 'Failed to download YOLOv8n. If offline, the backend must still start and /ws/scan reports "vehicle model missing".'
+        }
+    } else {
+        Write-Ok 'YOLOv8n model already exists'
     }
 }
 
@@ -2449,6 +2492,8 @@ try {
     }
 
     # --- Step 8 -------------------------------------------------------------- #
+    Invoke-DownloadModels
+
     $backendUp = ($results | Where-Object { $_.Service -eq 'Backend API' }).Ok
     if ($backendUp) {
         Invoke-Seeding

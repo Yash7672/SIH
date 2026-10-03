@@ -725,7 +725,16 @@ start_backend_local() {
     return
   fi
   assert_port_free "$PORT_BACKEND" backend prompt
-  start_process backend "FastAPI backend" "$BACKEND_DIR" \
+  # `ai` is a REPO-ROOT package imported as `from ai.detector import ...` by
+  # app/api/v1/live_scan.py. Docker gets it for free (build context is the repo
+  # root, so `ai/` sits next to `app/` under /app). Locally uvicorn runs with its
+  # cwd set to backend/, so only backend/ is importable and the backend dies at
+  # import with `ModuleNotFoundError: No module named 'ai'` - nothing listens on
+  # :8000 and every WebSocket client then retries every 3s forever. Exporting the
+  # repo root reproduces the container layout: `app.*` still resolves from
+  # backend/, `ai.*` now resolves from the root. Scoped to this child process.
+  PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    start_process backend "FastAPI backend" "$BACKEND_DIR" \
     "$VENV_DIR/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT_BACKEND"
 }
 
@@ -768,6 +777,22 @@ start_docker() {
 
   step "waiting for containers to report healthy"
   ( cd "$REPO_ROOT" && docker compose ps ) || true
+}
+
+download_models() {
+  step "downloading YOLOv8n model for vehicle detection"
+  local model_dir="$REPO_ROOT/backend/models"
+  local yolo_path="$model_dir/yolov8n.pt"
+  mkdir -p "$model_dir"
+  if [ ! -f "$yolo_path" ]; then
+    if curl -sSL "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt" -o "$yolo_path"; then
+      ok "YOLOv8n model downloaded"
+    else
+      warn "Failed to download YOLOv8n. If offline, the backend must still start and /ws/scan reports 'vehicle model missing'."
+    fi
+  else
+    ok "YOLOv8n model already exists"
+  fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -1161,6 +1186,7 @@ banner "Waiting for services"
 exit_code=0
 wait_readiness || exit_code=1
 
+download_models
 [ "$exit_code" -eq 0 ] && run_seeding || warn "backend is not healthy - skipping demo seeding"
 
 start_expo

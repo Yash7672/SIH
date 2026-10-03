@@ -17,6 +17,24 @@ from app.services.seed import seed_demo_users
 logger = get_logger(__name__)
 
 
+def warm_live_models() -> None:
+    """Load and run both live-detection models once, off the event loop."""
+    import numpy as np
+
+    from app.api.v1.live_scan import decode_and_infer, get_vehicle_model
+
+    get_vehicle_model()
+    # 640x480 black frame: exercises graph load and the first inference on both
+    # models without depending on any file being present.
+    blank = np.zeros((480, 640, 3), dtype=np.uint8)
+    import cv2
+
+    ok, enc = cv2.imencode(".jpg", blank)
+    if ok:
+        decode_and_infer(enc.tobytes())
+    logger.info("Live detection models warmed (vehicle + plate)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
@@ -36,6 +54,20 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Hotlist cache rebuild skipped: %s", exc)
     task = asyncio.create_task(hotlist_expiry_worker())
+
+    # Warm the live-detection models off the event loop.
+    #
+    # YOLOv8n and the plate detector each take seconds to construct and run a
+    # first inference (graph load, kernel selection, memory arena growth). Paying
+    # that on the first phone frame showed up as a multi-second "boxes" latency
+    # and read as a hang. Loading here moves the cost to startup, where the
+    # backend is not yet serving anyone. A missing or broken model must never
+    # stop the API from coming up: /ws/scan reports it per connection instead.
+    try:
+        await asyncio.to_thread(warm_live_models)
+    except Exception as exc:
+        logger.warning("Live detection models not warmed: %s", exc)
+
     yield
     task.cancel()
 

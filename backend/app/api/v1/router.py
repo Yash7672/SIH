@@ -13,6 +13,7 @@ from app.api.v1 import (
     users,
     vehicles,
     ws,
+    live_scan,
 )
 
 api_router = APIRouter()
@@ -28,3 +29,4 @@ api_router.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(scanner.router, prefix="/scanner", tags=["scanner"])
 api_router.include_router(ws.router, prefix="/ws", tags=["ws"])
+api_router.include_router(live_scan.router, prefix="/ws", tags=["ws"])

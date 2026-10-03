@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Animated,
   AppState,
   Pressable,
   ScrollView,
@@ -15,8 +16,10 @@ import { StatusBar } from "expo-status-bar";
 // families (~2.2 MB of assets) even though the scanner only uses Ionicons.
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { ScannerGuideFrame } from "./ScannerGuideFrame";
+// The scanner no longer draws a fixed guide frame: live detection paints real
+// boxes over the feed, and a decorative frame on top of them only got in the way.
 import Button from "./ui/Button";
+import LiveDetectionOverlay from "./LiveDetectionOverlay";
 import { Card } from "./ui/Card";
 import { LoadingState } from "./ui/Banner";
 import { fontSize, fontWeight, radius, spacing } from "../theme";
@@ -37,16 +40,17 @@ import { useTheme } from "../theme/ThemeContext";
 
 const LOG_LIMIT = 20;
 const HEALTH_INTERVAL_MS = 30000;
-const CAMERA_HEIGHT_RATIO = 0.4;
+const CAMERA_HEIGHT_RATIO = 0.55;
 // The 40% share is too small to aim with on a short phone, so the preview never
 // drops below this. 360x640 would otherwise get a 256 px strip.
 const MIN_CAMERA_HEIGHT = 260;
 
-export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLogout, deviceReady, user }) {
+export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLogout, deviceReady, user, liveScanState, boxes, stolenPlate, autoDetect, onToggleAutoDetect, externalCamRef, onAutoResultRef }) {
   const { colors, isDark, setMode } = useTheme();
   const insets = useSafeAreaInsets();
   const [perm, requestPerm] = useCameraPermissions();
-  const camRef = useRef(null);
+  const internalCamRef = useRef(null);
+  const camRef = externalCamRef || internalCamRef;
   const [camReady, setCamReady] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -54,10 +58,12 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
   const [result, setResult] = useState(null);
   const [log, setLog] = useState([]);
   const [showDebug, setShowDebug] = useState(true);
-  // react-navigation is not installed, so focus comes from AppState: the camera
-  // must not run inference while the app sits in the background.
   const [focused, setFocused] = useState(true);
   const { height } = useWindowDimensions();
+  
+  if (onAutoResultRef) {
+    onAutoResultRef.current = setResult;
+  }
 
   const s = useMemo(() => makeStyles(colors), [colors]);
 
@@ -237,6 +243,9 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
         pill={pill}
         camRef={camRef}
         onCameraReady={() => setCamReady(true)}
+        boxes={boxes}
+        liveScanState={liveScanState}
+        stolenPlate={stolenPlate}
       />
 
       <ScrollView
@@ -266,11 +275,28 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
         <AnprDebugCard result={result} visible={showDebug} onToggle={() => setShowDebug((v) => !v)} colors={colors} s={s} />
 
         <View style={s.actions}>
+          <View style={{flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, backgroundColor: colors.dark[800], padding: 10, borderRadius: 10}}>
+            <Text style={{color: colors.onDark.strong, fontWeight: 'bold'}}>Auto-Detect</Text>
+            <Pressable 
+              onPress={onToggleAutoDetect} 
+              style={{
+                width: 50, height: 30, borderRadius: 15, 
+                backgroundColor: autoDetect ? colors.success : colors.dark[600],
+                justifyContent: 'center',
+                paddingHorizontal: 2
+              }}
+            >
+              <View style={{
+                width: 26, height: 26, borderRadius: 13, backgroundColor: 'white',
+                alignSelf: autoDetect ? 'flex-end' : 'flex-start'
+              }} />
+            </Pressable>
+          </View>
           <Button
-            label="Scan plate"
+            label="Scan"
             size="lg"
             onPress={capture}
-            disabled={!camReady || !focused}
+            disabled={!camReady || !focused || scanning}
             loading={scanning}
             loadingLabel="Reading plate..."
             style={s.flex}
@@ -345,7 +371,7 @@ function ConnPill({ status, s }) {
  * Camera preview plus its overlays, memoised so a new activity-log line never
  * re-renders the camera. Only `pill` and `scanning` reach it.
  */
-const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady }) {
+const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady, boxes, liveScanState }) {
   // The overlay must be laid out against the preview box, so the box measures
   // itself and hands the result down. `height` is the intended height, used
   // until the first onLayout lands.
@@ -379,22 +405,82 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
         </View>
       ) : null}
 
-      {/* Sized from the measured preview box, so the frame can never spill over
-          the cards below. */}
-      <ScannerGuideFrame
-        scanning={scanning}
-        hint={null}
-        containerWidth={box.width || undefined}
-        containerHeight={box.height || height}
-      />
+      {liveScanState && (
+        <View style={{position: 'absolute', top: 10, left: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 5, borderRadius: 5, zIndex: 10}}>
+          <Text style={{color: 'white', fontSize: 10}}>{liveScanState.fps} fps | {liveScanState.ms} ms | {liveScanState.status}</Text>
+        </View>
+      )}
+      {/* Detection boxes live in their own memoised layer: the camera preview
+          above has no state and must not re-render just to move a rectangle. */}
+      <LiveDetectionOverlay message={boxes} preview={box} />
 
-      <View style={s.hintStrip} pointerEvents="none">
-        <Text style={s.hintStripText} numberOfLines={1}>
-          Align plate in the viewfinder, then press Scan
-        </Text>
-      </View>
+      <StolenBanner plate={stolenPlate} />
     </View>
   );
+});
+
+/**
+ * Full-width red banner shown when a plate the camera just read is on the active
+ * hot-list. A volunteer standing next to a reported car outdoors needs this to
+ * be unmissable and to name the plate, so it pulses and does not rely on colour
+ * alone.
+ */
+const StolenBanner = memo(function StolenBanner({ plate }) {
+  const pulse = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (!plate) {
+      pulse.setValue(1);
+      return undefined;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 0.35, duration: 420, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1, duration: 420, useNativeDriver: true })
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [plate, pulse]);
+
+  if (!plate) return null;
+
+  return (
+    <Animated.View
+      accessibilityRole="alert"
+      accessibilityLabel={`Stolen vehicle detected, plate ${plate}`}
+      pointerEvents="none"
+      style={[stolenStyles.banner, { opacity: pulse }]}
+    >
+      <Ionicons name="warning" size={18} color="#FFFFFF" />
+      <View style={stolenStyles.textWrap}>
+        <Text style={stolenStyles.title}>STOLEN VEHICLE</Text>
+        <Text style={stolenStyles.plate}>{plate}</Text>
+      </View>
+    </Animated.View>
+  );
+});
+
+const stolenStyles = StyleSheet.create({
+  banner: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    bottom: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: "#FF1F1F",
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+    zIndex: 20
+  },
+  textWrap: { flex: 1 },
+  title: { color: "#FFFFFF", fontSize: 11, fontWeight: "800", letterSpacing: 1 },
+  plate: { color: "#FFFFFF", fontSize: 20, fontWeight: "800", letterSpacing: 2 }
 });
 
 function resultPill(result) {
