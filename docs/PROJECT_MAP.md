@@ -120,11 +120,25 @@ Protocol:
 - Close codes: `4401` bad/missing token or auth timeout, `4403` role or device rejected.
 - Boxes are normalised 0..1 against the captured image. Vehicles `#FF8A00` @2.5 px,
   plates `#FF1F1F` @3 px.
+- **Frame size is handled by downscaling, never by refusing.** `SOFT_FRAME_BYTES`
+  (300 KB) is the point past which `decode_and_infer` resizes to `WORKING_WIDTH`
+  (1280 px); `HARD_FRAME_BYTES` (8 MB) is an abuse ceiling that returns
+  `size_limit`. This replaced a flat 300 KB reject that silently killed live
+  detection on any phone with a modern sensor — a 12 MP capture is ~500 KB even at
+  JPEG 0.3, so *every* frame was dropped and the app looked like it had no
+  detector at all. The app additionally resizes on-device
+  (`prepareLiveFrame`, a width × quality ladder measured against the real payload)
+  so a normal frame never needs the server-side fallback.
 - **Latency contract**: boxes go out as soon as detection finishes (~240 ms p50).
   OCR costs ~2 s per crop on CPU, so plate text is decoded on a separate single-worker
   thread pool and arrives later as a `plate` message. It never blocks the frame path.
 - Backpressure: latest-frame-wins (a frame arriving while one is in flight is dropped),
-  15 fps per device, 300 KB per frame.
+  15 fps per device. Note the server drops the whole burst while a frame is in
+  flight, so it answers the frame it accepted rather than the newest one; newest-wins
+  is the client's job (`liveScan.js` overwrites `_pending`).
+- **Read budget**: `MAX_READS_PER_FRAME = 3` crops per frame and `MIN_PLATE_PX = 45`.
+  Both were tightened downward while nothing was reaching this code, which is how a
+  frame with a third plate in view ended up silently unread.
 - Privacy: a plate that is **not** hot-listed is read, returned to that one phone, and
   then discarded. It is never stored, never counted anywhere, and never broadcast.
 - Every processed frame also feeds the density grid: `traffic_accumulator.add(lat, lng,
@@ -232,10 +246,14 @@ PC on the network.
 | `test_geo.py` | `/geo/heat` RBAC, bbox / window / class validation, hour-bucket window trap |
 | `test_heat_layers.py` | per-frame density, min-frames threshold, time decay, no-attribution |
 | `test_traffic_grid.py` | cell maths, GPS-fix rejection, batching, failed-flush retention, retention sweep |
+| `test_live_scan_frames.py` | oversized frame downscaled not dropped, ceiling ordering, aspect ratio, read budget |
 
 Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
-`scripts/live_scan_test.py` is the live-path check (needs the backend running).
+`scripts/live_scan_test.py` is the live-path check (needs the backend running) —
+16 checks covering auth rejection, RBAC, streaming throughput, the stolen-vehicle
+alert, the no-imagery-leaves-the-host guarantee, oversized-frame handling, and
+stale-frame dropping.
 Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test.js`.
 
 ## Police Dashboard Routes
@@ -294,3 +312,13 @@ area uniformly pale.
   `/ws/scan` run writes cells with `frames = N` and all vehicle counts zero. That is correct
   (an empty road is low density, not missing data) but means real density needs a real road.
   `scripts/seed_traffic.py` is what fills the map for a demo.
+- **`backend/app/ws/scan_manager.py` is an abandoned draft.** It holds a `ScanConnection`
+  dataclass and an `IoUTracker` with no imports and no `scan_manager` instance, and
+  `ws.py` had been edited to import from it — which broke the whole app at import time.
+  Reverted; the file is untracked and unreferenced. Live scan lives in
+  `app/api/v1/live_scan.py`. Extracting it is still reasonable, but as a deliberate
+  refactor with the tracking behaviour ported deliberately, not left half-wired.
+- **`scripts/e2e_verify.py` crashes on a cp1252 console** when a plate OCR reason
+  contains a non-ASCII fragment (`UnicodeEncodeError` on `型`). Harmless to the checks
+  themselves — run with `PYTHONIOENCODING=utf-8` — but the script should set
+  `sys.stdout.reconfigure(encoding="utf-8")` so a plain run does not die.

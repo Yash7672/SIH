@@ -40,10 +40,25 @@ MAX_CONNECTIONS = 3
 PING_INTERVAL_SECONDS = 20
 # A socket that never sends its auth message releases its slot after this long.
 AUTH_TIMEOUT_SECONDS = 10
-MAX_FRAME_BYTES = 300 * 1024
+# Frame size policy.
+#
+# A phone with a 12 MP sensor produces a ~500 KB JPEG even at quality 0.3, so a
+# flat 300 KB ceiling rejected *every* live frame and the detector saw nothing at
+# all. Size is now handled by downscaling to WORKING_WIDTH instead of dropping
+# the frame, with HARD_FRAME_BYTES left purely as an abuse ceiling.
+SOFT_FRAME_BYTES = 300 * 1024   # above this the frame is downscaled, not rejected
+HARD_FRAME_BYTES = 8 * 1024 * 1024  # above this the frame is refused outright
+WORKING_WIDTH = 1280             # inference width; matches the app's upload width
 FRAME_RATE_LIMIT = 15.0
-MIN_PLATE_PX = 60
-MAX_READS_PER_FRAME = 2
+# 60 px was tuned when nothing was actually reaching this code. At WORKING_WIDTH a
+# plate under ~45 px carries too few characters for OCR to be worth the ~2 s of
+# single-worker OCR time it costs, so this is the recall/coverage tradeoff, not a
+# guess.
+MIN_PLATE_PX = 45
+# Only the two largest-confidence crops were read per frame, so a frame with three
+# plates in view silently dropped the third - a visible "it is not detecting all".
+# OCR runs off the hot path, so a third read costs latency to nobody.
+MAX_READS_PER_FRAME = 3
 CACHE_TTL_SECONDS = 3.0
 CACHE_IOU = 0.3
 MIN_PLATE_CONFIDENCE = 0.6
@@ -79,6 +94,16 @@ def decode_and_infer(jpeg_bytes: bytes):
     t0 = time.perf_counter()
     img = Image.open(BytesIO(jpeg_bytes))
     img = ImageOps.exif_transpose(img)
+
+    # Downscale before inference rather than refusing the frame. Detection quality
+    # is driven by plate height in pixels, and WORKING_WIDTH keeps a plate legible
+    # while cutting decode, base64 and inference cost by ~5x on a 12 MP capture.
+    # Runs before the BGR conversion so the resize itself is on RGB, which is
+    # cheaper and avoids a pointless full-res cvtColor.
+    if img.width > WORKING_WIDTH:
+        new_h = max(1, round(img.height * (WORKING_WIDTH / img.width)))
+        img = img.resize((WORKING_WIDTH, new_h), Image.BILINEAR)
+
     bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     
     h, w = bgr.shape[:2]
@@ -127,8 +152,8 @@ def decode_and_infer(jpeg_bytes: bytes):
                 
                 x1, y1, x2, y2 = coords[:4]
                 width = x2 - x1
-                # Read a plate only if its box is at least 60 px wide in the source image
-                if width < 60:
+                # Read a plate only if its box is wide enough to carry characters.
+                if width < MIN_PLATE_PX:
                     continue
                 
                 nx1, ny1, nx2, ny2 = x1/w, y1/h, x2/w, y2/h
@@ -143,7 +168,7 @@ def decode_and_infer(jpeg_bytes: bytes):
                 crop_bgr = bgr[padded[1]:padded[3], padded[0]:padded[2]]
                 crops.append((p_id, crop_bgr, [nx1, ny1, nx2, ny2]))
                 
-                if len(crops) >= 2: # max 2 reads per frame
+                if len(crops) >= MAX_READS_PER_FRAME: # max reads per frame
                     break
                     
     ms = int((time.perf_counter() - t0) * 1000)
@@ -297,11 +322,23 @@ async def ws_live_scan(websocket: WebSocket):
                 b64 = data.get("jpeg_b64", "")
                 jpeg_bytes = base64.b64decode(b64)
                 
-                if len(jpeg_bytes) > 300 * 1024:
+                # Only an outright oversized payload is refused, and it says so.
+                # Between SOFT and HARD the frame is kept and downscaled inside
+                # decode_and_infer, because dropping it silently meant a phone with
+                # a modern sensor got zero detections and no explanation.
+                if len(jpeg_bytes) > HARD_FRAME_BYTES:
                     await websocket.send_text(json.dumps({
-                        "type": "error", "code": "size_limit", "message": "Frame rejected: too large"
+                        "type": "error",
+                        "code": "size_limit",
+                        "message": f"Frame rejected: {len(jpeg_bytes) // 1024} KB exceeds the {HARD_FRAME_BYTES // (1024 * 1024)} MB limit"
                     }))
                     continue
+
+                if len(jpeg_bytes) > SOFT_FRAME_BYTES:
+                    logger.info(
+                        "Live scan frame %s KB over the soft limit; downscaling to %spx",
+                        len(jpeg_bytes) // 1024, WORKING_WIDTH,
+                    )
                 
                 seq = data.get("seq")
                 lat = data.get("lat")

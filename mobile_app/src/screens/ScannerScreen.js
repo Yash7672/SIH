@@ -18,6 +18,25 @@ const VOTE_FRAMES = 3;
 const VOTE_INTERVAL_MS = 350;
 const EARLY_EXIT_CONFIDENCE = 0.85;
 
+// Live-path frame budget.
+//
+// The server refuses frames over 300 KB of decoded JPEG. The auto-detect loop used
+// to call takePictureAsync with no resize at all, so a 12 MP sensor produced
+// ~500 KB even at quality 0.3 and *every* live frame was rejected — which looked
+// exactly like "detection does not work". The manual snap path was unaffected
+// because prepareFrame() resizes, which is why /scanner/scan kept working while
+// live detection silently did not.
+const LIVE_FRAME_BUDGET_BYTES = 260 * 1024; // headroom under the server's 300 KB
+const LIVE_QUALITY_LADDER = [0.7, 0.55, 0.4, 0.3];
+const LIVE_WIDTH_LADDER = [1280, 960, 800];
+const LIVE_MIN_INTERVAL_MS = 120;
+
+/** Decoded JPEG size of a bare base64 payload, without decoding it. */
+function base64Bytes(b64) {
+  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.floor((b64.length * 3) / 4) - padding;
+}
+
 /**
  * Map an exception to a distinct, honest state.
  *
@@ -145,7 +164,13 @@ export default function ScannerScreen({ user, onLogout }) {
            if (onAutoResultRef.current) onAutoResultRef.current(result);
         }
       },
-      onError: (err) => console.log("LiveScan error:", err)
+      // Errors go to the on-screen status too, not just the console. A frame
+      // rejected server-side used to be invisible in the UI, so the scanner looked
+      // broken with no indication of why.
+      onError: (err) => {
+        console.log("LiveScan error:", err);
+        setLiveScanState(s => ({ ...s, status: `error: ${err?.message || err}` }));
+      }
     });
     client.connect();
     liveScanRef.current = client;
@@ -161,28 +186,48 @@ export default function ScannerScreen({ user, onLogout }) {
   useEffect(() => {
     let active = true;
     const loop = async () => {
+      let lastSentAt = 0;
       while (active) {
         if (autoDetect && focused && camRef.current && liveScanRef.current?.ready) {
           try {
-            const photo = await camRef.current.takePictureAsync({ quality: 0.3, base64: true, skipProcessing: true, exif: false });
-            if (photo && photo.base64 && active && autoDetect) {
-              const loc = await getLocation().catch(() => ({}));
-              liveScanRef.current.sendFrame(photo.width, photo.height, loc.latitude || 0, loc.longitude || 0, photo.base64);
-              
-              frameCount.current += 1;
-              const now = Date.now();
-              if (now - lastFpsTime.current > 1000) {
-                setLiveScanState(s => ({...s, fps: frameCount.current}));
-                frameCount.current = 0;
-                lastFpsTime.current = now;
+            // No base64 here on purpose: takePictureAsync base64-encodes the FULL
+            // sensor image, so we ask for the uri and downscale before reading it.
+            const photo = await camRef.current.takePictureAsync({
+              quality: 0.7,
+              skipProcessing: true,
+              exif: false,
+            });
+            if (photo && photo.uri && active && autoDetect) {
+              const payload = await prepareLiveFrame(photo);
+              if (payload && active && autoDetect) {
+                const loc = await getLocation().catch(() => ({}));
+                liveScanRef.current.sendFrame(
+                  payload.width, payload.height,
+                  loc.latitude || 0, loc.longitude || 0,
+                  payload.base64,
+                );
+
+                frameCount.current += 1;
+                const now = Date.now();
+                if (now - lastFpsTime.current > 1000) {
+                  setLiveScanState(s => ({ ...s, fps: frameCount.current }));
+                  frameCount.current = 0;
+                  lastFpsTime.current = now;
+                }
               }
             }
-          } catch(e) {
-            await new Promise(r => setTimeout(r, 100)); // sleep on error
+          } catch (e) {
+            // A single bad capture must not kill the loop.
+            if (e?.message) console.log("LiveScan capture:", e.message);
           }
-        } else {
-          await new Promise(r => setTimeout(r, 200)); // sleep if disabled
         }
+        // Pace the loop. Without this the camera is driven flat out, which starves
+        // the JS thread and drops the location fix that every frame rides along on.
+        const since = Date.now() - lastSentAt;
+        if (since < LIVE_MIN_INTERVAL_MS) {
+          await new Promise((r) => setTimeout(r, LIVE_MIN_INTERVAL_MS - since));
+        }
+        lastSentAt = Date.now();
       }
     };
     loop();
@@ -231,6 +276,57 @@ export default function ScannerScreen({ user, onLogout }) {
     } catch (error) {
       // prepareFrame's own errors already say "Could not prepare image"; do not
       // relabel a manipulator fault as a read fault.
+      throw String(error?.message || "").startsWith("Could not prepare image")
+        ? error
+        : new Error(`Could not prepare image: ${error?.message || error}`);
+    }
+  }
+
+  /**
+   * Resize + compress a live frame until it fits the server's frame budget.
+   *
+   * Walks a width ladder and, within each width, a JPEG quality ladder, returning
+   * the first combination that lands under LIVE_FRAME_BUDGET_BYTES. Measuring the
+   * real payload beats guessing a fixed quality, because the same setting yields
+   * very different sizes depending on scene content — a frame full of sky and
+   * tarmac compresses far past the budget, a cluttered street does not.
+   *
+   * If nothing fits, the smallest attempt is returned rather than dropped, so a
+   * marginal frame still gets a chance instead of vanishing silently.
+   */
+  async function prepareLiveFrame(photo) {
+    const uri = photo?.uri;
+    if (!uri) throw new Error("Camera did not return an image");
+
+    let smallest = null;
+    try {
+      for (const width of LIVE_WIDTH_LADDER) {
+        for (const quality of LIVE_QUALITY_LADDER) {
+          const resized =
+            photo.width && photo.width > width
+              ? await manipulateAsync(uri, [{ resize: { width } }], { compress: 1, format: SaveFormat.JPEG })
+              : null;
+          const target = resized?.uri || uri;
+          const result = await manipulateAsync(
+            target,
+            [],
+            { compress: quality, format: SaveFormat.JPEG },
+          );
+          const base64 = await frameToBase64(result?.uri || target);
+          const bytes = base64Bytes(base64);
+          const candidate = { width: result?.width || width, height: result?.height || photo.height, base64, bytes };
+
+          if (!smallest || bytes < smallest.bytes) smallest = candidate;
+          if (bytes <= LIVE_FRAME_BUDGET_BYTES) return candidate;
+        }
+      }
+      if (smallest) {
+        console.log(
+          `[RAKSHAK LIVE] frame ${Math.round(smallest.bytes / 1024)} KB still over budget after compression`,
+        );
+      }
+      return smallest;
+    } catch (error) {
       throw String(error?.message || "").startsWith("Could not prepare image")
         ? error
         : new Error(`Could not prepare image: ${error?.message || error}`);

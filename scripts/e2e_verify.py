@@ -39,6 +39,15 @@ PROBE_DEVICE_NAMES = ("E2E-Scanner", "E2E-Scanner-2", "WS-Probe")
 
 def _ensure_backend_on_path() -> None:
     """Allow the script to import the backend app package (config + models)."""
+    # OCR routinely reports a rejected non-ASCII fragment in its reason string
+    # ("dropped fragment '型'"). On a default Windows console (cp1252) printing that
+    # raises UnicodeEncodeError and kills the run at whichever check happens to hit
+    # it, so the checks after it never execute. Force UTF-8 up front.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     backend = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
     backend = os.path.abspath(backend)
     if backend not in sys.path:
