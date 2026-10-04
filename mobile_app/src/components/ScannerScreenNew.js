@@ -371,7 +371,7 @@ function ConnPill({ status, s }) {
  * Camera preview plus its overlays, memoised so a new activity-log line never
  * re-renders the camera. Only `pill` and `scanning` reach it.
  */
-const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady, boxes, liveScanState }) {
+const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady, boxes, liveScanState, stolenPlate }) {
   // The overlay must be laid out against the preview box, so the box measures
   // itself and hands the result down. `height` is the intended height, used
   // until the first onLayout lands.
