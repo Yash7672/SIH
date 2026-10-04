@@ -16,8 +16,7 @@ import { StatusBar } from "expo-status-bar";
 // families (~2.2 MB of assets) even though the scanner only uses Ionicons.
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-// The scanner no longer draws a fixed guide frame: live detection paints real
-// boxes over the feed, and a decorative frame on top of them only got in the way.
+import { useKeepAwake } from "expo-keep-awake";
 import Button from "./ui/Button";
 import LiveDetectionOverlay from "./LiveDetectionOverlay";
 import { Card } from "./ui/Card";
@@ -26,61 +25,78 @@ import { fontSize, fontWeight, radius, spacing } from "../theme";
 import { useTheme } from "../theme/ThemeContext";
 
 /**
+ * The live scanner.
+ *
+ * The camera is the page. It fills the top ~65% of the screen at all times and
+ * detection runs by itself - there is no shutter button, because a live feed
+ * that waits for a tap is just a camera app with extra steps. Everything the
+ * volunteer needs to *interpret* the feed sits in a compact panel underneath:
+ * the last plate and its confidence, the stolen banner, a short event log, the
+ * connection state and the frame rate.
+ *
  * The scanner is deliberately always dark in both themes: a bright chrome next
  * to the viewfinder makes the plate the least readable thing on screen, and the
  * volunteer is holding the phone outdoors. Only the chrome tints follow the
  * palette.
  *
- * Everything lives on ONE scrolling page - debug card, actions, backend check,
- * last detection and the activity log - so nothing useful hides behind a menu.
- *
- * No watermark over the viewfinder: text on top of the plate preview lowers
- * plate-read accuracy.
+ * No watermark or guide frame over the viewfinder: text on top of the plate
+ * preview lowers plate-read accuracy, and live detection already draws real
+ * boxes over the feed.
  */
 
-const LOG_LIMIT = 20;
+const LOG_LIMIT = 12;
 const HEALTH_INTERVAL_MS = 30000;
-const CAMERA_HEIGHT_RATIO = 0.55;
-// The 40% share is too small to aim with on a short phone, so the preview never
-// drops below this. 360x640 would otherwise get a 256 px strip.
+const CAMERA_HEIGHT_RATIO = 0.65;
+// A share this small is impossible to aim with on a short phone, so the preview
+// never drops below this. 360x640 would otherwise get a 256 px strip.
 const MIN_CAMERA_HEIGHT = 260;
 
-export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLogout, deviceReady, user, liveScanState, boxes, stolenPlate, autoDetect, onToggleAutoDetect, externalCamRef, onAutoResultRef }) {
+export default function ScannerScreen({
+  onSimulate,
+  onTestBackend,
+  onLogout,
+  deviceReady,
+  user,
+  liveScan,
+  stalePlate,
+  streaming,
+  onToggleStreaming,
+  externalCamRef,
+  cameraActive,
+  cameraFault,
+  pictureSize,
+}) {
   const { colors, isDark, setMode } = useTheme();
   const insets = useSafeAreaInsets();
   const [perm, requestPerm] = useCameraPermissions();
   const internalCamRef = useRef(null);
   const camRef = externalCamRef || internalCamRef;
-  const [camReady, setCamReady] = useState(false);
-  const [scanning, setScanning] = useState(false);
   const [testing, setTesting] = useState(false);
   const [backendState, setBackendState] = useState({ status: "CHECKING", error: null });
-  const [result, setResult] = useState(null);
   const [log, setLog] = useState([]);
-  const [showDebug, setShowDebug] = useState(true);
   const [focused, setFocused] = useState(true);
   const { height } = useWindowDimensions();
-  
-  if (onAutoResultRef) {
-    onAutoResultRef.current = setResult;
-  }
 
+  // Themed stylesheet. Rebuilt only when the palette changes, not per frame: the
+  // overlay and the panels below the viewfinder read from this object, and a new
+  // object every render would re-render the whole screen several times a second.
   const s = useMemo(() => makeStyles(colors), [colors]);
+
+  // A phone that sleeps mid-scan stops detecting, and nobody notices until the
+  // screen is dark in their hand. Held only while the stream is actually
+  // running, so the rest of the app still sleeps normally.
+  useKeepAwake(streaming && focused && cameraActive ? "rakshak-live-scan" : undefined, { allowed: true });
 
   const appendLog = useCallback((line) => {
     setLog((prev) => [line, ...prev].slice(0, LOG_LIMIT));
   }, []);
 
+  // The app being backgrounded unmounts the camera preview, so focus is what
+  // gates both the capture loop and the socket.
   useEffect(() => {
     const sub = AppState.addEventListener("change", (state) => setFocused(state === "active"));
     return () => sub?.remove?.();
   }, []);
-
-  // Losing focus invalidates the camera handle: the preview unmounts, so a
-  // stale "ready" flag would let a scan press fire against a dead ref.
-  useEffect(() => {
-    if (!focused) setCamReady(false);
-  }, [focused]);
 
   // Backend health: first call on mount, again on every focus, then every 30 s
   // while focused and in the foreground. The interval is torn down on blur and
@@ -113,55 +129,11 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
 
   const handleTestBackend = useCallback(() => runHealth(true), [runHealth]);
 
-  const capture = useCallback(async () => {
-    if (scanning || !camRef.current || !camReady || !focused) return;
-    setScanning(true);
-    setResult(null);
-    const startedAt = Date.now();
-    try {
-      const scanResult = await onScan(camRef.current);
-      const totalMs = Date.now() - startedAt;
-      setResult(scanResult);
-      const pct = Math.round((scanResult.confidence || 0) * 100);
-      const ok = scanResult.state === "success" || scanResult.state === "uncertain" || scanResult.state === "none";
-      // The status pill belongs to the health check alone, never to one scan. A
-      // connection-level scan failure is confirmed with an immediate re-check:
-      // only if that also fails does the backend count as unreachable.
-      if (scanResult.state === "network") {
-        appendLog("scan: connection failed - confirming with a health check");
-        await runHealth(false);
-      }
-      appendLog(
-        `scan: ${scanResult.plate || "no plate"} ${pct}% frames=${scanResult.frames ?? 0} votes={${formatVotes(scanResult.votes)}} ` +
-          `state=${scanResult.state} ` +
-          `${scanResult.elapsedMs ? `${scanResult.elapsedMs}ms via=${scanResult.uploadVia}` : `${totalMs}ms`}` +
-          `${scanResult.message && !ok ? ` | ${scanResult.message}` : ""}`
-      );
-      if (scanResult.hotlist) {
-        try {
-          Vibration.vibrate([40, 120, 80]);
-        } catch {}
-      }
-    } catch (e) {
-      setResult({ state: "error", message: e.message });
-      appendLog(`scan FAILED total=${Date.now() - startedAt}ms | ${e.message}`);
-    } finally {
-      setScanning(false);
-    }
-  }, [scanning, camReady, focused, onScan, appendLog, runHealth]);
-
   const simulate = useCallback(async () => {
     try {
       const r = await onSimulate();
-      setResult(r);
-      appendLog(`simulate: ${r.plate} votes={${formatVotes(r.votes)}}`);
-      if (r.hotlist) {
-        try {
-          Vibration.vibrate([40, 120, 80]);
-        } catch {}
-      }
+      appendLog(`simulate: ${r.plate}${r.hotlist ? " - HOTLIST MATCH" : ""}`);
     } catch (e) {
-      setResult({ state: "network", message: e.message });
       appendLog(`error: ${e.message}`);
     }
   }, [onSimulate, appendLog]);
@@ -174,8 +146,8 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
         <View style={s.permission}>
           <Text style={[s.permissionTitle, { color: colors.surface.text }]}>Camera access needed</Text>
           <Text style={[s.permissionText, { color: colors.surface.muted }]}>
-            The scanner needs the camera to read vehicle number plates. No video is uploaded — only a single still
-            frame per scan.
+            The scanner needs the camera to read vehicle number plates. It streams detection frames to the server
+            over your own network — no video is stored.
           </Text>
           <Button
             label="Grant camera access"
@@ -189,7 +161,6 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
     );
   }
 
-  const pill = resultPill(result);
   const cameraHeight = Math.round(Math.max(MIN_CAMERA_HEIGHT, height * CAMERA_HEIGHT_RATIO));
 
   return (
@@ -198,7 +169,6 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
       <StatusBar style="light" translucent />
 
       <View style={[s.header, { backgroundColor: colors.dark[800], borderBottomColor: colors.dark[600], paddingTop: insets.top + spacing.sm }]}>
-        {/* Row 1: title only, so it never has to share width with buttons. */}
         <View style={s.headerRow}>
           <Text style={[s.title, { color: colors.onDark.strong }]} numberOfLines={1}>
             RAKSHAK Scanner
@@ -225,27 +195,25 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
           </View>
         </View>
 
-        {/* Row 2: who is scanning, and whether the backend is answering. */}
         <View style={s.headerRow}>
           <Text style={[s.subtitle, { color: colors.onDark.muted }]} numberOfLines={1}>
             {user?.name} · {String(user?.role || "VOLUNTEER").toUpperCase()}
           </Text>
-          <ConnPill status={backendState.status} s={s} />
+          <LivePill live={liveScan} colors={colors} s={s} />
         </View>
       </View>
 
+      {/* Memoised on purpose: this subtree holds the native camera, and the
+          message rate is several per second. Only these props may cross into
+          it - the boxes come through the overlay's own store instead. */}
       <CameraSection
         height={cameraHeight}
         colors={colors}
         s={s}
         focused={focused}
-        scanning={scanning}
-        pill={pill}
         camRef={camRef}
-        onCameraReady={() => setCamReady(true)}
-        boxes={boxes}
-        liveScanState={liveScanState}
-        stolenPlate={stolenPlate}
+        streaming={streaming}
+        pictureSize={pictureSize}
       />
 
       <ScrollView
@@ -253,95 +221,53 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
         contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
         keyboardShouldPersistTaps="handled"
       >
+        <StolenBanner plate={stalePlate} />
+
+        {cameraFault ? (
+          <View style={[s.faultBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
+            <Ionicons name="alert-circle-outline" size={15} color={colors.danger} />
+            <Text style={[s.faultText, { color: colors.onDark.body }]}>{cameraFault}</Text>
+          </View>
+        ) : null}
+
         {backendState.status === "OFFLINE" ? (
-          <View style={[s.offlineBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
+          <View style={[s.faultBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
             <Ionicons name="warning-outline" size={15} color={colors.danger} />
-            <Text style={[s.offlineText, { color: colors.onDark.body }]} numberOfLines={2}>
+            <Text style={[s.faultText, { color: colors.onDark.body }]} numberOfLines={2}>
               Backend unreachable{backendState.error ? `: ${backendState.error}` : ""}
             </Text>
           </View>
         ) : null}
 
-        {/* Scan faults get their own block. It sits inside the scroll content
-            with a top margin, so it can never slide under the fixed-height
-            camera container the way the old absolutely-positioned banner did. */}
-        {isErrorState(result) ? (
-          <View style={[s.errorBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
-            <Ionicons name="alert-circle-outline" size={15} color={colors.danger} />
-            <Text style={[s.offlineText, { color: colors.onDark.body }]}>{result.message}</Text>
-          </View>
-        ) : null}
-
-        <AnprDebugCard result={result} visible={showDebug} onToggle={() => setShowDebug((v) => !v)} colors={colors} s={s} />
+        <InfoPanel
+          liveScan={liveScan}
+          stalePlate={stalePlate}
+          streaming={streaming}
+          onToggleStreaming={onToggleStreaming}
+          colors={colors}
+          s={s}
+        />
 
         <View style={s.actions}>
-          <View style={{flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, backgroundColor: colors.dark[800], padding: 10, borderRadius: 10}}>
-            <Text style={{color: colors.onDark.strong, fontWeight: 'bold'}}>Auto-Detect</Text>
-            <Pressable 
-              onPress={onToggleAutoDetect} 
-              style={{
-                width: 50, height: 30, borderRadius: 15, 
-                backgroundColor: autoDetect ? colors.success : colors.dark[600],
-                justifyContent: 'center',
-                paddingHorizontal: 2
-              }}
-            >
-              <View style={{
-                width: 26, height: 26, borderRadius: 13, backgroundColor: 'white',
-                alignSelf: autoDetect ? 'flex-end' : 'flex-start'
-              }} />
-            </Pressable>
-          </View>
-          <Button
-            label="Scan"
-            size="lg"
-            onPress={capture}
-            disabled={!camReady || !focused || scanning}
-            loading={scanning}
-            loadingLabel="Reading plate..."
-            style={s.flex}
-            icon={<Ionicons name="camera" size={19} color="#FFFFFF" />}
-          />
           <Button
             label="Simulate"
             size="lg"
             variant="secondary"
             onPress={simulate}
-            disabled={scanning}
             style={s.flex}
             icon={<Ionicons name="dice" size={19} color={colors.onDark.body} />}
           />
-        </View>
-
-        <View style={s.backendRow}>
           <Button
-            label="TEST BACKEND CONNECTION"
-            size="md"
+            label="TEST BACKEND"
+            size="lg"
             variant="secondary"
             onPress={handleTestBackend}
             loading={testing}
             loadingLabel="Testing..."
             style={s.flex}
-            icon={<Ionicons name="pulse" size={17} color={colors.accent[300]} />}
+            icon={<Ionicons name="pulse" size={19} color={colors.accent[300]} />}
           />
-          <Text
-            style={[
-              s.backendStatus,
-              {
-                color:
-                  backendState.status === "CONNECTED"
-                    ? colors.success
-                    : backendState.status === "CHECKING"
-                      ? colors.warning
-                      : colors.danger,
-              },
-            ]}
-          >
-            {backendState.status}
-          </Text>
         </View>
-
-        <LastDetectionCard result={result} colors={colors} s={s} />
 
         <ActivityLog log={log} colors={colors} s={s} />
       </ScrollView>
@@ -349,29 +275,23 @@ export default function ScannerScreen({ onScan, onSimulate, onTestBackend, onLog
   );
 }
 
-function formatVotes(votes) {
-  if (!votes || typeof votes !== "object") return "";
-  const parts = Object.keys(votes).map((k) => `${k}:${votes[k]}`);
-  return parts.length ? parts.join(",") : "";
-}
-
-/** Three-state backend pill: CHECKING amber, CONNECTED green, OFFLINE red. */
-function ConnPill({ status, s }) {
-  const { colors } = useTheme();
-  const tone = status === "CONNECTED" ? colors.success : status === "CHECKING" ? colors.warning : colors.danger;
+/** LIVE / RECONNECTING / OFFLINE. The one status the volunteer acts on. */
+function LivePill({ live, colors, s }) {
+  const state = live?.state || "OFFLINE";
+  const tone = state === "LIVE" ? colors.success : state === "RECONNECTING" ? colors.warning : colors.danger;
   return (
     <View style={[s.pill, { borderColor: tone }]}>
       <View style={[s.pillDot, { backgroundColor: tone }]} />
-      <Text style={[s.pillText, { color: tone }]}>{status}</Text>
+      <Text style={[s.pillText, { color: tone }]}>{state}</Text>
     </View>
   );
 }
 
 /**
- * Camera preview plus its overlays, memoised so a new activity-log line never
- * re-renders the camera. Only `pill` and `scanning` reach it.
+ * Camera preview plus its overlays, memoised so a new log line never re-renders
+ * the camera. Nothing that changes per message may be passed in here.
  */
-const CameraSection = memo(function CameraSection({ height, colors, s, focused, scanning, pill, camRef, onCameraReady, boxes, liveScanState, stolenPlate }) {
+const CameraSection = memo(function CameraSection({ height, colors, s, focused, camRef, streaming, pictureSize }) {
   // The overlay must be laid out against the preview box, so the box measures
   // itself and hands the result down. `height` is the intended height, used
   // until the first onLayout lands.
@@ -393,28 +313,25 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
           facing="back"
           autofocus="on"
           zoom={0}
-          onCameraReady={onCameraReady}
+          flash="off"
+          animateShutter={false}
+          // The smallest size the plate is still readable at. Without it the
+          // sensor hands the loop a 12 MP frame to compress down to 45 KB, and
+          // that is where the frame rate goes.
+          pictureSize={pictureSize}
         />
       ) : null}
 
-      {pill ? (
-        <View style={[s.resultPill, { borderColor: pill.tone, backgroundColor: "rgba(4,8,20,0.66)" }]}>
-          <Text style={[s.resultPillText, { color: pill.tone }]} numberOfLines={1}>
-            {pill.text}
-          </Text>
-        </View>
-      ) : null}
-
-      {liveScanState && (
-        <View style={{position: 'absolute', top: 10, left: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 5, borderRadius: 5, zIndex: 10}}>
-          <Text style={{color: 'white', fontSize: 10}}>{liveScanState.fps} fps | {liveScanState.ms} ms | {liveScanState.status}</Text>
-        </View>
-      )}
       {/* Detection boxes live in their own memoised layer: the camera preview
           above has no state and must not re-render just to move a rectangle. */}
-      <LiveDetectionOverlay message={boxes} preview={box} />
+      <LiveDetectionOverlay preview={box} />
 
-      <StolenBanner plate={stolenPlate} />
+      {!streaming ? (
+        <View style={s.pausedVeil} pointerEvents="none">
+          <Ionicons name="pause-circle" size={34} color="#FFFFFF" />
+          <Text style={s.pausedText}>Detection paused</Text>
+        </View>
+      ) : null}
     </View>
   );
 });
@@ -436,7 +353,7 @@ const StolenBanner = memo(function StolenBanner({ plate }) {
     const loop = Animated.loop(
       Animated.sequence([
         Animated.timing(pulse, { toValue: 0.35, duration: 420, useNativeDriver: true }),
-        Animated.timing(pulse, { toValue: 1, duration: 420, useNativeDriver: true })
+        Animated.timing(pulse, { toValue: 1, duration: 420, useNativeDriver: true }),
       ])
     );
     loop.start();
@@ -448,14 +365,18 @@ const StolenBanner = memo(function StolenBanner({ plate }) {
   return (
     <Animated.View
       accessibilityRole="alert"
-      accessibilityLabel={`Stolen vehicle detected, plate ${plate}`}
+      accessibilityLabel={`Stolen vehicle detected, plate ${plate.plate}`}
       pointerEvents="none"
       style={[stolenStyles.banner, { opacity: pulse }]}
     >
       <Ionicons name="warning" size={18} color="#FFFFFF" />
       <View style={stolenStyles.textWrap}>
-        <Text style={stolenStyles.title}>STOLEN VEHICLE</Text>
-        <Text style={stolenStyles.plate}>{plate}</Text>
+        <Text style={stolenStyles.title} numberOfLines={1}>
+          STOLEN VEHICLE {plate.plate}
+        </Text>
+        <Text style={stolenStyles.sub} numberOfLines={1}>
+          {plate.confidence}% · police alerted
+        </Text>
       </View>
     </Animated.View>
   );
@@ -463,140 +384,91 @@ const StolenBanner = memo(function StolenBanner({ plate }) {
 
 const stolenStyles = StyleSheet.create({
   banner: {
-    position: "absolute",
-    left: 12,
-    right: 12,
-    bottom: 12,
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.md,
     paddingVertical: 10,
     paddingHorizontal: 12,
-    borderRadius: 10,
+    borderRadius: radius.md,
     backgroundColor: "#FF1F1F",
     borderWidth: 2,
     borderColor: "#FFFFFF",
-    zIndex: 20
   },
   textWrap: { flex: 1 },
-  title: { color: "#FFFFFF", fontSize: 11, fontWeight: "800", letterSpacing: 1 },
-  plate: { color: "#FFFFFF", fontSize: 20, fontWeight: "800", letterSpacing: 2 }
+  title: { color: "#FFFFFF", fontSize: 12, fontWeight: "800", letterSpacing: 0.6 },
+  sub: { color: "#FFFFFF", fontSize: 11, fontWeight: "700", opacity: 0.92 },
 });
 
-function resultPill(result) {
-  if (!result) return null;
-  if (result.state === "success" && result.plate) return { tone: "#22C55E", text: result.plate };
-  if (result.state === "uncertain") return { tone: "#F59E0B", text: `${result.plate || "?"} · uncertain` };
-  if (result.state === "none") return { tone: "#EF4444", text: "NO PLATE" };
-  if (result.state === "network") return { tone: "#EF4444", text: "NO CONNECTION" };
-  if (result.message) return { tone: "#EF4444", text: result.state === "camera" ? "CAMERA" : "REQUEST FAILED" };
-  return null;
-}
-
-/** True for states that represent a fault rather than a scan outcome. */
-function isErrorState(result) {
-  if (!result) return false;
-  return ["camera", "network", "request", "server", "slow", "session", "forbidden", "error"].includes(result.state);
-}
-
-function DebugRow({ label, value, valueColor, s, colors }) {
-  return (
-    <View style={s.debugRow}>
-      <Text style={[s.debugLabel, { color: colors.onDark.muted }]}>{label}</Text>
-      <Text style={[s.debugValue, { color: valueColor || colors.onDark.strong }]} numberOfLines={2}>
-        {value}
-      </Text>
-    </View>
-  );
-}
-
-function AnprDebugCard({ result, visible, onToggle, colors, s }) {
-  const detected = Boolean(result && result.plate);
-  const pct = result && result.confidence ? `${Math.round(result.confidence * 100)}%` : "—";
-  const yes = (v) => (v ? "YES" : "NO");
+/**
+ * Everything under the camera, in one panel: last plate, stats, the pause
+ * toggle and the recent events. Kept compact so the preview can have the top
+ * 65% of the screen instead of fighting a stack of cards.
+ */
+function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, colors, s }) {
+  const last = stalePlate;
   return (
     <Card tone="dark" style={s.block}>
       <View style={s.blockHeader}>
-        <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>ANPR DEBUG</Text>
-        <Pressable onPress={onToggle} hitSlop={8} accessibilityRole="button" accessibilityLabel="Toggle ANPR debug card">
-          <Ionicons name={visible ? "chevron-up" : "chevron-down"} size={17} color={colors.onDark.muted} />
+        <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>LAST PLATE</Text>
+        <Pressable
+          onPress={onToggleStreaming}
+          hitSlop={8}
+          accessibilityRole="switch"
+          accessibilityState={{ checked: streaming }}
+          accessibilityLabel={streaming ? "Pause live detection" : "Resume live detection"}
+          style={({ pressed }) => [styles.detectToggle, { opacity: pressed ? 0.7 : 1 }]}
+        >
+          <View style={[styles.detectTrack, { backgroundColor: streaming ? colors.success : colors.dark[600] }]}>
+            <View style={[styles.detectKnob, { alignSelf: streaming ? "flex-end" : "flex-start" }]} />
+          </View>
         </Pressable>
       </View>
-      {visible ? (
-        <View style={s.debugBody}>
-          <DebugRow
-            label="Plate detected"
-            value={yes(detected)}
-            valueColor={detected ? colors.success : colors.danger}
-            s={s}
-            colors={colors}
-          />
-          <DebugRow label="Raw OCR" value={result?.raw || "—"} s={s} colors={colors} />
-          <DebugRow label="Normalized" value={result?.normalized || result?.plate || "—"} s={s} colors={colors} />
-          <DebugRow label="Confidence" value={pct} s={s} colors={colors} />
-          <DebugRow
-            label="Valid plate"
-            value={yes(Boolean(result?.valid))}
-            valueColor={result?.valid ? colors.success : colors.danger}
-            s={s}
-            colors={colors}
-          />
+
+      {last ? (
+        <View>
+          <Text style={[s.plateMono, { color: last.stolen ? "#FF6B6B" : colors.onDark.strong }]} numberOfLines={1} adjustsFontSizeToFit>
+            {last.plate}
+          </Text>
+          <Text style={s.detSub}>
+            {last.confidence}% confidence · {last.stolen ? "reported to police" : "not on the hotlist"}
+          </Text>
         </View>
-      ) : null}
+      ) : (
+        <Text style={[s.emptyText, { color: colors.onDark.muted }]}>
+          {streaming ? "Point the camera at a vehicle plate." : "Live detection is paused."}
+        </Text>
+      )}
+
+      <View style={[s.statRow, { borderTopColor: colors.dark[600] }]}>
+        <Stat label="FPS" value={liveScan?.fps ? String(liveScan.fps) : "-"} colors={colors} s={s} />
+        <Stat label="SERVER" value={liveScan?.serverMs ? `${liveScan.serverMs}ms` : "-"} colors={colors} s={s} />
+        <Stat label="ROUND TRIP" value={liveScan?.roundTripMs ? `${liveScan.roundTripMs}ms` : "-"} colors={colors} s={s} />
+      </View>
     </Card>
   );
 }
 
-function LastDetectionCard({ result, colors, s }) {
-  if (!result) {
-    return (
-      <Card tone="dark" style={s.block}>
-        <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>LAST DETECTION</Text>
-        <Text style={[s.emptyText, { color: colors.onDark.muted }]}>No detection yet — press Scan plate.</Text>
-      </Card>
-    );
-  }
-
-  const pct = result.confidence ? `${Math.round(result.confidence * 100)}% confidence` : "";
-  const valid = Boolean(result.valid);
-  const sub = result.state === "success" ? `${pct} · valid plate` : result.state === "uncertain" ? `${pct} · uncertain, scan again` : result.message || "";
-
+function Stat({ label, value, colors, s }) {
   return (
-    <Card tone="dark" style={s.block}>
-      <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>LAST DETECTION</Text>
-      {result.plate ? (
-        <Text style={[s.plateMono, { color: colors.onDark.strong }]} numberOfLines={1} adjustsFontSizeToFit>
-          {result.plate}
-        </Text>
-      ) : null}
-      <Text style={[s.detSub, { color: valid ? colors.success : colors.warning }]}>{sub}</Text>
-
-      {result.hotlist ? (
-        <View style={[s.hotlist, { backgroundColor: colors.solidDanger, borderColor: colors.danger }]}>
-          <Ionicons name="shield" size={16} color="#FFFFFF" />
-          <Text style={s.hotlistText}>HOTLIST MATCH, reported to police</Text>
-        </View>
-      ) : null}
-
-      {!valid && result.state === "none" ? (
-        <Text style={[s.detNote, { color: colors.danger }]}>
-          No plate detected{result.frames ? ` across ${result.frames} frame(s)` : ""} — move closer and hold steady.
-        </Text>
-      ) : null}
-    </Card>
+    <View style={s.stat}>
+      <Text style={[s.statLabel, { color: colors.onDark.muted }]}>{label}</Text>
+      <Text style={[s.statValue, { color: colors.onDark.strong }]}>{value}</Text>
+    </View>
   );
 }
 
 function ActivityLog({ log, colors, s }) {
   return (
     <Card tone="dark" style={s.block}>
-      <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>ACTIVITY LOG</Text>
+      <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>RECENT EVENTS</Text>
       {log.length === 0 ? (
         <Text style={[s.emptyText, { color: colors.onDark.muted }]}>Nothing yet.</Text>
       ) : (
         <View style={s.logBody}>
           {log.map((line, i) => (
-            <Text key={`${i}-${line.slice(0, 24)}`} style={[s.logLine, { color: colors.onDark.muted }]}>
+            <Text key={`${i}-${line.slice(0, 24)}`} style={[s.logLine, { color: colors.onDark.muted }]} numberOfLines={2}>
               {line}
             </Text>
           ))}
@@ -605,6 +477,18 @@ function ActivityLog({ log, colors, s }) {
     </Card>
   );
 }
+
+const styles = StyleSheet.create({
+  detectToggle: { paddingVertical: 2 },
+  detectTrack: {
+    width: 46,
+    height: 28,
+    borderRadius: 14,
+    justifyContent: "center",
+    paddingHorizontal: 3,
+  },
+  detectKnob: { width: 22, height: 22, borderRadius: 11, backgroundColor: "#FFFFFF" },
+});
 
 function makeStyles(colors) {
   return StyleSheet.create({
@@ -642,44 +526,21 @@ function makeStyles(colors) {
     pillText: { fontSize: 10, fontWeight: fontWeight.bold, letterSpacing: 0.4 },
 
     cameraWrap: { backgroundColor: "#000", width: "100%", overflow: "hidden" },
-    resultPill: {
-      position: "absolute",
-      top: spacing.md,
-      alignSelf: "center",
-      borderWidth: 2,
-      borderRadius: radius.pill,
-      paddingHorizontal: spacing.lg,
-      paddingVertical: 5,
-      zIndex: 2,
-    },
-    resultPillText: { fontSize: fontSize.base, fontWeight: fontWeight.bold, letterSpacing: 1 },
-    hintStrip: {
-      position: "absolute",
-      left: 0,
-      right: 0,
-      bottom: 0,
-      backgroundColor: "rgba(4,8,20,0.66)",
-      paddingVertical: spacing.sm,
+    // Shown over the preview while paused. Opacity rather than a blur, so it
+    // costs nothing on a device that is already struggling to encode frames.
+    pausedVeil: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: "rgba(4,8,20,0.55)",
       alignItems: "center",
+      justifyContent: "center",
+      gap: 6,
     },
-    hintStripText: { color: "#E2E8F0", fontSize: fontSize.sm, fontWeight: fontWeight.medium },
+    pausedText: { color: "#FFFFFF", fontSize: fontSize.sm, fontWeight: fontWeight.semibold, letterSpacing: 0.6 },
 
     scroll: { flex: 1 },
     flex: { flex: 1 },
 
-    offlineBanner: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: spacing.sm,
-      margin: spacing.lg,
-      marginBottom: 0,
-      padding: spacing.md,
-      borderRadius: radius.md,
-      borderWidth: 1,
-    },
-    // Normal flow block: a real top margin, no negative offset, so the banner
-    // starts below the camera rather than underneath it.
-    errorBanner: {
+    faultBanner: {
       flexDirection: "row",
       alignItems: "flex-start",
       gap: spacing.sm,
@@ -689,7 +550,7 @@ function makeStyles(colors) {
       borderRadius: radius.md,
       borderWidth: 1,
     },
-    offlineText: { flex: 1, fontSize: fontSize.sm },
+    faultText: { flex: 1, fontSize: fontSize.sm },
 
     block: { marginHorizontal: spacing.lg, marginTop: spacing.md },
     blockHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
@@ -700,50 +561,30 @@ function makeStyles(colors) {
     },
     emptyText: { marginTop: spacing.sm, fontSize: fontSize.sm },
 
-    debugBody: { marginTop: spacing.md, gap: spacing.xs },
-    debugRow: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", gap: spacing.md },
-    debugLabel: { fontSize: fontSize.sm },
-    debugValue: {
-      flex: 1,
-      textAlign: "right",
-      fontSize: fontSize.sm,
-      fontWeight: fontWeight.semibold,
-      fontFamily: "monospace",
-    },
-
-    actions: { flexDirection: "row", gap: spacing.md, marginHorizontal: spacing.lg, marginTop: spacing.md },
-
-    backendRow: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: spacing.md,
-      marginHorizontal: spacing.lg,
-      marginTop: spacing.md,
-    },
-    backendStatus: { fontSize: fontSize.sm, fontWeight: fontWeight.bold, letterSpacing: 0.4 },
-
     plateMono: {
-      marginTop: spacing.md,
-      fontSize: fontSize.display,
+      marginTop: spacing.sm,
+      fontSize: fontSize.xxl,
       fontWeight: fontWeight.heavy,
       fontFamily: "monospace",
       letterSpacing: 2,
     },
-    detSub: { marginTop: spacing.xs, fontSize: fontSize.sm, fontWeight: fontWeight.semibold },
-    detNote: { marginTop: spacing.sm, fontSize: fontSize.sm },
-    hotlist: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: spacing.sm,
-      marginTop: spacing.md,
-      padding: spacing.md,
-      borderRadius: radius.md,
-      borderWidth: 1,
-    },
-    hotlistText: { color: "#FFFFFF", fontSize: fontSize.sm, fontWeight: fontWeight.bold, letterSpacing: 0.3, flex: 1 },
+    detSub: { marginTop: 2, fontSize: fontSize.xs, color: "#94A3B8" },
 
-    logBody: { marginTop: spacing.md, gap: 3 },
-    logLine: { fontSize: 12.5, lineHeight: 18, fontFamily: "monospace" },
+    statRow: {
+      flexDirection: "row",
+      marginTop: spacing.md,
+      paddingTop: spacing.sm,
+      borderTopWidth: 1,
+      gap: spacing.md,
+    },
+    stat: { flex: 1 },
+    statLabel: { fontSize: 10, fontWeight: fontWeight.semibold, letterSpacing: 0.8 },
+    statValue: { marginTop: 2, fontSize: fontSize.sm, fontFamily: "monospace" },
+
+    actions: { flexDirection: "row", gap: spacing.md, marginHorizontal: spacing.lg, marginTop: spacing.md },
+
+    logBody: { marginTop: spacing.sm, gap: 3 },
+    logLine: { fontSize: 12, lineHeight: 17, fontFamily: "monospace" },
 
     permission: { flex: 1, justifyContent: "center", paddingHorizontal: spacing.xl, gap: spacing.lg, alignItems: "center" },
     permissionTitle: { fontSize: fontSize.xl, fontWeight: fontWeight.bold },

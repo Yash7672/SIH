@@ -29,6 +29,7 @@ def warm_live_models() -> None:
     import numpy as np
 
     from app.api.v1.live_scan import decode_and_infer, get_vehicle_model
+    from app.ws.scan_manager import VehicleTracker
 
     get_vehicle_model()
     # 640x480 black frame: exercises graph load and the first inference on both
@@ -38,7 +39,9 @@ def warm_live_models() -> None:
 
     ok, enc = cv2.imencode(".jpg", blank)
     if ok:
-        decode_and_infer(enc.tobytes())
+        # A throwaway tracker: the warm-up exists to pay the first-inference cost,
+        # and a tracker is per connection, so this one is discarded immediately.
+        decode_and_infer(enc.tobytes(), VehicleTracker())
     logger.info("Live detection models warmed (vehicle + plate)")
 
 

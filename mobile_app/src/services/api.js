@@ -222,7 +222,7 @@ export async function resetSession() {
 // burn the refresh token and the later ones would fail on a rotated token.
 let refreshInFlight = null;
 
-async function refreshSession() {
+export async function refreshSession() {
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
@@ -260,6 +260,28 @@ async function refreshSession() {
     return await refreshInFlight;
   } finally {
     refreshInFlight = null;
+  }
+}
+
+/**
+ * Has the access token expired, or is it about to?
+ *
+ * The live WebSocket authenticates once, on the first message, and then holds
+ * that claim for as long as the socket is open. A phone that scans a road for
+ * forty minutes therefore ends up holding a claim minted half an hour ago:
+ * every frame is accepted, but the *next* reconnect is refused with 4401 and the
+ * user is kicked to the login screen mid-shift. Reading `exp` lets the socket
+ * re-auth while it is still healthy.
+ */
+export function tokenExpiresInMs() {
+  if (!session.token) return 0;
+  try {
+    const payload = JSON.parse(atob(session.token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (typeof payload?.exp !== "number") return 0;
+    return payload.exp * 1000 - Date.now();
+  } catch (e) {
+    // Opaque or non-JWT token: no claim to read, so no proactive refresh.
+    return 0;
   }
 }
 

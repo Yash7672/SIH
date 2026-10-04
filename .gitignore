@@ -13,6 +13,15 @@ backend/data/uploads/
 dist/
 # Transient output of `npx expo export --output-dir .tmp-export`; rebuild-only.
 .tmp-export/
+# Scratch logs from verification runs (pytest, the live-scan benchmark, start.bat).
+# `.tmp*` specifically, because a launcher that redirects its own output passes
+# those handles on to every child it starts - so these stay locked, and therefore
+# undeletable, for exactly as long as the server it started is running.
+.tmp_*.txt
+# `scripts/render_live_view.py` writes annotated frames here. The older debug
+# dumps under data/debug_out/ are committed, but these are regenerable from a
+# fixture in the repo and would otherwise dirty the tree on every run.
+data/debug_out/live_view_*.jpg
 build/
 *.log
 .DS_Store

@@ -1,24 +1,52 @@
 /**
- * Projection maths for the live-detection overlay.
+ * Projection and tracking maths for the live-detection overlay.
  *
- * The server returns boxes normalised to 0..1 against the *captured image*.
- * The camera preview is a different rectangle that usually does not share the
+ * The server returns boxes normalised to 0..1 against the *captured image*. The
+ * camera preview is a different rectangle that usually does not share the
  * image's aspect ratio, so the boxes cannot simply be multiplied by the preview
  * size - they have to be mapped through the same cover/contain transform the
  * preview uses, or every box drifts away from the car it belongs to.
  *
+ * On top of the projection this module keeps the short-lived *track* state that
+ * makes the overlay look like a live CCTV feed rather than a slideshow:
+ *
+ *   - every rectangle is keyed by the server's track id, so a box follows its
+ *     car instead of flickering under a per-message key;
+ *   - a refreshed box is drawn where the car will be by the time the 150 ms
+ *     slide finishes (constant velocity from the last two positions, capped);
+ *   - a box that stops being reported fades out after 700 ms instead of
+ *     sticking to a car that has already driven off.
+ *
  * Kept free of React and of any react-native import so it can be unit tested
- * directly.
+ * directly with `node --test`.
  */
 
-export const VEHICLE_COLOR = "#FF8A00";
+export const VEHICLE_COLOR = "#22C55E";
 export const PLATE_COLOR = "#FF1F1F";
-export const VEHICLE_WIDTH = 2.5;
+export const VEHICLE_WIDTH = 3;
 export const PLATE_WIDTH = 3;
+// Box cap. A crowded junction can produce far more vehicles than are useful on
+// a phone screen; the nearest (largest) ones win. Plates are capped separately
+// and always kept, because a read plate is the whole point of the screen.
 export const MAX_BOXES = 20;
-// A box that vanishes after this long would otherwise flicker for ever on a
-// road where detection is intermittent.
-export const BOX_FADE_MS = 700;
+export const MAX_PLATE_BOXES = 8;
+// How long a slide between two reported positions takes, and how far ahead of
+// the newest report the box is drawn. They are the same number on purpose: the
+// animation then arrives exactly as the predicted box does.
+export const MOVE_MS = 150;
+export const LEAD_MS = MOVE_MS;
+export const FADE_MS = 220;
+export const BOX_EXPIRY_MS = 700;
+// A prediction is extrapolated from two samples. Samples closer together than
+// this carry no usable velocity (sub-pixel quantisation), so nothing is
+// extrapolated from them.
+export const MIN_PREDICT_DT = 40;
+// The extrapolation is clamped to this fraction of the box's own diagonal, so a
+// single jumpy detection can never fling a rectangle across the screen.
+export const PREDICTION_CAP = 0.75;
+// Height reserved for a chip, and the gap between a box and its chip.
+export const CHIP_H = 13;
+export const CHIP_GAP = 2;
 
 const clamp01 = (n) => (n < 0 ? 0 : n > 1 ? 1 : n);
 
@@ -94,45 +122,223 @@ export function projectBox(box, t) {
 
 const area = (b) => Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
 
+/** Fresh, empty overlay state. */
+export function createOverlayState() {
+  return {
+    // Track id -> record. Two independent maps on purpose: the `plates` and
+    // `plate` messages can arrive a moment after the `boxes` message for the
+    // same frame, and one missed box must not cost the plate chip.
+    vehicles: new Map(),
+    plates: new Map(),
+    image: { width: 0, height: 0 },
+  };
+}
+
+function upsert(map, id, box, now, patch) {
+  if (id == null) return null;
+  const key = String(id);
+  const prev = map.get(key);
+  if (prev) {
+    if (Array.isArray(box)) {
+      prev.prev = prev.box;
+      prev.prevAt = prev.at;
+      prev.box = box;
+    }
+    prev.at = now;
+    prev.fading = false;
+    prev.fadeAt = 0;
+    if (patch) Object.assign(prev, patch);
+    return prev;
+  }
+  const rec = {
+    id: key,
+    box: Array.isArray(box) ? box : null,
+    prev: Array.isArray(box) ? box : null,
+    at: now,
+    prevAt: now,
+    fading: false,
+    fadeAt: 0,
+    ...(patch || {}),
+  };
+  map.set(key, rec);
+  return rec;
+}
+
+/** Fold a `boxes` message into the state. `now` is injected so tests are deterministic. */
+export function applyBoxes(state, message, now) {
+  if (!message) return state;
+  if (message.w > 0 && message.h > 0) state.image = { width: message.w, height: message.h };
+  (message.vehicles || []).forEach((v) => {
+    upsert(state.vehicles, v.track, v.box, now, {
+      label: v.label || v.cls || null,
+      cls: v.cls != null ? v.cls : null,
+      score: typeof v.conf === "number" ? v.conf : null,
+    });
+  });
+  return state;
+}
+
+/** Fold a `plates` message (box only) into the state. */
+export function applyPlates(state, message, now) {
+  if (!message) return state;
+  (message.plates || []).forEach((p) => {
+    const rec = upsert(state.plates, p.track, p.box, now, {
+      // Detector confidence. The OCR confidence replaces it once the text is in.
+      score: typeof p.conf === "number" ? p.conf : null,
+      read: null,
+      stolen: false,
+    });
+    // A fresh box means the previous text is stale: the car moved and the new
+    // pixels have not been read yet.
+    if (rec) rec.read = null;
+  });
+  return state;
+}
+
+/** Fold a `plate` message (the OCR result) into the state. */
+export function applyPlateText(state, message, now) {
+  if (!message) return null;
+  const rec = upsert(state.plates, message.track, null, now, {});
+  if (!rec) return null;
+  rec.read = message.norm || message.text || null;
+  rec.raw = message.text || null;
+  rec.score = typeof message.conf === "number" ? message.conf : rec.score;
+  rec.valid = Boolean(message.valid);
+  // Only a *valid* read can raise an alert; a garbled one must never do so.
+  rec.stolen = Boolean(message.stolen) && Boolean(message.valid);
+  rec.label = message.label || rec.label || null;
+  return rec;
+}
+
 /**
- * Turn one server frame into the flat list the overlay renders.
- * Caps the count and keeps the largest boxes: when a busy junction produces
- * more than MAX_BOXES detections, the nearest cars are the useful ones.
+ * Extrapolate a box forward along its own velocity.
+ *
+ * `leadMs` of travel is applied from the two most recent positions. The result
+ * is clamped to PREDICTION_CAP of the box's own diagonal, and nothing is
+ * extrapolated when the last two samples are too close together to carry a
+ * velocity.
  */
-export function buildOverlayItems(message, preview, mode = "cover") {
-  if (!message) return [];
-  const t = computeTransform(preview, { width: message.w, height: message.h }, mode);
+export function predictBox(rec, leadMs = LEAD_MS) {
+  const box = rec.box;
+  if (!Array.isArray(box) || !Array.isArray(rec.prev)) return box;
+  const dt = rec.at - rec.prevAt;
+  if (!(dt >= MIN_PREDICT_DT)) return box;
+
+  const vx = (box[0] - rec.prev[0]) / dt;
+  const vy = (box[1] - rec.prev[1]) / dt;
+  let dx = vx * leadMs;
+  let dy = vy * leadMs;
+
+  const cap = PREDICTION_CAP * Math.hypot(box[2] - box[0], box[3] - box[1]);
+  const mag = Math.hypot(dx, dy);
+  if (mag > cap && cap > 0) {
+    dx = (dx / mag) * cap;
+    dy = (dy / mag) * cap;
+  }
+  return [box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy];
+}
+
+function chipBelowBox(rect, previewH) {
+  return rect.top + rect.height + CHIP_GAP + CHIP_H <= previewH;
+}
+
+/**
+ * Everything the overlay draws, in draw order.
+ *
+ * Pure: it reads the state and never writes to it. Expiry and fading are driven
+ * separately by `tick`.
+ */
+export function selectItems(state, preview, mode = "cover", now = 0) {
+  if (!state) return [];
+  const t = computeTransform(preview, state.image, mode);
   if (!t) return [];
 
-  const raw = [];
-  (message.vehicles || []).forEach((v, i) => {
-    raw.push({
-      key: `v${message.seq ?? 0}_${i}`,
+  const vehicles = [];
+  state.vehicles.forEach((rec, id) => {
+    if (!Array.isArray(rec.box)) return;
+    // A fading box holds its last position: sliding it while it dissolves looks
+    // like a bug, not like a car driving away.
+    const rect = projectBox(rec.fading ? rec.box : predictBox(rec), t);
+    if (!rect) return;
+    vehicles.push({
+      key: `v:${id}`,
+      id,
       kind: "vehicle",
       color: VEHICLE_COLOR,
       borderWidth: VEHICLE_WIDTH,
-      box: v.box || v,
-      label: v.cls || v.class || null,
-      score: v.conf != null ? v.conf : null,
+      rect,
+      area: area(rec.box),
+      label: rec.label,
+      chip: rec.label,
+      chipBelow: false,
+      score: rec.score,
+      fading: Boolean(rec.fading),
+      stolen: false,
     });
   });
-  (message.plates || []).forEach((p, i) => {
-    raw.push({
-      key: `p${message.seq ?? 0}_${i}`,
+  // Largest first, then capped: on a busy road the nearest cars are the useful
+  // ones and the far ones are three pixels tall.
+  vehicles.sort((a, b) => b.area - a.area);
+  const keptVehicles = vehicles.slice(0, MAX_BOXES);
+
+  const plates = [];
+  state.plates.forEach((rec, id) => {
+    if (!Array.isArray(rec.box)) return;
+    const rect = projectBox(rec.fading ? rec.box : predictBox(rec), t);
+    if (!rect) return;
+    const pct = typeof rec.score === "number" ? Math.round(rec.score * 100) : null;
+    plates.push({
+      key: `p:${id}`,
+      id,
       kind: "plate",
       color: PLATE_COLOR,
       borderWidth: PLATE_WIDTH,
-      box: p.box || p,
-      label: null,
-      score: p.conf != null ? p.conf : null,
+      rect,
+      area: area(rec.box),
+      // No text yet means the OCR is still running for this track.
+      chip: rec.read ? `${rec.read}${pct != null ? ` ${pct}%` : ""}` : "reading...",
+      reading: !rec.read,
+      chipBelow: chipBelowBox(rect, t.previewH),
+      score: rec.score,
+      valid: rec.valid,
+      fading: Boolean(rec.fading),
+      stolen: Boolean(rec.stolen),
     });
   });
+  plates.sort((a, b) => b.area - a.area);
 
-  const projected = [];
-  for (const item of raw) {
-    const rect = projectBox(item.box, t);
-    if (rect) projected.push({ ...item, rect, area: area(item.box) });
-  }
-  projected.sort((a, b) => b.area - a.area);
-  return projected.slice(0, MAX_BOXES);
+  return [...keptVehicles, ...plates.slice(0, MAX_PLATE_BOXES)];
+}
+
+/**
+ * Advance expiry. A box stops being drawn once it has faded out.
+ *
+ * Returns true when something changed, so the caller can skip a re-render for
+ * the (common) tick that changed nothing.
+ */
+export function tick(state, now) {
+  let changed = false;
+  const sweep = (map) => {
+    map.forEach((rec, id) => {
+      if (!rec.fading && now - rec.at >= BOX_EXPIRY_MS) {
+        rec.fading = true;
+        rec.fadeAt = now;
+        changed = true;
+      } else if (rec.fading && now - rec.fadeAt >= FADE_MS) {
+        map.delete(id);
+        changed = true;
+      }
+    });
+  };
+  sweep(state.vehicles);
+  sweep(state.plates);
+  return changed;
+}
+
+/** Drop every track. Used when the socket drops, so nothing survives a reconnect. */
+export function clearState(state) {
+  state.vehicles.clear();
+  state.plates.clear();
+  state.image = { width: 0, height: 0 };
+  return state;
 }

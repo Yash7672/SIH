@@ -8,10 +8,15 @@ Last full review: 2026-10-04, after the live-detection and Maps-heatmap work.
 RAKSHAK is a "Privacy-First Crowdsourced ANPR Vehicle Tracking System".
 
 - **Backend**: FastAPI (Python 3.12), PostgreSQL 17 (source of truth), Redis 7 (cache only).
-- **AI Engine**: YOLOv8n (`backend/models/yolov8n.pt`) for vehicles, a fine-tuned
-  YOLOv8n plate detector (`license-plate-finetune-v1n.pt`), RapidOCR (ONNX) for plate text.
-  Inference runs **on the PC backend**, never on the phone — Expo Go cannot run
-  native ML, and a frame that never leaves the process is a frame that cannot leak.
+- **AI Engine**: YOLOv8n COCO (`backend/models/yolov8n.pt`) for **vehicles** —
+  classes 2/3/5/7 → `CAR` / `BIKE` / `BUS` / `TRUCK`, and no other label is ever
+  emitted; a fine-tuned YOLOv8n plate detector (`license-plate-finetune-v1n.pt`);
+  RapidOCR (ONNX) for plate text. Inference runs **on the PC backend**, never on the
+  phone — Expo Go cannot run native ML, and a frame that never leaves the process is a
+  frame that cannot leak. Both models are loaded *and warmed* at startup
+  (`warm_live_models()`), because the first YOLO call costs ~4 s and the first OCR
+  call ~4.3 s, and paying that on the first volunteer frame is the difference
+  between "the app is broken" and "it takes a second".
 - **citizen_web**: Vite + React 18 SPA for filing complaints.
 - **police_dashboard**: Vite + React 18 SPA for officers.
 - **mobile_app**: Expo SDK 58 / React Native app for volunteers and officers.
@@ -54,12 +59,13 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/models/models.py` | SQLAlchemy models | `User`, `Device`, `Complaint`, `Hotlist`, `Sighting`, `AuditLog` |
 | `backend/app/services/` | Business logic | `hotlist_service.py`, `sighting_service.py`, `plate.py`, `cache.py`, `seed.py` |
 | `backend/app/ws/manager.py` | Police alert fan-out (`alert_manager`) | `broadcast()` |
+| `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget) and `ScanConnection` (in-flight slots, OCR claims, device) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `render_live_view.py`, `make_test_road_scene.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
-| `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/components/LiveDetectionOverlay.js` |
+| `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |
 | `data/generated/` | Demo media for tests (gitignored) | `demo_road.mp4`, `plate_*.png` |
 
 ## API Route Table
@@ -104,46 +110,129 @@ Auth via `?token=` query param **or** a first `{type:"auth"}` message. Server pu
 ### `/api/v1/ws/scan` — live detection (volunteer phone)
 Only mounted when `DEMO_MODE` is true. Max 3 concurrent connections.
 
-Protocol:
+Protocol — **three** replies per frame, not one, and the split is the whole design:
 
 ```
 → {"type":"auth","token":"<jwt>","device_id":"<uuid>"}   (must be first; 10 s timeout)
 ← {"type":"ready"}
-→ {"type":"frame","seq":1,"w":640,"h":480,"lat":17.36,"lng":78.51,"jpeg_b64":"…"}
-← {"type":"boxes","seq":1,"w":640,"h":480,"ms":244,"vehicles":[…],"plates":[…]}
-← {"type":"plate","plate_id":0,"seq":1,"text":"…","norm":"MH12JK4567","conf":0.99,"valid":true,"stolen":true}
-← {"type":"error","code":"size_limit"|"missing_model", …}
+→ {"type":"frame","seq":1,"w":1280,"h":844,"lat":17.36,"lng":78.51,"jpeg_b64":"…"}
+← {"type":"boxes","seq":1,"w":1280,"h":844,"ms":60,"vehicles":[{"track":1,"label":"CAR 1","cls":2,"conf":0.82,"box":[…]}]}
+← {"type":"plates","seq":1,"plates":[{"track":1,"conf":0.44,"box":[…]}]}
+← {"type":"plate","track":1,"label":"CAR 1","seq":1,"text":"…","norm":"MH12JK4567","conf":0.997,"valid":true,"stolen":true}
+← {"type":"error","code":"size_limit"|"bad_frame"|"missing_model", …}
 ← {"type":"ping"|"pong"}                                  (server pings every 20 s)
 ```
 
+- Three replies because both detector passes plus decode measure ~190 ms here, so one
+  message would put every green box behind the plate pass. `boxes` goes out at
+  ~60 ms p50, `plates` at ~150 ms, and `plate` seconds later. The client keys both
+  rectangles off `track`, so a plate box arriving a frame late still lands in the
+  right vehicle.
 - The token travels in the first message, **never in the URL**.
-- Close codes: `4401` bad/missing token or auth timeout, `4403` role or device rejected.
-- Boxes are normalised 0..1 against the captured image. Vehicles `#FF8A00` @2.5 px,
-  plates `#FF1F1F` @3 px.
-- **Frame size is handled by downscaling, never by refusing.** `SOFT_FRAME_BYTES`
-  (300 KB) is the point past which `decode_and_infer` resizes to `WORKING_WIDTH`
-  (1280 px); `HARD_FRAME_BYTES` (8 MB) is an abuse ceiling that returns
-  `size_limit`. This replaced a flat 300 KB reject that silently killed live
-  detection on any phone with a modern sensor — a 12 MP capture is ~500 KB even at
-  JPEG 0.3, so *every* frame was dropped and the app looked like it had no
-  detector at all. The app additionally resizes on-device
-  (`prepareLiveFrame`, a width × quality ladder measured against the real payload)
-  so a normal frame never needs the server-side fallback.
-- **Latency contract**: boxes go out as soon as detection finishes (~240 ms p50).
-  OCR costs ~2 s per crop on CPU, so plate text is decoded on a separate single-worker
-  thread pool and arrives later as a `plate` message. It never blocks the frame path.
-- Backpressure: latest-frame-wins (a frame arriving while one is in flight is dropped),
-  15 fps per device. Note the server drops the whole burst while a frame is in
+- Close codes: `4401` bad/missing token or auth timeout, `4403` role or device
+  rejected, `4404` too many connections, `1013` server shutting down.
+- **Vehicle model is YOLOv8n COCO** (`backend/models/yolov8n.pt`, downloaded
+  idempotently by `start.bat`). Classes 2/3/5/7 → `CAR` / `BIKE` / `BUS` / `TRUCK`,
+  and **no `AUTO` label is ever emitted** — COCO has no auto-rickshaw class, and
+  `plate_model_source/` ships no Indian vehicle detector, so a chip that said "AUTO"
+  could never be true. Numbers are per class, reusing the lowest free one.
+- Tracking is **per connection** (`backend/app/ws/scan_manager.py`, one
+  `VehicleTracker` per socket, never shared). The detector alone only answers
+  "there is a car at […]"; without ids the overlay re-keys every rectangle each
+  frame and "CAR 1 / CAR 2" shuffle by confidence order. Ids are never recycled
+  inside a connection, so a `plate` reply arriving seconds late cannot paint a
+  stolen plate onto a different car.
+- Boxes are normalised 0..1 against the captured image. Vehicles `#22C55E` @3 px with
+  a solid green chip, plates `#FF1F1F` @3 px with a red chip carrying the text and
+  confidence (`"reading…"` before it lands).
+- **`WORKING_WIDTH` is 1280, not 640, and that is a measured decision.** On
+  `data/test_plates/road_scene.jpg`:
+  - 640 px input → plate is 90×18 px → OCR returns nothing at all.
+  - 960 px → 139×28 px → reads only at q40, and *worse* at q60/q80.
+  - 1280 px → 185×39 px → reads 0.991 (q40) … 0.996 (q80).
+
+  1280 is also faster to serve (no resize; a 1280→960 PIL bilinear costs more than
+  the JPEG decode it saves) and it is the width `expo-camera` gives both the preview
+  and the capture anyway. On Android `pictureSize` feeds *both* the Preview and the
+  ImageCapture `ResolutionSelector` (`ExpoCameraView.kt`), so a small value would
+  blur the live preview, not just the frames.
+- `PLATE_IMGSZ` stays 640 and `PLATE_CONF`/normalisation in `ai/` are **untouched**:
+  the plate reading is already correct and must stay byte-for-byte identical. Only
+  `VEHICLE_IMGSZ` moved (416 → 384). ultralytics costs ~50 ms fixed per call on
+  this CPU, which is why the plate detector runs **once per frame** and each plate is
+  matched to the smallest vehicle box containing its centre.
+- **Frame size is two bands, not one cap.** `SOFT_FRAME_BYTES` (300 KB) is logged and
+  the client downscales; `HARD_FRAME_BYTES` (400 KB) returns `size_limit`. This
+  replaced a flat 300 KB reject that silently killed live detection on any phone with
+  a modern sensor. The client (`liveCapture.js`) resizes on-device so a normal frame
+  never needs the server-side fallback, and the server refuses rather than decodes
+  anything over the ceiling.
+- **Two in-flight slots, one per stage** (`ScanConnection.frame_processing` /
+  `plate_processing`). Holding one slot across both stages made the server refuse the
+  next frame for the whole plate pass (~60–400 ms) while the phone — which paces on
+  `boxes` — offers its next frame ~120 ms later: roughly 1 frame in 10 was thrown
+  away and the phone saw a stalled feed. Splitting them took the stream benchmark
+  from 1.2 fps / 2 unanswered to 4.5 fps / 0 unanswered.
+- **OCR is capacity-gated** (`OCR_MAX_IN_FLIGHT = 2`, `OcrClaim`). OCR costs ~2 s per
+  crop while a frame is ~200 ms, so an ungated stream grows the queue without limit
+  and every queued crop burns cores the green boxes need. A track already in the
+  pipeline is skipped *without* spending one of its `MAX_READ_ATTEMPTS`, otherwise a
+  track could be settled after three gated-out frames and never read at all.
+- **Read budget**: `MAX_READS_PER_FRAME = 3` crops per frame, `MIN_PLATE_PX = 45`,
+  `MAX_READ_ATTEMPTS = 3` per track, stopping at `PLATE_CONF_DONE = 0.8`. Both the
+  per-frame and the pixel minimum were tightened downward while nothing was reaching
+  this code, which is how a frame with a third plate in view ended up silently unread.
+- Backpressure: latest-frame-wins (a frame arriving while one is in flight is
+  dropped), 15 fps per device. The server drops the whole burst while a frame is in
   flight, so it answers the frame it accepted rather than the newest one; newest-wins
   is the client's job (`liveScan.js` overwrites `_pending`).
-- **Read budget**: `MAX_READS_PER_FRAME = 3` crops per frame and `MIN_PLATE_PX = 45`.
-  Both were tightened downward while nothing was reaching this code, which is how a
-  frame with a third plate in view ended up silently unread.
 - Privacy: a plate that is **not** hot-listed is read, returned to that one phone, and
   then discarded. It is never stored, never counted anywhere, and never broadcast.
 - Every processed frame also feeds the density grid: `traffic_accumulator.add(lat, lng,
   vehicles)` is called right after inference. It receives a coordinate and a per-class
   tally only — no plate, no image, no device id.
+
+### The phone side — how the live view is put together
+
+| File | Role |
+| --- | --- |
+| `src/screens/ScannerScreen.js` | All I/O: device registration, location, socket, capture loop, vibration, the event log. Renders the view component. |
+| `src/components/ScannerScreenNew.js` | Presentation only (memoised): camera fills the top ~65%, compact panel below (last plate + confidence, stolen banner, recent events, LIVE/RECONNECTING/OFFLINE pill, fps + latency). |
+| `src/services/liveCapture.js` | `LiveCaptureLoop` — one async loop, never two captures at once. Deps injected so the pacing logic is testable off-device. |
+| `src/services/liveScan.js` | The socket. One instance, StrictMode-safe, re-auth on token refresh, seq-gated acks. |
+| `src/components/liveOverlayStore.js` | External store (`useSyncExternalStore`) holding the current boxes. |
+| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 37 unit tests, no React, no native. |
+| `src/components/LiveDetectionOverlay.js` | Draws the rectangles. Reads the store directly. |
+
+Four decisions that are load-bearing, and would be easy to undo by accident:
+
+- **The overlay is an external store, not React state.** `CameraView` renders the
+  video; if every `boxes` message were `useState`, the whole screen would re-render
+  several times a second and the preview would stutter. The overlay subscribes to the
+  store, and only the rectangles move.
+- **The projection is pure and separately tested.** The frame is 4:3 and the preview is
+  a taller crop of it, so the mapping is cover-with-crop, not a plain scale —
+  `liveOverlayMath.js` is where that lives, with the 4:3-on-a-taller-preview case
+  pinned as a test.
+- **Animation is `Animated` with `useNativeDriver`, not Reanimated.** Reanimated is not
+  installed. Only `transform` and `opacity` are animated, and only `translateX/Y` +
+  `opacity` are used — those are the properties that can go on the native thread.
+- **`skipProcessing: false` in `CAPTURE_OPTIONS`.** This is the bug that made live
+  detection look dead: `skipProcessing: true` returns EXIF `width`/`height` that are
+  often `-1` and *ignores* `quality`, so every frame arrived with a bogus size and a
+  full-size payload. Verified against the installed expo-camera 58.0.7 source
+  (`Options.kt`), not from memory.
+- **`MIN_PICTURE_WIDTH` is 1280 and it is not negotiable.** The plate detector +
+  OCR need it: at 640 the plate is 90×18 px and OCR returns *nothing*; at 960 it
+  reads only at q40 and gets *worse* at higher quality; at 1280 it reads 0.991–0.996.
+  On Android `pictureSize` also feeds the Preview `ResolutionSelector`
+  (`ExpoCameraView.kt` builds one selector and hands it to both use cases), so a
+  narrower capture would blur the preview as well — two reasons for the same floor.
+
+Removed on purpose: the Scan-plate shutter button, the guide frame, the dashed
+rectangle and the hint strip. There is no shutter on a live feed, and text drawn over
+the plate area lowers plate-read accuracy on screen. `useKeepAwake` is held only
+while the stream is actually running, so the rest of the app still sleeps.
 
 ## Maps Heatmap
 
@@ -246,15 +335,52 @@ PC on the network.
 | `test_geo.py` | `/geo/heat` RBAC, bbox / window / class validation, hour-bucket window trap |
 | `test_heat_layers.py` | per-frame density, min-frames threshold, time decay, no-attribution |
 | `test_traffic_grid.py` | cell maths, GPS-fix rejection, batching, failed-flush retention, retention sweep |
-| `test_live_scan_frames.py` | oversized frame downscaled not dropped, ceiling ordering, aspect ratio, read budget |
+| `test_live_scan_frames.py` | working width matches what the app sends, ceiling ordering, aspect ratio, read budget |
+| `test_live_scan_ws.py` | the whole wire contract end-to-end with the detectors stubbed: `boxes`/`plates`/`plate` ordering, per-connection trackers, auth + RBAC close codes, latest-frame-wins, split in-flight slots, OCR queue depth, privacy (a non-hot-listed plate stores nothing) |
+| `test_scan_tracker.py` | `VehicleTracker`: IoU matching, id stability, per-class chip numbering, expiry, plate read budget |
 
 Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
+167 tests, all passing (`pytest -q -p no:randomly`, ~90 s).
+
 `scripts/live_scan_test.py` is the live-path check (needs the backend running) —
-16 checks covering auth rejection, RBAC, streaming throughput, the stolen-vehicle
-alert, the no-imagery-leaves-the-host guarantee, oversized-frame handling, and
-stale-frame dropping.
-Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test.js`.
+24 checks covering auth rejection, RBAC, a self-calibrating probe of what the OCR
+actually reads, streaming throughput, the stolen-vehicle alert, the
+no-imagery-leaves-the-host guarantee, both frame-size bands, and stale-frame
+dropping. It registers a **fresh device id per phase** because the sighting
+cooldown key is `plate:<plate>:<device id>`, and it hard-codes no plate name: the
+probe learns one from the fixture and asserts against that.
+
+Its input fixture, `data/test_plates/road_scene.jpg`, is built by
+`scripts/make_test_road_scene.py` (`--check` re-verifies it): an MIT-licensed
+sample road photo with the project's own synthetic plate renderer composited over
+the photo's blurred plate region. Real photos of Indian roads with a legible plate
+are not redistributable, and a synthetic plate on a real background is the only way
+to keep a *fixed* expected plate string in a committed fixture. Multi-vehicle
+behaviour is covered by the deterministic `VehicleTracker` unit tests instead.
+
+Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test.js`
+(37 tests — run it from `mobile_app`, with the explicit file path).
+
+### `scripts/render_live_view.py`
+
+Draws what the phone would draw — green `#22C55E` vehicle rectangles with a solid chip,
+red `#FF1F1F` plate rectangles with the text and confidence below — onto
+`data/test_plates/road_scene.jpg`, for `--repeat N --motion 0.035` consecutive panned
+frames so the tracking and the prediction can be eyeballed. `--hotlist` reads the real
+hot-list table so a stolen plate is drawn the way it will actually appear.
+
+This script earned its place by finding a real bug: it scaled `y` by the frame *width*,
+which stretched every rectangle 1.52× down the image and looked plausible in a thumbnail.
+`_to_px(box, width, height)` is now the only place normalised coordinates become pixels,
+and the row/column runs it prints are checkable numerically when you cannot eyeball the
+image. It draws with `cv2.getTextSize` / `putText` on purpose — no Pillow — so it agrees
+with the model pipeline about what a pixel is.
+
+### `scripts/make_test_road_scene.py`
+
+Builds and (`--check`) verifies `data/test_plates/road_scene.jpg`. See the fixture note
+under Tests above for why the fixture is composited rather than photographed.
 
 ## Police Dashboard Routes
 
@@ -296,29 +422,48 @@ area uniformly pale.
   unaffected — but the bus is not there.
 - **Expo SDK patch drift**: `expo-doctor` 19/20. Installed versions are one patch behind
   what SDK 58 wants (`expo` 58.0.2 vs ~58.0.3, `expo-camera` 58.0.7 vs ~58.0.8,
-  `expo-font`, `expo-image-manipulator`, `expo-location`, `expo-splash-screen`). Everything
-  bundles and runs; left alone deliberately to avoid re-resolving `node_modules`.
+  `expo-font`, `expo-image-manipulator`, `expo-location`, `expo-splash-screen`). This
+  predates the live-view work and is still deliberately left alone: the live capture
+  options are pinned against the **installed** expo-camera 58.0.7 native source
+  (`Options.kt`, `ExpoCameraView.kt`) — `skipProcessing`, `shutterSound`'s Android
+  default and the shared Preview/ImageCapture `ResolutionSelector` were all read out of
+  that tree, not out of a changelog. Bumping a patch to silence a cosmetic warning would
+  invalidate every one of those facts and could not be re-validated here, because no
+  device build can be run in this environment. `expo-keep-awake` (the one package this
+  work added) is at the version SDK 58 wants.
 - **`backend/data/uploads/`**: `STORAGE_LOCAL_PATH` is the relative `./data/uploads`, so
   running pytest or uvicorn from `backend/` creates a second uploads tree that the root
   `.gitignore` rule never matched. Now ignored explicitly.
 - **`tree.txt`** at the repo root is a leftover scratch file from an earlier session; untracked.
 - **`scripts/start.sh` is syntax-unverified**: no WSL on this machine, so `bash -n` cannot
   run. The `PYTHONPATH` fix it carries is mirrored from `start.ps1` and untested there.
-- **Live-scan latency is ~240 ms p50 / ~570 ms p95**, not the 150 ms originally targeted.
-  Both models together are ~110 ms; the rest is JPEG decode, base64, JSON and thread
-  contention with the OCR pool on a 5-core i5. OCR is already off the hot path, so this is
-  a CPU budget, not an architecture problem. Roughly 3–4 effective fps per phone.
+- **Live-scan latency is ~60 ms p50 / ~200 ms p95 for the green boxes**, against the
+  120 ms p50 target, with plate boxes at ~150 ms / ~520 ms and the OCR text seconds
+  after that. Measured end-to-end over the real WebSocket with the real models:
+  4.5 fps per phone, 0 unanswered frames, 95 s CPU over 20 s wall (4.7 cores) on an
+  8-core box. The earlier ~240 ms figure was two things at once: the old single
+  `boxes` message that waited for the plate pass too, and one in-flight slot held
+  across both stages. Splitting the stages and answering `boxes` first is what moved
+  it.
 - **The demo road video yields plate detections but no COCO vehicle detections**, so a live
   `/ws/scan` run writes cells with `frames = N` and all vehicle counts zero. That is correct
   (an empty road is low density, not missing data) but means real density needs a real road.
   `scripts/seed_traffic.py` is what fills the map for a demo.
-- **`backend/app/ws/scan_manager.py` is an abandoned draft.** It holds a `ScanConnection`
-  dataclass and an `IoUTracker` with no imports and no `scan_manager` instance, and
-  `ws.py` had been edited to import from it — which broke the whole app at import time.
-  Reverted; the file is untracked and unreferenced. Live scan lives in
-  `app/api/v1/live_scan.py`. Extracting it is still reasonable, but as a deliberate
-  refactor with the tracking behaviour ported deliberately, not left half-wired.
 - **`scripts/e2e_verify.py` crashes on a cp1252 console** when a plate OCR reason
   contains a non-ASCII fragment (`UnicodeEncodeError` on `型`). Harmless to the checks
   themselves — run with `PYTHONIOENCODING=utf-8` — but the script should set
   `sys.stdout.reconfigure(encoding="utf-8")` so a plain run does not die.
+- **The phone-side frame rate, preview smoothness and on-screen box alignment cannot be
+  verified in this environment.** Everything measurable was measured against a real
+  WebSocket with the real models and the real fixture, and every line of drawing maths
+  is unit-tested, but three things need a device in a hand:
+  1. the actual capture rate — `takePictureAsync` on a real sensor is slower than the
+     loop's own pacing assumes, and `liveCapture.js` backs off when the round trip
+     exceeds 800 ms, so the phone will settle below the benchmark's 4.5 fps;
+  2. whether the preview stutters while frames are in flight;
+  3. whether the rectangles land on the plates — i.e. whether the cover-with-crop
+     projection in `liveOverlayMath.js` agrees with what `CameraView`'s
+     `ResolutionSelector` actually puts on screen. Its 4:3-frame-on-a-taller-preview
+     case is a unit test of the maths, which is not the same claim.
+  `scripts/render_live_view.py` covers the geometry against a still image, and it is
+  worth running by eye on the three output frames before trusting the projection.
