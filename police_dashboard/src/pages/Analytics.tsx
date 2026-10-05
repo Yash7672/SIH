@@ -23,10 +23,20 @@ interface LocationRow {
   time: string;
 }
 
+interface TrafficSnapshot {
+  hours: number;
+  total_volume: number;
+  busiest_hour: { hour: string | null; count: number };
+  by_hour: { hour: string | null; count: number }[];
+  busiest_cells: { lat: number; lng: number; count: number; frames: number }[];
+  class_mix: { vehicle_class: string; count: number }[];
+}
+
 export default function Analytics() {
   const [byHour, setByHour] = useState<HourBucket[]>([]);
   const [matches, setMatches] = useState<MatchRow[]>([]);
   const [locations, setLocations] = useState<LocationRow[]>([]);
+  const [traffic, setTraffic] = useState<TrafficSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -37,8 +47,9 @@ export default function Analytics() {
       api.get<{ hour: string; count: number }[]>("/analytics/detections"),
       api.get<MatchRow[]>("/analytics/hotlist-matches"),
       api.get<LocationRow[]>("/analytics/locations"),
+      api.get<TrafficSnapshot>("/analytics/traffic?hours=24"),
     ])
-      .then(([h, m, l]) => {
+      .then(([h, m, l, t]) => {
         if (cancelled) return;
         if (h.status === "fulfilled") {
           setByHour(
@@ -55,6 +66,7 @@ export default function Analytics() {
         }
         if (m.status === "fulfilled") setMatches(m.value.data);
         if (l.status === "fulfilled") setLocations(l.value.data);
+        if (t.status === "fulfilled") setTraffic(t.value.data);
       })
       .finally(() => !cancelled && setLoading(false));
     return () => {
@@ -101,6 +113,63 @@ export default function Analytics() {
                 <DetectionsChart data={byHour} />
               </Suspense>
             </div>
+          )}
+        </Card>
+
+        <Card padding="none">
+          <div className="p-5 pb-0">
+            <CardHeader title="Traffic snapshot" subtitle="Last 24 hours of anonymous counts." />
+          </div>
+          {traffic ? (
+            <div className="space-y-4 p-5">
+              <div className="flex items-center justify-between rounded-xl bg-surface-bg px-3 py-2">
+                <span className="text-xs uppercase tracking-[0.12em] text-surface-muted">Total volume</span>
+                <span className="text-xl font-semibold text-surface-text">{traffic.total_volume}</span>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-surface-border p-3">
+                  <p className="text-xs uppercase tracking-[0.12em] text-surface-muted">Busiest hour</p>
+                  <p className="mt-2 text-sm font-medium text-surface-text">
+                    {traffic.busiest_hour.hour ? new Date(traffic.busiest_hour.hour).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" }) : "—"}
+                  </p>
+                  <p className="text-xs text-surface-muted">{traffic.busiest_hour.count} vehicles</p>
+                </div>
+                <div className="rounded-xl border border-surface-border p-3">
+                  <p className="text-xs uppercase tracking-[0.12em] text-surface-muted">Top class</p>
+                  <p className="mt-2 text-sm font-medium text-surface-text">
+                    {traffic.class_mix[0]?.vehicle_class || "—"}
+                  </p>
+                  <p className="text-xs text-surface-muted">{traffic.class_mix[0]?.count || 0} counted</p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {traffic.class_mix.map((row) => (
+                  <div key={row.vehicle_class} className="flex items-center justify-between text-sm">
+                    <span className="truncate text-surface-text">{row.vehicle_class.replace("_", " ")}</span>
+                    <span className="font-medium text-surface-muted">{row.count}</span>
+                  </div>
+                ))}
+              </div>
+              {traffic.busiest_cells.length > 0 ? (
+                <div className="space-y-2">
+                  <p className="text-xs uppercase tracking-[0.12em] text-surface-muted">Busiest grid cells</p>
+                  {traffic.busiest_cells.slice(0, 4).map((cell) => (
+                    <div key={`${cell.lat},${cell.lng}`} className="flex items-center justify-between text-sm">
+                      <span className="truncate text-surface-text">
+                        {cell.lat.toFixed(3)}, {cell.lng.toFixed(3)}
+                      </span>
+                      <span className="font-medium text-surface-muted">{cell.count}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <EmptyState
+              icon={<BarChart3 className="h-6 w-6" aria-hidden />}
+              title="No traffic data yet"
+              description="Scan with the phone app, or run scripts/seed_traffic.py for demo counts."
+            />
           )}
         </Card>
 

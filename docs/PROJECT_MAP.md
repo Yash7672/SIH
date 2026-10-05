@@ -96,7 +96,7 @@ Roles are enforced by `app/api/deps.py` (`require_cop`, `require_volunteer`, `re
 | POST | `/api/v1/devices/register` | VOLUNTEER, COP |
 | POST | `/api/v1/devices/{id}/revoke` | ADMIN |
 | GET | `/api/v1/alerts` | COP, ADMIN |
-| GET | `/api/v1/analytics/{overview,detections,hotlist-matches,locations}` | COP, ADMIN |
+| GET | `/api/v1/analytics/{overview,detections,hotlist-matches,locations,traffic}` | COP, ADMIN |
 | POST | `/api/v1/scanner/scan` | VOLUNTEER, COP |
 | GET | `/api/v1/geo/heat` | COP, ADMIN |
 
@@ -525,11 +525,26 @@ area uniformly pale.
 
 ## Found but not working or missing
 
-- **Event bus**: source is **gone**. `backend/app/services/bus/` contains only stale
-  `__pycache__` (`base`, `factory`, `kafka`, `redis_streams`, `__init__`); no `.py` files
-  remain. Git history shows them in `9e2c419`/`d2a6196`, so the Python files were dropped
-  in the GitHub restore and the `.pyc` files survived. Nothing imports it, so the app is
-  unaffected — but the bus is not there.
+- **Event bus / OD-flow pipeline: deliberately not merged.** `maps-feature` (`9e2c419`,
+  parent `d2a6196` "wip: interrupted maps session snapshot") carried a second, unfinished
+  traffic stack — `services/bus/` (redis-streams + Kafka), `ingest.py` / `ingest_consumer.py`
+  / `ingest_service.py`, `maps.py` / `maps_service.py`, `traffic_sim.py`, `geo_support.py`,
+  `plate_fuzzy.py`, `0003_maps_traffic_od_cameras.py`, `test_maps.py`. It defines its **own
+  `traffic_cells`** (`camera_id`, `vehicle_class`, `count`) against the same table name this
+  branch uses (`frames`, `two_wheeler`, `car`, `bus`, `truck`, no camera), and its migration
+  claims revision id `0003` alongside `0003_traffic_cells.py`. Both cannot be true at once,
+  and two writers with different count semantics would corrupt the verified heatmap. The
+  merge therefore keeps this branch's grid, its `/api/v1/geo/heat` and its `0003_traffic_cells`
+  migration, and takes from the branch only what does not collide: the `/analytics/traffic`
+  snapshot (rewritten onto this grid — it reports per-hour volume, per-class mix and the
+  busiest grid cells, not cameras, because the grid has no camera dimension) and the
+  "View heat" link on `VehicleDetail`. The branch itself is untouched, so the dropped code
+  is still reachable at `maps-feature`.
+- **Demo camera seeding**: the `Camera` model, `cameras`/`od_flows` tables, `seed_cameras()`
+  and the synthetic traffic simulator were dropped with the rest of that stack — nothing on
+  this branch writes or reads them. `/api/v1/maps/*` (`/cameras`, `/traffic`, `/od-flows`,
+  `/summary`) therefore does not exist; the dashboard's only map data source is
+  `GET /api/v1/geo/heat`.
 - **Expo SDK patch drift**: `expo-doctor` 19/20. Installed versions are one patch behind
   what SDK 58 wants (`expo` 58.0.2 vs ~58.0.3, `expo-camera` 58.0.7 vs ~58.0.8,
   `expo-font`, `expo-image-manipulator`, `expo-location`, `expo-splash-screen`). This
