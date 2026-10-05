@@ -163,7 +163,7 @@ test("out-of-range coordinates are clamped, not trusted", () => {
 
 // ---- drawing rules ------------------------------------------------------- //
 
-test("vehicles are green and plates are red, with the spec widths", () => {
+test("vehicles are green, and a plate's colour is its verdict, with the spec widths", () => {
   const state = createOverlayState();
   seed(state, [{ track: 1, label: "CAR 1", cls: "car", conf: 0.8, box: [0.1, 0.1, 0.4, 0.6] }], [
     { track: 1, conf: 0.4, box: [0.2, 0.3, 0.3, 0.38] },
@@ -175,11 +175,99 @@ test("vehicles are green and plates are red, with the spec widths", () => {
   assert.equal(v.color, VEHICLE_COLOR);
   assert.equal(v.borderWidth, 3);
   assert.equal(v.borderWidth, VEHICLE_WIDTH);
-  assert.equal(p.color, "#FF1F1F");
+  // A plate that has not been read is not red. It used to be, which put a
+  // STOLEN-looking box under every ordinary car on the road.
   assert.equal(p.color, PLATE_COLOR);
+  assert.notEqual(p.color, "#FF1F1F");
   assert.equal(p.borderWidth, 3);
   assert.equal(p.borderWidth, PLATE_WIDTH);
   assert.equal(v.chip, "CAR 1", "the chip names the class and the track number");
+});
+
+test("plate box colour follows the verdict, and only STOLEN is red", () => {
+  const cases = [
+    { state: "STOLEN", color: "#FF1F1F" },
+    { state: "POSSIBLE", color: "#F59E0B" },
+    { state: "CLEAR", color: PLATE_COLOR },
+    { state: "UNREAD", color: "#9CA3AF" },
+  ];
+  for (const { state, color } of cases) {
+    const state_ = createOverlayState();
+    seed(state_, [{ track: 1, label: "CAR 1", box: [0.1, 0.1, 0.4, 0.6] }], [
+      { track: 1, conf: 0.4, box: [0.2, 0.3, 0.3, 0.38] },
+    ], 1000);
+    applyPlateText(state_, {
+      track: 1,
+      text: "DL1ZA9092",
+      norm: "DL1ZA9092",
+      conf: 0.95,
+      valid: true,
+      verdict: { state, plate: "DL1ZA9092", confidence: 0.95, reads: 2 },
+    }, 1050);
+    const plate = selectItems(state_, PREVIEW, "cover", 1200).find((i) => i.kind === "plate");
+    assert.equal(plate.color, color, `verdict ${state}`);
+    assert.equal(plate.state, state);
+    assert.equal(plate.stolen, state === "STOLEN", "only STOLEN pulses");
+  }
+});
+
+test("the chip marks each character the server was unsure about", () => {
+  const s = createOverlayState();
+  seed(s, [{ track: 1, label: "CAR 1", box: [0.1, 0.1, 0.4, 0.6] }], [
+    { track: 1, conf: 0.4, box: [0.2, 0.3, 0.3, 0.38] },
+  ], 1000);
+  applyPlateText(s, {
+    track: 1,
+    text: "DL1ZA9092",
+    norm: "DL1ZA9092",
+    conf: 0.86,
+    valid: true,
+    verdict: { state: "POSSIBLE", plate: "DL1ZA9092", confidence: 0.86, reads: 1, weak: [3, 6] },
+  }, 1050);
+  const plate = selectItems(s, PREVIEW, "cover", 1200).find((i) => i.kind === "plate");
+  // DL1ZA9092 with index 3 (the Z, the character this whole exercise is about)
+  // and index 6 doubtful. Counting: D0 L1 1(2) Z(3) A(4) 9(5) 0(6) 9(7) 2(8).
+  assert.equal(plate.chip, "DL1Z?A90?92 86%");
+});
+
+test("an out-of-range weak index marks nothing rather than the wrong character", () => {
+  const s = createOverlayState();
+  seed(s, [{ track: 1, label: "CAR 1", box: [0.1, 0.1, 0.4, 0.6] }], [
+    { track: 1, conf: 0.4, box: [0.2, 0.3, 0.3, 0.38] },
+  ], 1000);
+  applyPlateText(s, {
+    track: 1,
+    text: "MH12JK4567",
+    norm: "MH12JK4567",
+    conf: 0.9,
+    valid: true,
+    verdict: { state: "CLEAR", plate: "MH12JK4567", confidence: 0.9, reads: 1, weak: [99, -1] },
+  }, 1050);
+  const plate = selectItems(s, PREVIEW, "cover", 1200).find((i) => i.kind === "plate");
+  assert.equal(plate.chip, "MH12JK4567 90%", "a bad index must not shift the marks");
+});
+
+test("the verdict, not a second client-side check, decides the state", () => {
+  const s = createOverlayState();
+  seed(s, [{ track: 1, label: "CAR 1", box: [0.1, 0.1, 0.4, 0.6] }], [
+    { track: 1, conf: 0.4, box: [0.2, 0.3, 0.3, 0.38] },
+  ], 1000);
+  // A server that says POSSIBLE on a read the client could have been confident
+  // about, and a server that says STOLEN on a read the client would have
+  // rejected. The client must pass both through unchanged - that is the whole
+  // point of moving the decision to one place.
+  for (const state of ["POSSIBLE", "STOLEN"]) {
+    applyPlateText(s, {
+      track: 1,
+      text: "DL12AG092",
+      norm: "DL12AG092",
+      conf: 0.62,
+      valid: true,
+      verdict: { state, plate: "DL12AG092", confidence: 0.62, reads: 2 },
+    }, 1050 + state.length);
+    const plate = selectItems(s, PREVIEW, "cover", 1200).find((i) => i.kind === "plate");
+    assert.equal(plate.state, state, `verdict ${state} must survive verbatim`);
+  }
 });
 
 test("a plate with no OCR text yet says so instead of showing an empty chip", () => {

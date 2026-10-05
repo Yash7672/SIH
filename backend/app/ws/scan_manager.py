@@ -327,6 +327,49 @@ class ScanConnection:
     # alternative - widening `infer_plates`' return type - would reach every
     # caller of it, including the offline helper.
     orphan_boxes: dict = field(default_factory=dict)
+    # Per-track read history and the verdict derived from it. Keyed by tid and
+    # owned by the connection, not by `Track`, because the decision has to survive
+    # the track being re-used for the next frame's box while still belonging to
+    # that one car - and because a track that leaves takes its evidence with it.
+    verdicts: dict = field(default_factory=dict)
+    # Track ids the server has asked the phone for a higher-resolution frame
+    # about. A plate narrower than the threshold is being read from too few pixels
+    # to trust, and the only cure is more pixels, which only the phone can supply.
+    hires_pending: set = field(default_factory=set)
+    # When the last `need_hires` went out. Rate-limited process-wide per
+    # connection because a hi-res frame costs ~300 KB of upload and a second of
+    # encode, and a car parked in view would otherwise ask for one every frame.
+    last_hires_at: float = 0.0
+    # Set when the server has asked for one, so the next frame is understood to be
+    # the hi-res one even if it arrives before the plate pass that asked for it.
+    hires_active: bool = False
+
+    def verdict_for(self, tid: int, now: Optional[float] = None) -> "TrackVerdict":
+        """The read history for one track, created on first use.
+
+        Imported lazily so `scan_manager` stays importable without the service
+        layer - the WebSocket protocol tests build connections directly.
+        """
+        from app.services.plate_verdict import TrackVerdict
+
+        existing = self.verdicts.get(tid)
+        if existing is None:
+            existing = TrackVerdict(tid, now=now)
+            self.verdicts[tid] = existing
+        return existing
+
+    def prune_verdicts(self, live_tids: Iterable[int]) -> None:
+        """Drop the evidence of tracks that are gone.
+
+        Without this the dict grows for the lifetime of the socket - one entry per
+        car that ever passed - and, worse, a tid is never recycled but memory is
+        still finite.
+        """
+        alive = set(live_tids)
+        for tid in list(self.verdicts):
+            if tid not in alive:
+                self.verdicts.pop(tid, None)
+                self.hires_pending.discard(tid)
 
     def claim_orphan(self, tid: int, box: Sequence[float], now: float, max_attempts: int) -> bool:
         """True when this plate-shaped thing is allowed one more read.

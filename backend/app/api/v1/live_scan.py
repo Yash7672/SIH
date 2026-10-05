@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -44,7 +44,8 @@ from PIL import Image, ImageOps
 from app.core.config import settings
 from app.core.security import decode_token
 from app.db.session import SessionLocal
-from app.models.models import Device, Role
+from app.models.models import Device, Hotlist, HotlistStatus, Role
+from app.services.cache import cache_service
 from app.services.hotlist_service import HotlistService
 from app.services.sighting_service import SightingService
 from app.services.traffic_service import traffic_accumulator
@@ -64,13 +65,33 @@ import torch
 torch.set_num_threads(2)
 from ultralytics import YOLO  # noqa: E402
 
-# The OCR pipeline is reused exactly as it is everywhere else in the project.
-# Detection/thresholding/normalisation are deliberately NOT touched here: the
-# plate reading is correct today and this module is only responsible for finding
-# the plate and scheduling the read.
-from ai.detector import _load_plate_detector, _pad_box, preprocess_crop  # noqa: E402
-from ai.ocr_engine import best_plate, candidates, read_text  # noqa: E402
+# The OCR *engine* is unchanged - same RapidOCR, same detector, same
+# normalisation. What changed is how the live path schedules and weighs reads:
+# several renderings of the best crop are voted on with per-character confidence,
+# and the stolen/not-stolen question moved into one tested function
+# (`plate_verdict`) instead of being answered by a single `plate in hotlist`.
+from ai.detector import _load_plate_detector, _pad_box  # noqa: E402
+from ai.ocr_engine import get_engine  # noqa: E402  (used only to warm the engine)
 from app.services.plate import normalize_plate  # noqa: E402
+from app.services.plate_reader import (  # noqa: E402
+    CropRead,
+    build_variants,
+    debug_crops_enabled,
+    plate_box_plausible,
+    read_crop,
+    save_plate_crop,
+    suppress_vehicle_boxes,
+    warn_debug_enabled_once,
+)
+from app.services.plate_verdict import (  # noqa: E402
+    CLEAR,
+    MAX_READS,
+    POSSIBLE,
+    STOLEN,
+    UNREAD,
+    PlateRead,
+    TrackVerdict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +119,13 @@ AUTH_TIMEOUT_SECONDS = 10
 # refused loudly with `size_limit`, which the app surfaces as "frame too large".
 SOFT_FRAME_BYTES = 300 * 1024
 HARD_FRAME_BYTES = 400 * 1024
+# A hi-res frame is a different trade: ~300 KB more upload and a slower encode on
+# the phone, in exchange for roughly 2.5x the linear resolution, which is the
+# difference between a 60 px plate and a 150 px one. It is only ever requested
+# when a plate is genuinely too small to read (see `HIRES_PLATE_PX`), never
+# speculatively, so the band exists for one reply in every couple of seconds at
+# worst and the normal path is unaffected.
+HIRES_FRAME_BYTES = 900 * 1024
 
 # Inference width for every model - the width every frame is normalised to before
 # it reaches a detector or the OCR.
@@ -117,6 +145,10 @@ HARD_FRAME_BYTES = 400 * 1024
 # (24.9 ms vs 10.7 ms). It only binds on frames larger than 1280, and on those the
 # two are within noise of each other (125 ms vs 134 ms on a 12 MP capture).
 WORKING_WIDTH = 1280
+# Upper bound on the hi-res plate source. The phone is asked for ~1600 px; this is
+# only here so a phone that sends a 12 MP frame cannot make the server hold 48 MB
+# of pixels to crop one 200 px plate.
+HIRES_MAX_WIDTH = 1920
 FRAME_RATE_LIMIT = 15.0
 
 VEHICLE_CONF = 0.25
@@ -152,6 +184,31 @@ MAX_READS_PER_FRAME = 3
 MAX_READ_ATTEMPTS = 3
 PLATE_CONF_DONE = 0.8
 MIN_PLATE_CONFIDENCE = 0.6
+
+# --------------------------------------------------------------------------- #
+# High-resolution reads
+# --------------------------------------------------------------------------- #
+# Below this plate width, in the pixels that actually reached the server, the
+# recogniser is guessing: 90 px wide reads a 9-character plate at chance, and the
+# measured failure is not a wrong *confidence*, it is a wrong string that then
+# looks like a different car. 140 px is where it starts reading reliably, so
+# below that the server asks the phone for a bigger frame instead of trying
+# harder on pixels it does not have.
+HIRES_PLATE_PX = 140.0
+# One hi-res frame per this many seconds, per connection. A car parked in view
+# is the worst case and would otherwise ask for one on every single frame.
+HIRES_MIN_INTERVAL_S = 2.0
+# How long a `need_hires` stays unanswered before it is forgotten. Long enough
+# to cover a capture-and-encode, short enough that an ignored request does not
+# keep asking.
+HIRES_TIMEOUT_S = 5.0
+# The preset the phone is asked to switch to. Verified against the installed
+# expo-camera (SDK 58): `takePictureAsync` takes a `quality` number and the
+# preview drives resolution, so the phone honours this by raising its own
+# picture size for one capture. 1600 px is the smallest preset that lifts a
+# typical plate past 140 px in the measurements taken here.
+HIRES_PRESET_WIDTH = 1600
+HIRES_PRESET_QUALITY = 0.7
 
 inference_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="LiveInference")
 ocr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LiveOCR")
@@ -268,18 +325,41 @@ def decode_frame(jpeg_bytes: bytes) -> np.ndarray:
     while the preview shows an upright one, so every box lands in the wrong place
     on screen.
     """
+    return _decode_capped(jpeg_bytes, WORKING_WIDTH)
+
+
+def _decode_capped(jpeg_bytes: bytes, max_width: int) -> np.ndarray:
     img = Image.open(BytesIO(jpeg_bytes))
     img = ImageOps.exif_transpose(img)
-    if img.width > WORKING_WIDTH:
-        new_h = max(1, round(img.height * (WORKING_WIDTH / img.width)))
-        img = img.resize((WORKING_WIDTH, new_h), Image.BILINEAR)
+    if img.width > max_width:
+        new_h = max(1, round(img.height * (max_width / img.width)))
+        img = img.resize((max_width, new_h), Image.BILINEAR)
     # np.array gives an RGB view; this is the one conversion on the hot path, so it
     # is kept here rather than repeated by callers.
     return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
 
 
+def decode_plate_source(jpeg_bytes: bytes) -> np.ndarray:
+    """The biggest honest version of a high-resolution frame.
+
+    Capped at `HIRES_MAX_WIDTH` rather than taken raw: the phone can be asked for
+    a 1600 px frame, and if it sends a 12 MP one instead there is no reason to
+    hold 48 MB of pixels to crop a 200 px plate. Beyond this width a plate crop
+    gains nothing measurable - the limit is the plate detector's own input size.
+    """
+    return _decode_capped(jpeg_bytes, HIRES_MAX_WIDTH)
+
+
 def detect_vehicles(bgr: np.ndarray) -> List[Detection]:
-    """Every COCO vehicle class in the frame, as normalised boxes."""
+    """Every COCO vehicle class in the frame, as normalised boxes, de-duplicated.
+
+    The de-duplication is class-agnostic on purpose. YOLO happily returns a `car`
+    and a `truck` over the same vehicle; the tracker then opens two tracks, each
+    draws its own green box, and - worse - each claims the same plate box, so one
+    car shows three green rectangles and its plate is read against whichever box
+    happened to be looked at first. IOU 0.6 is where two boxes are the same
+    object rather than a car in front of a bus.
+    """
     model = get_vehicle_model()
     results = model(
         bgr,
@@ -293,16 +373,18 @@ def detect_vehicles(bgr: np.ndarray) -> List[Detection]:
         return out
     boxes = results[0].boxes
     h, w = bgr.shape[:2]
+    raw: List[Detection] = []
     for i in range(len(boxes)):
         coords = boxes.xyxy[i].detach().cpu().numpy()
-        out.append(
+        raw.append(
             Detection(
                 box=[coords[0] / w, coords[1] / h, coords[2] / w, coords[3] / h],
                 cls_id=int(boxes.cls[i].item()),
                 conf=float(boxes.conf[i].item()),
             )
         )
-    return out
+    keep = suppress_vehicle_boxes([d.box for d in raw], [d.conf for d in raw])
+    return [raw[i] for i in keep]
 
 
 def detect_plates(bgr: np.ndarray) -> List[Tuple[List[float], float]]:
@@ -372,6 +454,12 @@ def assign_plates(
     """
     plates: List[dict] = []
     crops: Dict[int, Tuple[List[float], float]] = {}
+    # Vehicle boxes in pixels, so a plate can be judged against its own car
+    # ("does this cover half the windscreen?") instead of only on its own.
+    veh_px: Dict[int, Tuple[float, float, float, float]] = {
+        t.tid: (t.box[0] * width, t.box[1] * height, t.box[2] * width, t.box[3] * height)
+        for t in tracks
+    }
     for box, conf in plate_dets:
         cx, cy = _plate_centre(box)
         host = None
@@ -386,9 +474,21 @@ def assign_plates(
         tid = host[1].tid if host is not None else None
         if tid is not None and tid in crops:
             continue
-        box_px = (box[2] - box[0]) * width
-        box_py = (box[3] - box[1]) * height
+        px_box = (box[0] * width, box[1] * height, box[2] * width, box[3] * height)
+        box_px = px_box[2] - px_box[0]
+        box_py = px_box[3] - px_box[1]
         if box_px < MIN_PLATE_PX or box_py < 12:
+            continue
+        # Shape and size sanity. This is what stops the reported false positive:
+        # a box stretched across the top of the frame, which is a sign or a
+        # shopfront, being drawn as a plate and handed to OCR. It is checked
+        # before `tid` is assigned so an impossible box cannot consume a car's
+        # single read budget either.
+        ok, why = plate_box_plausible(
+            px_box, (width, height), veh_px.get(tid) if tid is not None else None
+        )
+        if not ok:
+            logger.debug("Plate box rejected (%s): %s", why, [round(v, 3) for v in box])
             continue
         if tid is None:
             # Stable across frames while the thing stays put, so the budget below
@@ -396,7 +496,15 @@ def assign_plates(
             # it alone instead of re-reading it every frame.
             tid = ORPHAN_TID_BASE - len(crops)
         plates.append(
-            {"track": tid, "conf": round(float(conf), 4), "box": [round(float(v), 5) for v in box]}
+            {
+                "track": tid,
+                "conf": round(float(conf), 4),
+                "box": [round(float(v), 5) for v in box],
+                # How wide the plate is in the pixels that were actually searched.
+                # The client cannot use this - its frame is a different size - but
+                # the server uses it to decide whether to ask for a bigger frame.
+                "px_w": int(round(box_px)),
+            }
         )
         crops[tid] = (box, conf)
     return plates, crops
@@ -435,6 +543,7 @@ def infer_plates(
     tracker: VehicleTracker,
     ocr_busy: Optional[set] = None,
     conn: Optional["ScanConnection"] = None,
+    plate_src: Optional[np.ndarray] = None,
 ):
     """Stage 2: one plate-detector call for the frame, assigned to vehicles.
 
@@ -449,14 +558,35 @@ def infer_plates(
     that was never actually looked at, so its chip would read "reading..." for
     ever.
 
+    ``plate_src`` is where the *plate detector* runs and where the OCR crops are
+    cut from. Normally that is the working frame. On a high-resolution frame it
+    is the full-resolution image, so the plate is found and cropped with all the
+    pixels the phone actually sent, while the green boxes stay on the downscaled
+    copy the 150 ms budget is held to. Because every box here is normalised,
+    boxes found in the bigger image still land in the right place on the phone's
+    preview.
+
     Negative track ids are the plates with no vehicle around them (see
     `assign_plates`). They are drawn either way, but they have no per-car budget,
     so they are charged against the connection's orphan budget instead and `conn`
     is what carries it. They are also strictly last: a car that was detected is
     worth more OCR than a rectangle that might be a sign.
     """
-    plate_dets = detect_plates(bgr)
-    plates, found = assign_plates(tracks, plate_dets, w, h)
+    src = plate_src if plate_src is not None else bgr
+    # `w`/`h` describe the working frame the client drew its preview from. On a
+    # hi-res frame the plate search runs on `plate_src`, whose own size is used
+    # for the pixel arithmetic, and `w`/`h` only stay correct for the boxes
+    # because every box on the wire is normalised.
+    src_w, src_h = (src.shape[1], src.shape[0]) if plate_src is not None else (w, h)
+    plate_dets = detect_plates(src)
+    plates, found = assign_plates(tracks, plate_dets, src_w, src_h)
+    if plate_src is not None and w:
+        # `assign_plates` sized px_w in the source image's pixels; rescale to the
+        # working frame so the value means the same thing on every frame, which is
+        # what decides whether another hi-res request is worth sending.
+        scale = float(w) / src_w
+        for entry in plates:
+            entry["px_w"] = int(round(entry["px_w"] * scale))
 
     busy = ocr_busy or set()
     hosted = {tid: width for tid, width in ((t, (b[2] - b[0]) * w) for t, (b, _c) in found.items()) if tid > 0}
@@ -464,7 +594,7 @@ def infer_plates(
     for track, _px in tracker.plates_to_read(hosted, MAX_READS_PER_FRAME, PLATE_CONF_DONE):
         if track.tid in busy:
             continue
-        crop = _crop_for_ocr(bgr, found[track.tid][0])
+        crop = _crop_for_ocr(src, found[track.tid][0])
         if crop is not None:
             track.attempts += 1
             crops[track.tid] = crop
@@ -477,7 +607,7 @@ def infer_plates(
                 continue
             if not conn.claim_orphan(tid, box, now, ORPHAN_MAX_ATTEMPTS):
                 continue
-            crop = _crop_for_ocr(bgr, box)
+            crop = _crop_for_ocr(src, box)
             if crop is not None:
                 crops[tid] = crop
                 spent += 1
@@ -499,27 +629,39 @@ def decode_and_infer(jpeg_bytes: bytes, tracker: VehicleTracker):
 
 
 # --------------------------------------------------------------------------- #
-# OCR (off the hot path, unchanged pipeline)
+# OCR (off the hot path)
 # --------------------------------------------------------------------------- #
 def run_ocr(crop_bgr: np.ndarray) -> Optional[dict]:
-    """Read one plate crop.
+    """Read one plate crop, as carefully as the crop allows.
 
-    Ranking goes through ``best_plate`` rather than raw score: RapidOCR returns
-    per-character fragments that each score 1.00 ("4890", "JK", "1234"), so
-    picking the highest score returned a fragment instead of the merged plate.
+    Several renderings of the same pixels are recognised and the readings are
+    voted on (`plate_reader.read_crop`), which returns per-character confidence
+    alongside the string. That is what makes a *single* weak read unable to
+    become an alert downstream.
+
+    Return shape is unchanged from the original version of this function - the
+    offline scripts and the WebSocket tests both depend on it - with two extra
+    keys the verdict needs. It still returns ``None`` for anything below the
+    confidence floor, which is how "this attempt produced nothing" is reported.
     """
-    preprocessed = preprocess_crop(crop_bgr)
-    hits = candidates(read_text(preprocessed))
-    if not hits:
+    read = read_crop(crop_bgr)
+    if read is None:
         return None
-    best = best_plate(hits)
-    if best is None:
-        return None
-
-    norm = normalize_plate(best.normalized)
-    if norm.valid and best.score >= MIN_PLATE_CONFIDENCE:
-        return {"text": best.text, "norm": norm.normalized, "conf": best.score, "valid": True}
-    return None
+    norm = normalize_plate(read.text, ocr_score=read.conf)
+    valid = bool(norm.valid and read.conf >= MIN_PLATE_CONFIDENCE)
+    result = {
+        "text": read.text,
+        "norm": norm.normalized,
+        "conf": read.conf,
+        "valid": valid,
+        "char_confs": list(read.char_confs) if read.char_confs else None,
+        "variant": read.best_variant,
+    }
+    # Low-confidence or ambiguous reads are the ones worth a human eye, so this
+    # is where the diagnostic crop is written - plate crops only, never a frame.
+    if result["char_confs"] and min(result["char_confs"]) < 0.85:
+        save_plate_crop(crop_bgr, norm.normalized or read.text, read.conf, read.reason)
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -597,6 +739,33 @@ async def _check_hotlist_and_record(
     return True
 
 
+def _active_hotlist_plates() -> Set[str]:
+    """The active hot-list, read as a set so the verdict can test membership.
+
+    Redis first because it is a cache of exactly this set and the verdict asks
+    about every read; PostgreSQL on a cache miss. This is the only new database
+    work on the read path, and it is one indexed lookup.
+    """
+    cached = cache_service.get_active_plates()
+    if cached is not None:
+        return set(cached)
+    db = SessionLocal()
+    try:
+        return {
+            row[0]
+            for row in db.execute(
+                select(Hotlist.plate).where(
+                    Hotlist.status.in_([HotlistStatus.ACTIVE, HotlistStatus.FIR_CONFIRMED])
+                )
+            ).all()
+        }
+    except Exception as exc:  # noqa: BLE001 - an unreadable hot-list must not alert
+        logger.warning("Could not read the active hot-list: %s", exc)
+        return set()
+    finally:
+        db.close()
+
+
 @router.websocket("/scan")
 async def ws_live_scan(websocket: WebSocket):
     global ACTIVE_CONNECTIONS
@@ -617,6 +786,10 @@ async def ws_live_scan(websocket: WebSocket):
     # Per connection. Two phones must never share tracks.
     conn = ScanConnection()
     ping_task: Optional[asyncio.Task] = None
+
+    if debug_crops_enabled():
+        # Once per connection, and only when someone actually switched it on.
+        warn_debug_enabled_once()
 
     try:
         # ---- auth ------------------------------------------------------- #
@@ -688,15 +861,60 @@ async def ws_live_scan(websocket: WebSocket):
             except Exception:  # noqa: BLE001 - client already gone
                 pass
 
-        async def process_frame(jpeg: bytes, seq, lat, lng) -> None:
+        async def request_hires(plates: list) -> None:
+            """Ask the phone for one bigger frame when a plate is too small to read.
+
+            Sent at most once every `HIRES_MIN_INTERVAL_S` and only for a track
+            that has a plate narrower than `HIRES_PLATE_PX` and no confident read
+            yet. The alternative - reading harder on pixels that do not exist -
+            is what produced confident readings of the wrong car.
+            """
+            if not plates:
+                return
+            now = time.monotonic()
+            if now - conn.last_hires_at < HIRES_MIN_INTERVAL_S:
+                return
+            for entry in plates:
+                tid = entry.get("track")
+                px_w = entry.get("px_w") or 0
+                if px_w >= HIRES_PLATE_PX or tid is None:
+                    continue
+                verdict = conn.verdicts.get(tid)
+                if verdict is not None and verdict.has_confirmed:
+                    continue
+                conn.last_hires_at = now
+                conn.hires_pending.add(tid)
+                conn.hires_active = True
+                try:
+                    await send(
+                        {
+                            "type": "need_hires",
+                            "track": tid,
+                            "px_w": px_w,
+                            "want": int(HIRES_PLATE_PX),
+                            "width": HIRES_PRESET_WIDTH,
+                            "quality": HIRES_PRESET_QUALITY,
+                        }
+                    )
+                except Exception:  # noqa: BLE001 - client gone
+                    return
+                return  # one request at a time; the next frame can ask again
+
+        async def process_frame(jpeg: bytes, seq, lat, lng, hires: bool = False) -> None:
             """Infer one frame, answering with the green boxes first.
 
             Two replies, in order: `boxes` as soon as vehicle detection is done
-            (~50 ms), then `plates` a while later, then `plate` with the OCR text
-            seconds after that from a separate task. Nothing on the box path waits
-            for OCR, and the vehicle slot is handed back the moment the green boxes
+            (~50 ms), then `plates` a while later, then `plate` with the verdict
+            after OCR, from a separate task. Nothing on the box path waits for
+            OCR, and the vehicle slot is handed back the moment the green boxes
             are on the wire - so the next frame's boxes are never queued behind
             this frame's plate pass.
+
+            A high-resolution frame is split in two on arrival: the green boxes
+            are still computed on the ordinary downscaled working copy, and only
+            the plate pass looks at the full-resolution pixels. That is the whole
+            point of asking for one - the extra pixels are worth ~300 ms of OCR,
+            not ~60 ms of vehicle inference on the path that has a 150 ms budget.
             """
             loop = asyncio.get_running_loop()
             try:
@@ -719,6 +937,10 @@ async def ws_live_scan(websocket: WebSocket):
                 # would tally nothing and quietly empty the Maps heatmap.
                 traffic_accumulator.add(lat, lng, vehicles)
 
+                # A track that has left view takes its read history with it, so a
+                # verdict is never formed from a mixture of two different cars.
+                conn.prune_verdicts(t.tid for t in tracks)
+
                 try:
                     await send({"type": "boxes", "seq": seq, "w": w, "h": h, "ms": ms, "vehicles": vehicles})
                 except Exception:  # noqa: BLE001 - client gone mid-inference
@@ -734,10 +956,28 @@ async def ws_live_scan(websocket: WebSocket):
                     # older frame would point at the wrong car.
                     return
                 try:
+                    # The high-resolution source, when the phone sent one. Decoded
+                    # here rather than up front so the green boxes - which are on
+                    # the wire already by this point - never wait for it.
+                    plate_src = None
+                    if hires:
+                        try:
+                            full = await loop.run_in_executor(
+                                inference_pool, decode_plate_source, jpeg
+                            )
+                            if full.shape[1] > w:
+                                plate_src = full
+                                conn.hires_active = False
+                                conn.hires_pending.clear()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Hi-res decode failed, using working copy: %s", exc)
+
                     try:
                         plates, crops = await loop.run_in_executor(
                             inference_pool,
-                            lambda: infer_plates(bgr, w, h, tracks, conn.tracker, conn.ocr_tracks, conn),
+                            lambda: infer_plates(
+                                bgr, w, h, tracks, conn.tracker, conn.ocr_tracks, conn, plate_src
+                            ),
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Live scan plate pass error: %s", exc)
@@ -747,6 +987,11 @@ async def ws_live_scan(websocket: WebSocket):
                         await send({"type": "plates", "seq": seq, "plates": plates})
                     except Exception:  # noqa: BLE001
                         return
+
+                    try:
+                        await request_hires(plates)
+                    except Exception:  # noqa: BLE001 - a failed request must not lose the frame
+                        pass
 
                     if crops:
                         conn.reclaim_ocr()
@@ -818,12 +1063,43 @@ async def ws_live_scan(websocket: WebSocket):
                                 # Good enough, or out of budget: stop paying for this car.
                                 track.plate_settled = True
 
-                        stolen = False
-                        if result["valid"]:
+                        # ---- the one decision ---------------------------------- #
+                        # Every read is added to this track's history and the
+                        # verdict is recomputed from all of them. `stolen` is read
+                        # off that verdict and from nowhere else, which is what
+                        # stops one weak OCR pass from paging the police.
+                        verdict = conn.verdict_for(tid, now=time.monotonic())
+                        char_confs = result.get("char_confs")
+                        verdict.add(
+                            PlateRead(
+                                text=result["text"],
+                                norm=result["norm"],
+                                conf=result["conf"],
+                                at=time.monotonic(),
+                                valid=bool(result["valid"]),
+                                char_confs=tuple(char_confs) if char_confs else None,
+                                reason=result.get("reason", ""),
+                            )
+                        )
+                        # A STOLEN verdict on the previous read must not be
+                        # re-alerted every frame while the car is still in view;
+                        # the sighting cooldown in `record_detection` is the
+                        # backstop, and this is the first gate.
+                        already = verdict.state is STOLEN
+                        vd = verdict.evaluate(
+                            _active_hotlist_plates(), cooldown_ok=not already
+                        )
+                        verdict.state = vd.state
+
+                        if not orphan:
+                            track.plate_stolen = vd.state == STOLEN
+
+                        alerted = False
+                        if vd.state == STOLEN and not already:
                             db = SessionLocal()
                             try:
-                                stolen = await _check_hotlist_and_record(
-                                    db, conn.device, result["norm"], lat, lng, result["conf"]
+                                alerted = await _check_hotlist_and_record(
+                                    db, conn.device, vd.plate, lat, lng, vd.confidence
                                 )
                             finally:
                                 db.close()
@@ -842,7 +1118,12 @@ async def ws_live_scan(websocket: WebSocket):
                                 "norm": result["norm"],
                                 "conf": result["conf"],
                                 "valid": result["valid"],
-                                "stolen": bool(stolen and result["valid"]),
+                                # The one flag the client is allowed to trust.
+                                "stolen": vd.state == STOLEN,
+                                # The whole verdict, so the phone never has to
+                                # decide anything for itself.
+                                "verdict": vd.as_dict(),
+                                "police_alerted": alerted,
                             })
                         except Exception:  # noqa: BLE001 - client gone
                             return
@@ -884,18 +1165,33 @@ async def ws_live_scan(websocket: WebSocket):
                 await report_error("bad_frame", "Frame was not valid base64")
                 continue
 
-            if len(jpeg) > HARD_FRAME_BYTES:
+            # A frame the phone took at our request is allowed to be bigger. The
+            # phone marks it, and a mark without a pending request is not
+            # believed - otherwise any client could opt itself out of the size
+            # limit by setting one flag.
+            hires = bool(data.get("hires")) and bool(conn.hires_pending)
+            limit = HIRES_FRAME_BYTES if hires else HARD_FRAME_BYTES
+            if len(jpeg) > limit:
                 conn.end_frame()
                 await report_error(
                     "size_limit",
                     f"Frame rejected: {len(jpeg) // 1024} KB exceeds the "
-                    f"{HARD_FRAME_BYTES // 1024} KB limit",
+                    f"{limit // 1024} KB limit",
                 )
                 continue
-            if len(jpeg) > SOFT_FRAME_BYTES:
+            if hires:
+                # This frame answered a `need_hires`; the plate pass consumes it
+                # there. Clearing the mark here means an unanswered request cannot
+                # keep lifting the size limit for every later frame.
+                logger.info(
+                    "Hi-res frame %s KB for tracks %s", len(jpeg) // 1024, sorted(conn.hires_pending)
+                )
+            elif len(jpeg) > SOFT_FRAME_BYTES:
                 logger.info("Live frame %s KB over soft limit; downscaling to %spx", len(jpeg) // 1024, WORKING_WIDTH)
 
-            asyncio.create_task(process_frame(jpeg, data.get("seq"), data.get("lat"), data.get("lng")))
+            asyncio.create_task(
+                process_frame(jpeg, data.get("seq"), data.get("lat"), data.get("lng"), hires)
+            )
 
     except WebSocketDisconnect:
         pass

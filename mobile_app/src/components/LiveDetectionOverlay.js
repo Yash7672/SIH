@@ -217,7 +217,7 @@ const BoxLayer = memo(
             styles.chip,
             item.kind === "vehicle"
               ? { backgroundColor: VEHICLE_CHIP, top: -CHIP_OFFSET }
-              : { backgroundColor: PLATE_CHIP, top: item.chipBelow ? h + CHIP_OFFSET : -CHIP_OFFSET },
+              : { backgroundColor: chipColorFor(item), top: item.chipBelow ? h + CHIP_OFFSET : -CHIP_OFFSET },
           ]}
         >
           <Text
@@ -240,6 +240,7 @@ const BoxLayer = memo(
       a.chip === b.chip &&
       a.chipBelow === b.chipBelow &&
       a.stolen === b.stolen &&
+      a.state === b.state &&
       Math.round(a.rect.left) === Math.round(b.rect.left) &&
       Math.round(a.rect.top) === Math.round(b.rect.top) &&
       Math.round(a.rect.width) === Math.round(b.rect.width) &&
@@ -249,7 +250,23 @@ const BoxLayer = memo(
 );
 
 const VEHICLE_CHIP = "#22C55E";
-const PLATE_CHIP = "#FF1F1F";
+// The plate chip's fill follows the verdict, not the other way round.
+//
+// It used to be one red for every plate, which put a red "STOLEN"-looking label
+// under every ordinary car - the same false alarm as the banner, one line down.
+// Amber for POSSIBLE, grey for UNREAD, plain blue otherwise. Only STOLEN is red.
+const PLATE_CHIP = {
+  STOLEN: "#FF1F1F",
+  POSSIBLE: "#F59E0B",
+  CLEAR: "#38BDF8",
+  UNREAD: "#9CA3AF",
+};
+
+function chipColorFor(item) {
+  if (item.kind !== "plate") return VEHICLE_CHIP;
+  return PLATE_CHIP[item.state] || PLATE_CHIP.CLEAR;
+}
+
 const CHIP_OFFSET = 15;
 
 const styles = StyleSheet.create({

@@ -22,7 +22,19 @@
  */
 
 export const VEHICLE_COLOR = "#22C55E";
-export const PLATE_COLOR = "#FF1F1F";
+export const PLATE_COLOR = "#38BDF8";
+// Border colour per verdict state.
+//
+// A plate box used to be red in every state, which painted "STOLEN" next to every
+// ordinary car on the road - the same mistake as the banner, in the same feature.
+// Colour now follows the server's verdict and nothing else. `PLATE_COLOR` is the
+// ordinary, not-listed case, so the default and the CLEAR case are identical.
+export const STATE_COLORS = {
+  STOLEN: "#FF1F1F",
+  POSSIBLE: "#F59E0B",
+  CLEAR: PLATE_COLOR,
+  UNREAD: "#9CA3AF",
+};
 export const VEHICLE_WIDTH = 3;
 export const PLATE_WIDTH = 3;
 // Box cap. A crowded junction can produce far more vehicles than are useful on
@@ -200,12 +212,28 @@ export function applyPlateText(state, message, now) {
   if (!message) return null;
   const rec = upsert(state.plates, message.track, null, now, {});
   if (!rec) return null;
-  rec.read = message.norm || message.text || null;
+  const verdict = message.verdict || null;
+  rec.read = verdict?.plate || message.norm || message.text || null;
   rec.raw = message.text || null;
-  rec.score = typeof message.conf === "number" ? message.conf : rec.score;
+  rec.score = typeof (verdict?.confidence ?? message.conf) === "number"
+    ? (verdict?.confidence ?? message.conf)
+    : rec.score;
   rec.valid = Boolean(message.valid);
-  // Only a *valid* read can raise an alert; a garbled one must never do so.
-  rec.stolen = Boolean(message.stolen) && Boolean(message.valid);
+  // The verdict is the only authority on the box's colour. It used to be
+  // recomputed here from `stolen && valid`, which is the same class of bug the
+  // banner had: a second implementation of the decision, free to disagree.
+  //
+  // The fallback is for a server that predates the verdict, and it keeps the
+  // original rule exactly: an invalid read can never be STOLEN, however it was
+  // flagged. It degrades to UNREAD rather than to CLEAR so an unreadable plate is
+  // never shown as a clean identification.
+  rec.state =
+    verdict?.state ||
+    (message.stolen ? (message.valid ? "STOLEN" : "UNREAD") : "CLEAR");
+  rec.stolen = rec.state === "STOLEN";
+  rec.reads = verdict?.reads ?? 0;
+  rec.weak = Array.isArray(verdict?.weak) ? verdict.weak : [];
+  rec.reason = verdict?.reason || "";
   rec.label = message.label || rec.label || null;
   return rec;
 }
@@ -240,6 +268,27 @@ export function predictBox(rec, leadMs = LEAD_MS) {
 
 function chipBelowBox(rect, previewH) {
   return rect.top + rect.height + CHIP_GAP + CHIP_H <= previewH;
+}
+
+/**
+ * Put a "?" on every character the server was unsure about.
+ *
+ * The chip is a plain string, so this is the only place the doubt can be shown.
+ * It is deliberately not a colour change: the chip's background already carries
+ * the verdict, and a volunteer glancing at a plate needs to see *which* glyph is
+ * in doubt, not a differently-coloured box.
+ *
+ * Indices come from the server's per-character confidence list, which is aligned
+ * to the *stripped* plate string - so an index that did not survive the read is
+ * simply out of range and ignored rather than marking the wrong character.
+ */
+function markWeak(read, weak) {
+  const weakSet = new Set(weak || []);
+  if (!weakSet.size) return read;
+  const glyphs = String(read).split("");
+  return glyphs
+    .map((g, i) => (weakSet.has(i) ? `${g}?` : g))
+    .join("");
 }
 
 /**
@@ -287,22 +336,28 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
     const rect = projectBox(rec.fading ? rec.box : predictBox(rec), t);
     if (!rect) return;
     const pct = typeof rec.score === "number" ? Math.round(rec.score * 100) : null;
+    const state = rec.state || "CLEAR";
     plates.push({
       key: `p:${id}`,
       id,
       kind: "plate",
-      color: PLATE_COLOR,
+      color: STATE_COLORS[state] || PLATE_COLOR,
       borderWidth: PLATE_WIDTH,
       rect,
       area: area(rec.box),
       // No text yet means the OCR is still running for this track.
-      chip: rec.read ? `${rec.read}${pct != null ? ` ${pct}%` : ""}` : "reading...",
+      chip: rec.read
+        ? `${markWeak(rec.read, rec.weak)}${pct != null ? ` ${pct}%` : ""}`
+        : "reading...",
       reading: !rec.read,
       chipBelow: chipBelowBox(rect, t.previewH),
       score: rec.score,
       valid: rec.valid,
       fading: Boolean(rec.fading),
       stolen: Boolean(rec.stolen),
+      state: rec.state || "CLEAR",
+      reads: rec.reads || 0,
+      weak: rec.weak || [],
     });
   });
   plates.sort((a, b) => b.area - a.area);

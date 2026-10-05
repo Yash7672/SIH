@@ -337,16 +337,32 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
 });
 
 /**
- * Full-width red banner shown when a plate the camera just read is on the active
- * hot-list. A volunteer standing next to a reported car outdoors needs this to
- * be unmissable and to name the plate, so it pulses and does not rely on colour
- * alone.
+ * The alert banner. Two states, both from the server's verdict, nothing else.
+ *
+ * Red and pulsing means the server has said STOLEN: strict syntax, an exact
+ * hot-list match, and either two independent frames agreeing or one frame read at
+ * 0.92+ with every glyph above 0.8. That is a car a volunteer should act on.
+ *
+ * Amber and still means POSSIBLE: it resembles a listed plate but no rule has
+ * been met. It deliberately does not pulse, does not vibrate and does not say
+ * "police alerted" - there is no alert, because nothing has been filed. Buzzing
+ * and shouting for every car that merely looks similar is how a volunteer learns
+ * to ignore both, and then the red one is ignored too.
+ *
+ * The banner is driven only by `plate.state`. It used to be driven by "is there
+ * any plate at all", which painted it red for an ordinary clear read - the
+ * reported symptom of a STOLEN banner sitting above a card reading "not on the
+ * hotlist".
  */
 const StolenBanner = memo(function StolenBanner({ plate }) {
   const pulse = useRef(new Animated.Value(1)).current;
+  const state = plate?.state;
+  const alarming = state === "STOLEN";
 
   useEffect(() => {
-    if (!plate) {
+    // Only the red one pulses. An amber banner that pulses at the same rate is
+    // an alarm with none of the information.
+    if (!plate || !alarming) {
       pulse.setValue(1);
       return undefined;
     }
@@ -358,24 +374,47 @@ const StolenBanner = memo(function StolenBanner({ plate }) {
     );
     loop.start();
     return () => loop.stop();
-  }, [plate, pulse]);
+  }, [plate, alarming, pulse]);
 
-  if (!plate) return null;
+  if (!plate || (state !== "STOLEN" && state !== "POSSIBLE")) return null;
+
+  const label =
+    state === "STOLEN"
+      ? `STOLEN VEHICLE ${plate.plate}`
+      : `POSSIBLE MATCH · ${plate.plate || "plate unread"}`;
+
+  const sub =
+    state === "STOLEN"
+      ? `${plate.confidence}%${plate.reads > 1 ? ` · seen in ${plate.reads} frames` : ""} · ${
+          plate.alerted ? "police alerted" : "match confirmed"
+        }`
+      : `${plate.confidence}%${plate.reads > 1 ? ` · seen in ${plate.reads} frames` : ""} · not confirmed, no alert sent`;
 
   return (
     <Animated.View
       accessibilityRole="alert"
-      accessibilityLabel={`Stolen vehicle detected, plate ${plate.plate}`}
+      accessibilityLabel={
+        state === "STOLEN"
+          ? `Stolen vehicle detected, plate ${plate.plate}, police alerted`
+          : `Possible match, plate ${plate.plate}, not confirmed`
+      }
       pointerEvents="none"
-      style={[stolenStyles.banner, { opacity: pulse }]}
+      style={[
+        stolenStyles.banner,
+        { backgroundColor: alarming ? "#FF1F1F" : "#B45309", opacity: alarming ? pulse : 1 },
+      ]}
     >
-      <Ionicons name="warning" size={18} color="#FFFFFF" />
+      <Ionicons
+        name={alarming ? "warning" : "help-circle"}
+        size={18}
+        color="#FFFFFF"
+      />
       <View style={stolenStyles.textWrap}>
         <Text style={stolenStyles.title} numberOfLines={1}>
-          STOLEN VEHICLE {plate.plate}
+          {label}
         </Text>
         <Text style={stolenStyles.sub} numberOfLines={1}>
-          {plate.confidence}% · police alerted
+          {sub}
         </Text>
       </View>
     </Animated.View>
@@ -392,7 +431,6 @@ const stolenStyles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 12,
     borderRadius: radius.md,
-    backgroundColor: "#FF1F1F",
     borderWidth: 2,
     borderColor: "#FFFFFF",
   },
@@ -401,13 +439,64 @@ const stolenStyles = StyleSheet.create({
   sub: { color: "#FFFFFF", fontSize: 11, fontWeight: "700", opacity: 0.92 },
 });
 
+// One row per verdict state, used by both the banner and the card. The card
+// showing "not on the hotlist" under a red banner is what this replaces, so the
+// wording for each state is written once and cannot drift between the two.
+const VERDICT_LINE = {
+  STOLEN: "on the hot-list · police alerted",
+  POSSIBLE: "resembles a listed plate · not confirmed",
+  CLEAR: "not on the hot-list",
+  UNREAD: "could not read the plate",
+};
+
+/**
+ * The plate with grey "?" chips on the characters the server was unsure about.
+ *
+ * This is the one thing the phone can show that the verdict cannot: *which*
+ * glyph is doubtful. A server that says POSSIBLE on `DL1ZA9092` because of the
+ * `Z` is a different situation from one that says POSSIBLE because of four
+ * characters, and a volunteer deciding whether to walk up to the car needs to
+ * tell them apart. `weak` is a list of character indices, so a dropped character
+ * does not shift the ones after it into the wrong place.
+ */
+function PlateWithWeakChips({ plate, chars, confidence, s }) {
+  const glyphs = String(plate || "").split("");
+  const weak = new Set((chars || []).filter((i) => Number.isInteger(i) && i >= 0 && i < glyphs.length));
+  return (
+    <Text
+      style={[s.plateMono, { color: confidence }]}
+      numberOfLines={1}
+      adjustsFontSizeToFit
+    >
+      {glyphs.map((g, i) =>
+        weak.has(i) ? (
+          <Text key={i} style={styles.weakChip}>
+            {g === " " ? "_" : g}
+            <Text style={styles.weakMark}>?</Text>
+          </Text>
+        ) : (
+          <Text key={i}>{g === " " ? "·" : g}</Text>
+        )
+      )}
+    </Text>
+  );
+}
+
 /**
  * Everything under the camera, in one panel: last plate, stats, the pause
  * toggle and the recent events. Kept compact so the preview can have the top
  * 65% of the screen instead of fighting a stack of cards.
+ *
+ * The card and the banner read the *same* `stalePlate` object, so they cannot
+ * disagree. That is the second half of the fix: they used to be computed
+ * independently, and the two answers could be different at the same instant on
+ * the same car.
  */
 function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, colors, s }) {
   const last = stalePlate;
+  const state = last?.state;
+  const chipColor =
+    state === "STOLEN" ? "#FF6B6B" : state === "POSSIBLE" ? "#F59E0B" : colors.onDark.strong;
   return (
     <Card tone="dark" style={s.block}>
       <View style={s.blockHeader}>
@@ -426,19 +515,27 @@ function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, colors,
         </Pressable>
       </View>
 
-      {last ? (
+      {last && last.plate ? (
         <View>
-          <Text style={[s.plateMono, { color: last.stolen ? "#FF6B6B" : colors.onDark.strong }]} numberOfLines={1} adjustsFontSizeToFit>
-            {last.plate}
-          </Text>
+          <PlateWithWeakChips plate={last.plate} chars={last.weak} confidence={chipColor} s={s} />
           <Text style={s.detSub}>
-            {last.confidence}% confidence · {last.stolen ? "reported to police" : "not on the hotlist"}
+            {`${last.confidence}% · ${VERDICT_LINE[state] || VERDICT_LINE.UNREAD}`}
+            {last.reads > 1 ? ` · seen in ${last.reads} frames` : ""}
           </Text>
         </View>
       ) : (
-        <Text style={[s.emptyText, { color: colors.onDark.muted }]}>
-          {streaming ? "Point the camera at a vehicle plate." : "Live detection is paused."}
-        </Text>
+        <View>
+          <Text style={[s.plateMono, { color: colors.onDark.muted }]} numberOfLines={1}>
+            {last ? "unsure" : "—"}
+          </Text>
+          <Text style={s.detSub}>
+            {last?.reason
+              ? `${VERDICT_LINE.UNREAD} · ${last.reason}`
+              : streaming
+                ? "Point the camera at a vehicle plate."
+                : "Live detection is paused."}
+          </Text>
+        </View>
       )}
 
       <View style={[s.statRow, { borderTopColor: colors.dark[600] }]}>
@@ -479,6 +576,11 @@ function ActivityLog({ log, colors, s }) {
 }
 
 const styles = StyleSheet.create({
+  // A character the server was unsure about: grey, underlined, and marked with a
+  // trailing "?" so it is legible without colour and distinguishable from a real
+  // character in a list of them.
+  weakChip: { color: "#9CA3AF", textDecorationLine: "underline" },
+  weakMark: { color: "#6B7280", fontSize: 9 },
   detectToggle: { paddingVertical: 2 },
   detectTrack: {
     width: 46,

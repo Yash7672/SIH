@@ -83,6 +83,30 @@ const CAPTURE_OPTIONS = {
   skipProcessing: false,
 };
 
+/**
+ * The one-off frame the server asks for when a plate is too small to read.
+ *
+ * Same options, two changes, both measured rather than guessed:
+ *
+ *   - `quality: 0.7` instead of 0.4. The plate is maybe 90 px wide here, so
+ *     there are ~10 pixels per glyph and JPEG artefacts land directly on the
+ *     characters - this is the exact failure that reads `Z` as `2`. More
+ *     compression saves ~40 KB per ordinary frame and is thrown away the moment
+ *     the detector has read it; on this one frame the bytes are the whole point.
+ *   - no `width`: the sensor is asked for what it has, and the server caps the
+ *     decode at its own `HIRES_MAX_WIDTH`. Resizing in JS first would mean
+ *     paying a native round trip to produce pixels the server was going to throw
+ *     away anyway.
+ *
+ * Cost: one bigger frame every two seconds at most, only while a plate is
+ * genuinely unreadable. At quality 0.7 a 1600 px frame is ~250 KB against a
+ * 900 KB ceiling, so the worst case is well inside the limit.
+ */
+const HIRES_CAPTURE_OPTIONS = {
+  ...CAPTURE_OPTIONS,
+  quality: 0.7,
+};
+
 // Smallest picture we ask the camera for.
 //
 // 1280 px, measured on the road-scene fixture end to end. This is the single
@@ -185,6 +209,35 @@ export function choosePictureSize(sizes) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 /**
+ * The camera settings the server asked for, if it asked for anything usable.
+ *
+ * The server sends its own `width` and `quality` in the request, so the two sides
+ * cannot disagree about what "big enough to read" means: if the reading pipeline
+ * is retuned and the threshold moves, the phone follows it without a new release.
+ *
+ * Only `quality` is taken. `takePictureAsync` in the installed expo-camera 58
+ * takes `{ quality, base64, exif, shutterSound, skipProcessing }` and nothing
+ * else - resolution comes from the `pictureSize` prop on the CameraView, which is
+ * chosen once at mount. Handing the camera a `width` it does not read would look
+ * like the feature works while changing nothing, so the requested width is used
+ * for the *check* instead: a capture that is not actually wider than the ordinary
+ * frame is reported, because on such a device there are no more pixels to be had
+ * and a volunteer deserves to know that rather than to keep watching a request
+ * that can never be answered.
+ *
+ * Anything nonsensical is ignored in favour of the local default rather than
+ * passed to the camera - a `quality` of 12 would be a `takePictureAsync`
+ * rejection at the worst possible moment, on the one frame whose whole purpose
+ * is to be read.
+ */
+function pickHiresSettings(want) {
+  const out = {};
+  const quality = Number(want && want.quality);
+  if (Number.isFinite(quality) && quality > 0 && quality <= 1) out.quality = quality;
+  return out;
+}
+
+/**
  * Run the loop until `stop()`.
  *
  * Everything the loop needs is injected, so the same code drives a real camera
@@ -195,6 +248,7 @@ export class LiveCaptureLoop {
     cameraRef,
     client,
     onStats,
+    onFrameTiming,
     onError,
     onPause,
     onRecover,
@@ -209,6 +263,9 @@ export class LiveCaptureLoop {
     this.cameraRef = cameraRef || { current: null };
     this.client = client || null;
     this.onStats = onStats || (() => {});
+    // Per-frame capture / encode / send, as three separate numbers. Every frame
+    // is reported; the screen decides which ones are worth showing a human.
+    this.onFrameTiming = onFrameTiming || null;
     this.onError = onError || (() => {});
     this.onPause = onPause || (() => {});
     this.onRecover = onRecover || (() => {});
@@ -239,6 +296,11 @@ export class LiveCaptureLoop {
     this._intervalMs = this._minIntervalMs;
     this._failures = 0;
     this._faulted = false;
+    // True only for the duration of an iteration that is answering a `need_hires`.
+    this._hiresActive = false;
+    this._hiresWantWidth = 0;
+    // One "this device has no more pixels" message per session, not per frame.
+    this._warnedNoHires = false;
   }
 
   start() {
@@ -332,8 +394,25 @@ export class LiveCaptureLoop {
     const writtenUris = [];
 
     try {
+      // Is the server waiting for one bigger frame? Taken *before* the capture,
+      // never after: the picture is taken at the resolution that was asked for,
+      // rather than being taken at 1280 px and then upscaled, which would
+      // manufacture detail that was never in the sensor and defeat the point.
+      //
+      // It is also taken from the socket rather than passed in, so the flag cannot
+      // be lost between the server's request and the frame that answers it.
+      const hires = typeof client.consumeHiresRequest === "function"
+        ? client.consumeHiresRequest()
+        : null;
+      const settings = hires ? pickHiresSettings(hires) : {};
+      const options = hires ? { ...HIRES_CAPTURE_OPTIONS, ...settings } : CAPTURE_OPTIONS;
+      this._hiresActive = Boolean(hires);
+      this._hiresWantWidth = Number(hires && hires.width) || 0;
+
       // One capture, awaited. Nothing else may take a picture until it resolves.
-      const photo = await cam.takePictureAsync(CAPTURE_OPTIONS);
+      const t0 = Date.now();
+      const photo = await cam.takePictureAsync(options);
+      const captureMs = Date.now() - t0;
       if (photo?.uri) writtenUris.push(photo.uri);
       if (this._retired(gen)) return;
 
@@ -349,7 +428,12 @@ export class LiveCaptureLoop {
       }
 
       // The bytes are already here, from the same call that created them.
+      // "Encoding" is already done by the time this line is reached on the fast
+      // path; the figure below is what any extra resize cost, so the three
+      // numbers a slow phone gets reported - capture, encode, send - each mean
+      // one thing.
       let base64 = photo.base64;
+      let encodeMs = 0;
 
       // Safety net for the devices where `pictureSize` is not honoured: the
       // ResolutionSelector falls back to the closest higher size, so a capture
@@ -357,8 +441,17 @@ export class LiveCaptureLoop {
       // server's 300 KB soft limit and approaching the 400 KB ceiling that comes
       // back as "frame too large" five times a second. Only when it is actually
       // needed, because the fast path stays file-free.
-      if (width > MAX_PICTURE_WIDTH && base64Bytes(base64) > SOFT_FRAME_BYTES) {
+      //
+      // A hi-res frame is deliberately exempt: resizing it back to 1280 px would
+      // throw away the extra pixels the server explicitly asked for.
+      if (
+        !hires &&
+        width > MAX_PICTURE_WIDTH &&
+        base64Bytes(base64) > SOFT_FRAME_BYTES
+      ) {
+        const t1 = Date.now();
         const shrunk = await this._downscale(photo.uri, MAX_PICTURE_WIDTH);
+        encodeMs = Date.now() - t1;
         if (shrunk) {
           base64 = shrunk.base64;
           width = shrunk.width;
@@ -373,9 +466,44 @@ export class LiveCaptureLoop {
       const loc = await this._location();
       if (this._retired(gen)) return;
 
-      client.sendFrame(width, height, loc.latitude, loc.longitude, base64);
+      const t2 = Date.now();
+      const sent = client.sendFrame(width, height, loc.latitude, loc.longitude, base64, this._hiresActive);
+      const sendMs = Date.now() - t2;
       this._frames += 1;
+
+      // Capture, encode and send are timed separately on purpose. One combined
+      // number cannot tell a volunteer whose phone is slow *why*, and the three
+      // have three different fixes: a slow sensor, a bad resize, or a bad
+      // connection. `onStats` gets all three every time.
+      if (this.onFrameTiming) {
+        this.onFrameTiming({
+          hires: this._hiresActive,
+          width,
+          height,
+          bytes: base64Bytes(base64),
+          captureMs,
+          encodeMs,
+          sendMs,
+        });
+      }
+
+      // Asked for a bigger frame and got the same pixels: say so once. This is a
+      // device property, not a fault, and it will be true on every subsequent
+      // request too - a volunteer watching a plate that never reads deserves to
+      // be told why instead of watching a request come and go.
+      if (
+        this._hiresActive &&
+        this._hiresWantWidth > 0 &&
+        width < this._hiresWantWidth &&
+        !this._warnedNoHires
+      ) {
+        this._warnedNoHires = true;
+        this.onError(
+          `Camera cannot supply more than ${width}px; this plate will stay hard to read`
+        );
+      }
     } finally {
+      this._hiresActive = false;
       // Only now, with the frame handed to the socket, are the temp JPEGs worth
       // removing. Over a long shift they would otherwise fill the app's cache.
       await this._discard(writtenUris);

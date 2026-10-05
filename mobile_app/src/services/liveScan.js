@@ -56,6 +56,9 @@ export class LiveScanClient {
     this._busy = false;
     this._pending = null;
     this._busyTimer = null;
+    // An outstanding server request for one bigger frame, or null. See
+    // `consumeHiresRequest`.
+    this._hiresWanted = null;
     this._inflightSeq = 0;
     // seq -> send time, for an honest round-trip number in the UI.
     this._sentAt = new Map();
@@ -149,6 +152,14 @@ export class LiveScanClient {
           break;
         case "plate":
           if (this.callbacks.onPlate) this.callbacks.onPlate(data);
+          break;
+        case "need_hires":
+          // The server found a plate too small to read and wants one bigger
+          // frame. It does not touch the slot: the green boxes for the current
+          // frame are still owed, and skipping them would stutter the overlay.
+          // The capture loop picks this up and answers on its next frame.
+          this._hiresWanted = data || null;
+          if (this.callbacks.onNeedHires) this.callbacks.onNeedHires(data);
           break;
         case "ping":
           // Server keepalive: answer so it does not drop us as idle.
@@ -280,7 +291,7 @@ export class LiveScanClient {
     if (this._pending) {
       const next = this._pending;
       this._pending = null;
-      this._doSend(next.width, next.height, next.lat, next.lng, next.base64);
+      this._doSend(next.width, next.height, next.lat, next.lng, next.base64, next.hires);
     }
   }
 
@@ -344,36 +355,70 @@ export class LiveScanClient {
     this._deviceId = deviceId;
   }
 
-  sendFrame(width, height, lat, lng, base64) {
+  sendFrame(width, height, lat, lng, base64, hires) {
     if (!this.connected || !this.ready || !this.ws) return false;
 
     if (this._busy) {
       // Newest wins: overwrite whatever was waiting rather than queueing.
-      this._pending = { width, height, lat, lng, base64 };
+      //
+      // The hi-res mark is OR-ed rather than replaced. A 1600 px frame dropped
+      // on the floor here is not merely wasted - the server is still holding an
+      // unanswered `need_hires`, and it has already spent one of its two
+      // requests on a car that has now driven off. Losing the mark would leave
+      // that request open until it timed out, which is exactly the "banner says
+      // STOLEN for a car nobody can read" state this work exists to remove.
+      this._pending = {
+        width,
+        height,
+        lat,
+        lng,
+        base64,
+        hires: Boolean(hires || this._pending?.hires)
+      };
       return false;
     }
-    return this._doSend(width, height, lat, lng, base64);
+    return this._doSend(width, height, lat, lng, base64, hires);
   }
 
-  _doSend(width, height, lat, lng, base64) {
+  /**
+   * Take the outstanding hi-res request, if there is one, and clear it.
+   *
+   * `take`, not `peek`: a request the phone never answers would otherwise be
+   * answered by a frame taken seconds later, long after the car in question has
+   * moved out of shot. The server rate-limits requests to one per two seconds
+   * precisely because one unanswered request is cheap and one per frame is not.
+   *
+   * The capture loop calls this once per iteration, before it takes the picture,
+   * so the picture itself is taken at the resolution the server asked for rather
+   * than being captured and then thrown away.
+   */
+  consumeHiresRequest() {
+    const want = this._hiresWanted;
+    this._hiresWanted = null;
+    return want;
+  }
+
+  _doSend(width, height, lat, lng, base64, hires) {
     const ws = this.ws;
     if (!ws) return false;
     this._busy = true;
     this.seq += 1;
     this._inflightSeq = this.seq;
     this._sentAt.set(this.seq, Date.now());
+    const payload = {
+      type: "frame",
+      seq: this.seq,
+      w: width,
+      h: height,
+      // 0,0 is "unknown" to the server, which ignores such frames rather
+      // than crediting them to a cell off the coast of Africa.
+      lat: lat || 0,
+      lng: lng || 0,
+      jpeg_b64: base64
+    };
+    if (hires) payload.hires = true;
     try {
-      ws.send(JSON.stringify({
-        type: "frame",
-        seq: this.seq,
-        w: width,
-        h: height,
-        // 0,0 is "unknown" to the server, which ignores such frames rather
-        // than crediting them to a cell off the coast of Africa.
-        lat: lat || 0,
-        lng: lng || 0,
-        jpeg_b64: base64
-      }));
+      ws.send(JSON.stringify(payload));
     } catch (e) {
       this._busy = false;
       this._inflightSeq = 0;

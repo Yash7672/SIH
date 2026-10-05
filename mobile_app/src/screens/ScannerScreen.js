@@ -12,12 +12,19 @@ import { CameraView } from "expo-camera";
 const DEVICE_KEY = "rakshak_device_id";
 const SIM_PLATES = ["TS09AB1234", "MH12JK4567"];
 
-// A read below this is shown but never treated as an identification. The server
-// does its own validation; this is the UI's own line in the sand.
-const MIN_TRUSTED_CONFIDENCE = 0.6;
-// How long the stolen banner stays up after the last matching read. Long enough
-// for a volunteer to look up from the road and read it.
+// How long the red banner stays up after the last STOLEN verdict. Long enough
+// for a volunteer to look up from the road and read it, short enough that it is
+// not still describing a car that has gone.
 const STOLEN_HOLD_MS = 8000;
+// Amber is a shorter prompt: "this might be the listed car, look again", not an
+// alarm. Holding it as long as the red one would let three ordinary cars bury a
+// real one behind them.
+const POSSIBLE_HOLD_MS = 4000;
+// A frame the camera, the encoder and the socket together did not get through in
+// this long is worth a line in the log. Above the capture loop's own 600 ms
+// slow-mode interval, so it means "this device is struggling", not "the server
+// was busy for a moment".
+const SLOW_FRAME_MS = 700;
 const LOG_LIMIT = 12;
 
 function formatClock(d) {
@@ -59,6 +66,15 @@ export default function ScannerScreen({ user, onLogout }) {
 
   const appendLog = useCallback((line) => {
     setLog((prev) => [line, ...prev].slice(0, LOG_LIMIT));
+  }, []);
+
+  // Re-arms the banner's own expiry. Kept in one place so the red and the amber
+  // paths cannot drift into two different dismissal behaviours - the reported
+  // symptom (a banner that never went away) came from the clear-timer being
+  // armed on only one of the two paths.
+  const armBanner = useCallback((ms) => {
+    if (stolenTimer.current) clearTimeout(stolenTimer.current);
+    stolenTimer.current = setTimeout(() => setStalePlate(null), ms);
   }, []);
 
   useEffect(() => {
@@ -139,39 +155,83 @@ export default function ScannerScreen({ user, onLogout }) {
       onPlates: (data) => {
         liveOverlayStore.applyPlates(data);
       },
+      onNeedHires: (data) => {
+        // Nothing to do but note it. The capture loop reads the request off the
+        // socket itself, immediately before the next picture is taken - which is
+        // the only place it can still influence what the camera is asked for.
+        // Logging it here is what makes "why was that frame 250 KB?" answerable
+        // from the phone's own log rather than from the server log.
+        appendLog(
+          `${formatClock(new Date())}  plate too small (${data?.px_w ?? "?"}px) - ` +
+            `asking for one ${data?.width ?? 1600}px frame`
+        );
+      },
       onPlate: (data) => {
         liveOverlayStore.applyPlateText(data);
-        const conf = Math.round((data.conf || 0) * 100);
-        const valid = Boolean(data.valid);
 
-        // Only a valid, confident read is allowed to raise an alert. A garbled
-        // low-confidence read is shown and otherwise ignored - the alternative is
-        // a red banner naming a plate nobody can read.
-        if (!valid || !data.text || (data.conf || 0) < MIN_TRUSTED_CONFIDENCE) {
-          appendLog(
-            `${data.label || "vehicle"}: unreadable${data.text ? ` (${data.text} ${conf}%)` : ""}`
-          );
-          return;
-        }
+        // The server's verdict is the *only* thing this screen decides anything
+        // from. It used to re-run its own checks here - "is it valid, is the
+        // confidence high enough, is the plate on the hot-list" - and every one of
+        // those decisions could disagree with the server's, which is how the
+        // banner said STOLEN while the card below it said "not on the hotlist".
+        // One decision, one place, one answer.
+        const verdict = data.verdict || null;
+        const state = verdict?.state || (data.stolen ? "STOLEN" : "CLEAR");
+        const plate = verdict?.plate || data.norm || data.text || "";
+        const conf = Math.round((verdict?.confidence ?? data.conf ?? 0) * 100);
+        const reads = verdict?.reads ?? 0;
 
-        const plate = {
-          plate: data.norm || normalizePlate(data.text),
+        // Grey "?" chips come from the server's per-character confidence: it is
+        // the only party that can tell which glyph it is unsure about.
+        const weak = Array.isArray(verdict?.weak)
+          ? verdict.weak
+          : (verdict?.ambiguous ? [verdict.plate] : []);
+
+        const shown = {
+          plate,
+          state,
           confidence: conf,
-          stolen: Boolean(data.stolen),
+          reads,
+          weak,
+          reason: verdict?.reason || "",
+          // The alert that was actually filed, not "this plate is on the list".
+          alerted: Boolean(data.police_alerted),
           at: Date.now(),
         };
-        setStalePlate(plate);
+        setStalePlate(shown);
+
+        const seen = reads > 1 ? `  seen in ${reads} frames` : "";
+        const tag =
+          state === "STOLEN"
+            ? shown.alerted
+              ? "  STOLEN - POLICE ALERTED"
+              : "  STOLEN"
+            : state === "POSSIBLE"
+              ? "  POSSIBLE MATCH"
+              : state === "UNREAD"
+                ? "  UNSURE"
+                : "";
         appendLog(
-          `${formatClock(new Date())}  ${plate.plate}  ${conf}%${plate.stolen ? "  HOTLIST MATCH" : ""}`
+          `${formatClock(new Date())}  ${plate || "(no plate)"}${seen}${seen && tag ? "  " : ""}${tag}`
         );
 
-        if (plate.stolen) {
+        // Only a real STOLEN vibrates. An amber POSSIBLE does not: it means "look
+        // at this", and buzzing the phone for every car that merely resembles a
+        // listed plate trains the volunteer to ignore the buzz.
+        if (state === "STOLEN") {
           try {
             Vibration.vibrate([40, 120, 80]);
           } catch {}
-          if (stolenTimer.current) clearTimeout(stolenTimer.current);
-          stolenTimer.current = setTimeout(() => setStalePlate(null), STOLEN_HOLD_MS);
+          armBanner(STOLEN_HOLD_MS);
+        } else if (state === "POSSIBLE") {
+          // Amber gets a shorter hold. It is a prompt to look, not an alarm, and
+          // leaving it up as long as a red one would bury the next car.
+          armBanner(POSSIBLE_HOLD_MS);
         }
+        // CLEAR and UNREAD deliberately do not clear the banner here: the banner
+        // is cleared by the track leaving or by its own timer, so a stream of
+        // ordinary cars cannot flicker it away while a listed one is still in
+        // view.
       },
       onRoundTrip: (roundTripMs) => {
         setLiveScan((s) => ({ ...s, roundTripMs }));
@@ -220,6 +280,25 @@ export default function ScannerScreen({ user, onLogout }) {
       client: clientRef.current,
       onStats: ({ fps, roundTripMs }) => {
         setLiveScan((s) => ({ ...s, fps, roundTripMs }));
+      },
+      // Capture, encode and send, timed separately. They are kept apart because
+      // one combined "frame took N ms" figure cannot tell a volunteer whose
+      // phone is slow *why*, and the three have three different causes: a slow
+      // sensor, a bad resize, or a bad connection.
+      onFrameTiming: ({ hires, width, height, bytes, captureMs, encodeMs, sendMs }) => {
+        // Only the frames that explain something go in the log. Every frame is
+        // timed, because averaging them is the point; but at 5 fps the visible
+        // log would be nothing but timing lines, and the plate readings a
+        // volunteer actually needs to see would scroll away between cars.
+        // A hi-res frame and a slow frame are both worth a line.
+        const total = captureMs + encodeMs + sendMs;
+        if (!hires && total < SLOW_FRAME_MS) return;
+        const tail = encodeMs > 0 ? `, encode ${Math.round(encodeMs)}ms` : "";
+        appendLog(
+          `${formatClock(new Date())}  ${hires ? "hi-res" : "slow frame"} ` +
+            `${width}x${height} ${Math.round(bytes / 1024)}KB - ` +
+            `capture ${Math.round(captureMs)}ms${tail}, send ${Math.round(sendMs)}ms`
+        );
       },
       onPause: () => {
         // The socket is not ready yet, or dropped. That is not an error, but it

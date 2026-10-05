@@ -57,12 +57,12 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/main.py` | App factory, CORS, privacy guard middleware, lifespan (seeds users, rebuilds hot-list cache, warms models) | `warm_live_models()` |
 | `backend/app/api/v1/` | HTTP + WebSocket routers | `live_scan.py`, `sightings.py`, `scanner.py`, `ws.py`, `hotlist.py` |
 | `backend/app/models/models.py` | SQLAlchemy models | `User`, `Device`, `Complaint`, `Hotlist`, `Sighting`, `AuditLog` |
-| `backend/app/services/` | Business logic | `hotlist_service.py`, `sighting_service.py`, `plate.py`, `cache.py`, `seed.py` |
+| `backend/app/services/` | Business logic | `hotlist_service.py`, `sighting_service.py`, `plate.py`, `plate_reader.py`, `plate_verdict.py`, `cache.py`, `seed.py` |
 | `backend/app/ws/manager.py` | Police alert fan-out (`alert_manager`) | `broadcast()` |
-| `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget) and `ScanConnection` (in-flight slots, OCR claims, device) | `VehicleTracker`, `ScanConnection` |
+| `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget), `ScanConnection` (in-flight slots, OCR claims, device, per-track verdicts, hires_pending/hires_active/last_hires_at) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
 | `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |

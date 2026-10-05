@@ -251,13 +251,42 @@ def _format_score(candidate: str) -> float:
     return best
 
 
+def _edit_trust(edits: int) -> int:
+    """How much evidence a candidate is allowed to override with layout prior.
+
+    A single glyph confusion (Z read as 2, 1 read as I) is a well-known failure
+    mode, and trusting a one-character repair when it produces a far more common
+    layout is the whole point of `FORMAT_PRIOR` - it is what turns
+    "MH1ZAB1234" into the "MH12AB1234" the car is actually carrying.
+
+    Two characters is a different claim. "DL 1 ZA 9092" and "DL 12 AG 092" are
+    *both* well-formed plates of *different real cars*, and the only thing
+    separating them is a preference for common layouts. Letting that preference
+    outrank two substitutions means a correct read gets silently rewritten into
+    another vehicle, which is how a stolen car was reported as innocent - so a
+    candidate that needs two or more changes can never outrank an exact one.
+    """
+    if edits == 0:
+        return 2
+    if edits == 1:
+        return 1
+    return 0
+
+
 def _score_candidate(candidate: str, cleaned: str, ocr_score: float) -> Tuple:
-    """Rank tuple; larger is better. Only pattern+whitelist-valid plates rank above 0."""
+    """Rank tuple; larger is better. Only pattern+whitelist-valid plates rank above 0.
+
+    Order matters: how many characters had to change decides before how common
+    the layout is. Ranking the layout prior first would let a nicer-looking
+    guess overwrite an exact read.
+    """
+    edits = _edit_count(candidate, cleaned)
     return (
         1 if is_valid_plate(candidate) else 0,
         1 if PLATE_MIN_LEN <= len(candidate) <= PLATE_MAX_LEN else 0,
+        _edit_trust(edits),
         _format_score(candidate),
-        -_edit_count(candidate, cleaned),
+        -edits,
         round(ocr_score, 4),
         -len(candidate),
     )

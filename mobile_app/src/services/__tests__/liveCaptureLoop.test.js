@@ -90,12 +90,16 @@ function makeFakeFs(stats) {
  */
 function makeCamera(fakeFs, opts = {}) {
   const { script = [], width = 1280, height = 960, bytes = 70 * 1024 } = opts;
-  const stats = { captures: 0, inFlight: 0, maxInFlight: 0, frames: 0 };
+  const stats = { captures: 0, inFlight: 0, maxInFlight: 0, frames: 0, options: [] };
   const cam = {
-    async takePictureAsync() {
+    async takePictureAsync(options) {
       stats.captures += 1;
       stats.inFlight += 1;
       stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+      // What the camera was actually asked for, per capture. The hi-res feature
+      // is entirely about these, so a fake that does not record them could not
+      // tell a working implementation from one that changed nothing.
+      stats.options.push({ ...(options || {}) });
       try {
         // Yield, so an overlap between two loops would be observable rather
         // than something the single-threaded runtime hides for us.
@@ -121,17 +125,28 @@ function makeCamera(fakeFs, opts = {}) {
 function makeClient(opts = {}) {
   const { reply = true } = opts;
   const stats = { sent: 0, bodies: [], lastRoundTripMs: 0, maxInFlight: 0, inFlight: 0 };
+  // A queue of server requests to hand out, one per capture, so a test can say
+  // "the server asks on the third frame" and have the loop see it there.
+  const pending = [];
   return {
     stats,
+    askForHires(want) {
+      pending.push(want || { width: 1600, quality: 0.7, px_w: 90 });
+    },
     client: {
       ready: true,
       connected: true,
       get lastRoundTripMs() {
         return stats.lastRoundTripMs;
       },
-      sendFrame(width, height, lat, lng, base64) {
+      // Take-and-clear, exactly like the real socket: a request the loop never
+      // answers must not be answered by a frame taken seconds later.
+      consumeHiresRequest() {
+        return pending.length ? pending.shift() : null;
+      },
+      sendFrame(width, height, lat, lng, base64, hires) {
         stats.sent += 1;
-        stats.bodies.push({ width, height, lat, lng, base64 });
+        stats.bodies.push({ width, height, lat, lng, base64, hires: Boolean(hires) });
         stats.inFlight += 1;
         stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
         if (reply) queueMicrotask(() => (stats.inFlight -= 1));
@@ -204,7 +219,17 @@ async function stopWithin(loop, ms = 10000) {
  * breaker pause, so the suite runs in seconds rather than the minute that 500
  * real 120 ms-spaced iterations would take.
  */
-const FAST = { minIntervalMs: 0, slowIntervalMs: 0, idleTimeoutMs: 5, failureBackoffMs: 120 };
+// Pacing policy for tests, plus a location stub. `location` is part of the same
+// spread every loop here is built with, so no test has to remember it - and a
+// loop that silently cannot get a fix would otherwise look like a loop that
+// cannot capture.
+const FAST = {
+  minIntervalMs: 0,
+  slowIntervalMs: 0,
+  idleTimeoutMs: 5,
+  failureBackoffMs: 120,
+  location: async () => ({ latitude: 17.44, longitude: 78.35 }),
+};
 
 test("500 iterations of a hostile camera produce zero uncaught rejections and zero ENOENT", async () => {
   const fsStats = { reads: 0, deleted: 0 };
@@ -454,6 +479,195 @@ test("five consecutive capture failures trip the breaker, then it recovers", asy
 
     assert.ok(clientStats.sent > duringOutage, "the loop resumed after the breaker");
     assert.ok(recovered >= 1, "the screen is told the camera is healthy again");
+  }
+});
+
+// ---- the hi-res answer ---------------------------------------------------- //
+
+test("a need_hires request changes the very next capture and is marked on the wire", async () => {
+  const fakeFs = makeFakeFs();
+  const { cam, stats: camStats } = makeCamera(fakeFs, { width: 1280, height: 960 });
+  const { client, stats, askForHires } = makeClient();
+  const loop = new LiveCaptureLoop({ cameraRef: { current: cam }, client, fs: fakeFs.fs, ...FAST });
+  loop.start();
+  try {
+    await waitFor(() => stats.sent >= 1, "one ordinary frame");
+    assert.equal(stats.bodies[0].hires, false, "an ordinary frame is not marked");
+    assert.equal(camStats.options[0].quality, CAPTURE_OPTIONS.quality);
+
+    // The server now finds a plate too small to read.
+    askForHires({ width: 1600, quality: 0.7, px_w: 90 });
+    await waitFor(() => stats.bodies.some((b) => b.hires), "the answering frame");
+
+    const first = stats.bodies.findIndex((b) => b.hires);
+    assert.equal(stats.bodies[first].hires, true, "the frame must be marked, or the server refuses its size");
+    // The capture *before* the marked frame is the one that answered the request,
+    // so the two indices line up.
+    assert.equal(
+      camStats.options[first].quality,
+      0.7,
+      "the request's own quality is used, so the two sides cannot disagree"
+    );
+    assert.ok(
+      stats.bodies.slice(first + 1).every((b) => !b.hires),
+      "exactly one frame answers one request"
+    );
+  } finally {
+    await stopWithin(loop);
+  }
+});
+
+test("a request is answered once, then the loop goes back to ordinary frames", async () => {
+  const fakeFs = makeFakeFs();
+  const { cam } = makeCamera(fakeFs, { width: 1280, height: 960 });
+  const { client, stats, askForHires } = makeClient();
+  const loop = new LiveCaptureLoop({ cameraRef: { current: cam }, client, fs: fakeFs.fs, ...FAST });
+  loop.start();
+  try {
+    askForHires();
+    await waitFor(() => stats.sent >= 3, "three frames");
+    const marked = stats.bodies.filter((b) => b.hires).length;
+    assert.equal(marked, 1, "one request, one marked frame - not one per frame after it");
+  } finally {
+    await stopWithin(loop);
+  }
+});
+
+test("a hi-res frame is never resized back down", async () => {
+  // A camera that ignores `pictureSize` and returns a 1920 px frame at a size
+  // over the soft limit. The ordinary path shrinks it; the hi-res path must not,
+  // because resizing to 1280 px would throw away the pixels the server asked for.
+  const fakeFs = makeFakeFs();
+  const { cam } = makeCamera(fakeFs, { width: 1920, height: 1280, bytes: 320 * 1024 });
+  let manipulates = 0;
+  const image = {
+    async manipulateAsync() {
+      manipulates += 1;
+      return { base64: "A".repeat(100), width: 1280, height: 960, uri: "file:///cache/x.jpg" };
+    },
+    SaveFormat: { JPEG: 1 },
+  };
+  const { client, stats, askForHires } = makeClient();
+  const loop = new LiveCaptureLoop({
+    cameraRef: { current: cam },
+    client,
+    fs: fakeFs.fs,
+    image,
+    ...FAST,
+  });
+  loop.start();
+  try {
+    await waitFor(() => stats.sent >= 1, "one ordinary frame");
+    // The ordinary frame on its own proves the resize path is live, so the
+    // assertion below is about the hi-res frame specifically.
+    assert.equal(stats.bodies[0].width, 1280, "an oversized ordinary frame is resized");
+    assert.equal(manipulates, 1);
+
+    askForHires();
+    await waitFor(() => stats.bodies.some((b) => b.hires), "the answering frame");
+    await stopWithin(loop);
+
+    const marked = stats.bodies.find((b) => b.hires);
+    assert.equal(marked.width, 1920, "the hi-res frame keeps the pixels it was given");
+    assert.equal(marked.height, 1280);
+    // One resize per ordinary frame up to the answer, and none for the answer
+    // itself. Counted per capture rather than as a raw total, because ordinary
+    // frames keep coming while the test waits.
+    const markedIndex = stats.bodies.findIndex((b) => b.hires);
+    assert.equal(manipulates, markedIndex, "the hi-res capture is not resized");
+  } finally {
+    await stopWithin(loop);
+  }
+});
+
+test("capture, encode and send are reported separately", async () => {
+  const fakeFs = makeFakeFs();
+  // 1920 px and 320 KB, so the resize path is entered and `encodeMs` is a real
+  // number rather than a zero that would pass in a version that never times it.
+  const { cam } = makeCamera(fakeFs, { width: 1920, height: 1280, bytes: 320 * 1024 });
+  const image = {
+    async manipulateAsync() {
+      // A real resize takes tens of milliseconds on a phone. Returning
+      // instantly would make `encodeMs` always 0, which would let a version
+      // that never times the resize at all pass this test unchanged.
+      await new Promise((r) => setTimeout(r, 3));
+      return { base64: "A".repeat(100), width: 1280, height: 960, uri: "file:///cache/x.jpg" };
+    },
+    SaveFormat: { JPEG: 1 },
+  };
+  const { client } = makeClient();
+  const timings = [];
+  const loop = new LiveCaptureLoop({
+    cameraRef: { current: cam },
+    client,
+    fs: fakeFs.fs,
+    image,
+    onFrameTiming: (t) => timings.push(t),
+    ...FAST,
+  });
+  loop.start();
+  try {
+    await waitFor(() => timings.length >= 2, "two timed frames");
+  } finally {
+    await stopWithin(loop);
+  }
+  const t = timings[0];
+  // One combined "frame took N ms" figure cannot tell a volunteer whose phone is
+  // slow *why*; the three have three different causes and three fixes.
+  assert.equal(typeof t.captureMs, "number");
+  assert.equal(typeof t.encodeMs, "number");
+  assert.equal(typeof t.sendMs, "number");
+  assert.equal(typeof t.bytes, "number");
+  assert.ok(t.encodeMs > 0, "the oversized frame really did go through the resize");
+  // `bytes` is what went on the wire, not what the camera produced - after the
+  // resize it is the small one, and that is the number that decides whether the
+  // server refuses the frame.
+  assert.equal(t.width, 1280);
+  assert.ok(t.bytes < 300 * 1024, `${t.bytes} bytes is over the soft limit`);
+  assert.equal(t.hires, false);
+});
+
+test("a device that cannot give more pixels is told once, not every frame", async () => {
+  const fakeFs = makeFakeFs();
+  // The camera is stuck at 1280 px whatever is asked for - a real property of
+  // some devices, and one a volunteer deserves to know about rather than to keep
+  // watching a request come and go.
+  const { cam } = makeCamera(fakeFs, { width: 1280, height: 960 });
+  const { client, stats, askForHires } = makeClient();
+  const errors = [];
+  const loop = new LiveCaptureLoop({
+    cameraRef: { current: cam },
+    client,
+    onError: (m) => errors.push(m),
+    ...FAST,
+  });
+  loop.start();
+  try {
+    askForHires({ width: 1600, quality: 0.7, px_w: 90 });
+    await waitFor(() => stats.sent >= 3, "three frames");
+    const said = errors.filter((m) => /more than 1280px/.test(m));
+    assert.equal(said.length, 1, `expected one message, got ${JSON.stringify(errors)}`);
+  } finally {
+    await stopWithin(loop);
+  }
+});
+
+test("an implausible request quality is ignored rather than handed to the camera", async () => {
+  const fakeFs = makeFakeFs();
+  const { cam, stats: camStats } = makeCamera(fakeFs, { width: 1280, height: 960 });
+  const { client, stats, askForHires } = makeClient();
+  const loop = new LiveCaptureLoop({ cameraRef: { current: cam }, client, fs: fakeFs.fs, ...FAST });
+  loop.start();
+  try {
+    askForHires({ width: 1600, quality: 12 });
+    await waitFor(() => stats.sent >= 1, "the answering frame");
+    assert.equal(stats.bodies[0].hires, true, "the frame is still marked");
+    assert.ok(
+      camStats.options[0].quality <= 1,
+      `the camera was asked for quality ${camStats.options[0].quality}`
+    );
+  } finally {
+    await stopWithin(loop);
   }
 });
 
