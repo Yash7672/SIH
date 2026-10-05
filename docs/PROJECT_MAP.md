@@ -62,7 +62,7 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget) and `ScanConnection` (in-flight slots, OCR claims, device) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `render_live_view.py`, `make_test_road_scene.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
 | `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |
@@ -107,6 +107,24 @@ Auth via `?token=` query param **or** a first `{type:"auth"}` message. Server pu
 `{"type":"hotlist_detection","payload":{…}}`. The dashboard retries every 3 s
 (`src/hooks/usePoliceSocket.ts`) and shows "Reconnecting to the alert stream" while down.
 
+The payload carries `sighting_id`, `plate`, `latitude`, `longitude`, `timestamp`,
+`confidence`, `hotlist_id`, **`camera`**, `device_id`, `last_seen_at`. `camera` is
+`device.device_name or device.device_type or "unknown"` — a cop deciding whether to
+roll needs to know whether this is the junction camera or a volunteer's phone, and an
+alert with only coordinates is not actionable at night. Both broadcast sites send it
+(`live_scan.py:_check_hotlist_and_record`, `sightings.py:create_sighting`), so the two
+paths into the dashboard's feed look identical. `AlertEvent` in
+`police_dashboard/src/services/api.ts` types the new fields as optional, since rows
+written before this change do not carry them.
+
+`SightingOut` exposes `plate` and `camera` as **derived** properties on the model
+(`Sighting.plate`, `Sighting.camera`), not columns. There is deliberately no `plate`
+column on `sightings` — the plate belongs to the hot-list entry and duplicating it
+would let the two drift apart — but a sightings list showing only `hotlist_id` cannot
+be matched to anything on screen, so the value is read through the relationship. That
+means `list_sightings` eager-loads `hotlist` and `device` with `selectinload`; without
+it, rendering 500 rows costs 1000 extra queries. No migration is involved.
+
 ### `/api/v1/ws/scan` — live detection (volunteer phone)
 Only mounted when `DEMO_MODE` is true. Max 3 concurrent connections.
 
@@ -125,9 +143,10 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
 
 - Three replies because both detector passes plus decode measure ~190 ms here, so one
   message would put every green box behind the plate pass. `boxes` goes out at
-  ~60 ms p50, `plates` at ~150 ms, and `plate` seconds later. The client keys both
+  ~80 ms p50, `plates` at ~150 ms, and `plate` seconds later. The client keys both
   rectangles off `track`, so a plate box arriving a frame late still lands in the
-  right vehicle.
+  right vehicle. Both `track` values may be negative (see orphan plates above); the
+  overlay stores them in a `Map` and never assumes they index anything.
 - The token travels in the first message, **never in the URL**.
 - Close codes: `4401` bad/missing token or auth timeout, `4403` role or device
   rejected, `4404` too many connections, `1013` server shutting down.
@@ -172,7 +191,7 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
   next frame for the whole plate pass (~60–400 ms) while the phone — which paces on
   `boxes` — offers its next frame ~120 ms later: roughly 1 frame in 10 was thrown
   away and the phone saw a stalled feed. Splitting them took the stream benchmark
-  from 1.2 fps / 2 unanswered to 4.5 fps / 0 unanswered.
+  from 1.2 fps / 2 unanswered to 4.2 fps / 0 unanswered.
 - **OCR is capacity-gated** (`OCR_MAX_IN_FLIGHT = 2`, `OcrClaim`). OCR costs ~2 s per
   crop while a frame is ~200 ms, so an ungated stream grows the queue without limit
   and every queued crop burns cores the green boxes need. A track already in the
@@ -182,6 +201,23 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
   `MAX_READ_ATTEMPTS = 3` per track, stopping at `PLATE_CONF_DONE = 0.8`. Both the
   per-frame and the pixel minimum were tightened downward while nothing was reaching
   this code, which is how a frame with a third plate in view ended up silently unread.
+- **A plate with no vehicle around it is still reported, drawn and read.** The plate
+  detector and the vehicle detector are separate models and they disagree: the vehicle
+  pass can miss a car that is half out of frame, at night or behind a pillar, while the
+  plate pass still sees the rectangle it was trained to find. Those were being dropped
+  (`assign_plates` did `continue` on no host) on the grounds that drawing them produced
+  "stray red rectangles floating over empty road". That was the wrong trade — the
+  dropped detection was usually the one car worth looking at, and the phone keys plate
+  boxes on nothing but the track id the server sends, so reporting one costs it nothing.
+  Orphans now get a **negative** track id (`ORPHAN_TID_BASE = -1`, counting down; the
+  tracker counts up from 1, so the ranges cannot meet). They have no per-car budget to
+  hang on, so they are charged against `ScanConnection.orphans`, keyed by a coarse
+  position cell — `ORPHAN_MAX_ATTEMPTS = 1`, `MAX_ORPHAN_READS_PER_FRAME = 1`,
+  `ORPHAN_MEMORY_SECONDS = 30`. A sign on a wall gets one look, ever; a jittering box
+  does not earn a fresh budget each frame; and cars are spent first because
+  `infer_plates` fills its crop list from tracks before it looks at orphans. An orphan
+  is sent with `"label": null`, because a chip reading "CAR 1" over a plate with no car
+  would be a lie. Pinned by `backend/tests/test_orphan_plates.py`.
 - Backpressure: latest-frame-wins (a frame arriving while one is in flight is
   dropped), 15 fps per device. The server drops the whole burst while a frame is in
   flight, so it answers the frame it accepted rather than the newest one; newest-wins
@@ -228,6 +264,52 @@ Four decisions that are load-bearing, and would be easy to undo by accident:
   On Android `pictureSize` also feeds the Preview `ResolutionSelector`
   (`ExpoCameraView.kt` builds one selector and hands it to both use cases), so a
   narrower capture would blur the preview as well — two reasons for the same floor.
+
+### Never read a temp file back — this is what caused the crash
+
+The `FileSystemFile.base64` ENOENT in the Metro log was not a permissions problem or
+a camera bug. `_downscale()` did:
+
+```js
+const file = new File(uri);            // manipulator wrote this, fine
+await manipulator.manipulate(uri).saveAsync({ compress, resize })  // ok
+const base64 = file.base64();          // <- NOT awaited
+```
+
+`File.base64()` returns a **Promise** in expo-file-system 58 (the sync twin is
+`base64Sync()`), and `File.delete()` is synchronous. So the un-awaited Promise was
+`JSON.stringify`d as the frame body — `{}` — while `delete()` unlinked the file that
+the native read was still queued against. Hence
+`java.io.FileNotFoundException: .../cache/ExperienceData/.../ImageManipulator/<uuid>.jpg:
+open failed: ENOENT`. The `ImageManipulator/` path in the message is what proves the
+crash came from the resize step, not the camera's own temp file.
+
+The rule now: **get the bytes in the same call that creates the image.** The resize
+pass passes `base64: true` in `SaveOptions` and reads `ImageResult.base64`
+(`expo-image-manipulator` 58.0.11, `ImageManipulator.types.d.ts`). No `File` is ever
+constructed to read bytes back. Temp files are deleted only *after* the frame is sent,
+inside the same awaited `try`/`finally`, and an already-collected file is ignored.
+
+The ENOENT itself was a race, so the regression guard is the deterministic half:
+`fsStats.reads === 0` in `mobile_app/src/services/__tests__/liveCaptureLoop.test.js`.
+Never reading a file removes the window that the race lived in.
+
+`expo-image-manipulator` is still a real dependency, deliberately: Android's
+`ResolutionStrategy(size, FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)` can hand back a
+size *larger* than requested (1920), so the net is genuinely needed, not vestigial.
+
+### The loop cannot be started twice
+
+`loop.stop()` clears `_running` *before* awaiting, and the screen used to call it
+fire-and-forget. A focus event landing in that window started a second loop while the
+first was still mid-iteration. Now `start()` chains on the previous `stop()`'s
+completion, a generation counter retires superseded loops, and one boolean lock is
+taken before any `await` in an iteration and released in `finally`. Every async call
+inside one `try`/`catch`/`finally` logs exactly one concise line per failure type.
+
+After 5 consecutive capture failures the loop pauses 2 s, surfaces "Camera error,
+retrying", and resumes. `onRecover` fires only once a frame actually succeeds, so the
+message clears when the camera really came back rather than when the timer elapsed.
 
 Removed on purpose: the Scan-plate shutter button, the guide frame, the dashed
 rectangle and the hint strip. There is no shutter on a live feed, and text drawn over
@@ -338,10 +420,11 @@ PC on the network.
 | `test_live_scan_frames.py` | working width matches what the app sends, ceiling ordering, aspect ratio, read budget |
 | `test_live_scan_ws.py` | the whole wire contract end-to-end with the detectors stubbed: `boxes`/`plates`/`plate` ordering, per-connection trackers, auth + RBAC close codes, latest-frame-wins, split in-flight slots, OCR queue depth, privacy (a non-hot-listed plate stores nothing) |
 | `test_scan_tracker.py` | `VehicleTracker`: IoU matching, id stability, per-class chip numbering, expiry, plate read budget |
+| `test_orphan_plates.py` | a plate with no vehicle around it is drawn and read under a negative id; one read per frame, one attempt ever, jitter does not earn a fresh budget, the entry does not outlive its object |
 
 Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
-167 tests, all passing (`pytest -q -p no:randomly`, ~90 s).
+179 tests, all passing (`pytest -q -p no:randomly`, ~100 s).
 
 `scripts/live_scan_test.py` is the live-path check (needs the backend running) —
 24 checks covering auth rejection, RBAC, a self-calibrating probe of what the OCR
@@ -359,8 +442,35 @@ are not redistributable, and a synthetic plate on a real background is the only 
 to keep a *fixed* expected plate string in a committed fixture. Multi-vehicle
 behaviour is covered by the deterministic `VehicleTracker` unit tests instead.
 
-Mobile overlay maths: `node --test src/components/__tests__/liveOverlayMath.test.js`
-(37 tests — run it from `mobile_app`, with the explicit file path).
+Mobile tests: `node --test src/components/__tests__/liveOverlayMath.test.js
+src/services/__tests__/liveCaptureLoop.test.js` — **43 pass** (37 overlay maths, 6
+capture-loop). Run from `mobile_app` with explicit paths; from the repo root Node
+reports `MODULE_NOT_FOUND`.
+
+`liveCaptureLoop.test.js` is the regression harness for the ENOENT crash and it is
+built to be hard to pass by accident:
+
+- 500 iterations against a hostile camera (fails, deletes files, throws) — asserts
+  **zero** uncaught rejections, `fsStats.reads === 0`, and `maxInFlight === 1` on both
+  the camera and the socket.
+- Two mutations prove it is not vacuous. Reinstating the old read-back fails on "no
+  read-back, even on the resize path"; restoring the original lifecycle fails
+  deterministically on "timed out after 30000ms waiting for: 2 captures".
+- The breaker, the resize path, and the capture options are pinned separately.
+- Native seams (`fs`, `location`, `image`) are lazy and injectable, and the pacing
+  constants (`minIntervalMs`, `slowIntervalMs`, `idleTimeoutMs`, `failureBackoffMs`)
+  are injected too, so the whole loop runs under `node --test` with no device.
+
+### The three end-to-end scripts
+
+| Script | Answers | Needs |
+| --- | --- | --- |
+| `scripts/chain_check.py` | the whole chain through the real API — complaint → Verify → hot-list immediately → frame → STOLEN banner → `/ws/police` alert within 3 s → one sighting row (60 s cooldown) → heat cells → the plate coming off the list stops it. **33/33.** | backend running |
+| `scripts/heat_check.py` | items 5 and 7 over the public API only: 401 without a token, 403 for CITIZEN and VOLUNTEER, both layers, the 7-day and 5,000-cell caps, the 10 s cache via `generated_at`, and that `/sightings` refuses multipart (415), refuses image/video fields (422), and has no imagery column. **14/14.** | backend running |
+| `scripts/speed_check.py` | item 8 — 1 / 4 / 6 vehicles at fixed width, closed loop and saturated. Budget: 150 ms p95 on the boxes reply. | backend running |
+
+`chain_check.py` hard-codes no plate name: it reads `MH12JK4567` from the fixture and
+asserts against that, so the check cannot pass on an OCR result nobody actually got.
 
 ### `scripts/render_live_view.py`
 
@@ -437,14 +547,60 @@ area uniformly pale.
 - **`tree.txt`** at the repo root is a leftover scratch file from an earlier session; untracked.
 - **`scripts/start.sh` is syntax-unverified**: no WSL on this machine, so `bash -n` cannot
   run. The `PYTHONPATH` fix it carries is mirrored from `start.ps1` and untested there.
-- **Live-scan latency is ~60 ms p50 / ~200 ms p95 for the green boxes**, against the
-  120 ms p50 target, with plate boxes at ~150 ms / ~520 ms and the OCR text seconds
-  after that. Measured end-to-end over the real WebSocket with the real models:
-  4.5 fps per phone, 0 unanswered frames, 95 s CPU over 20 s wall (4.7 cores) on an
-  8-core box. The earlier ~240 ms figure was two things at once: the old single
-  `boxes` message that waited for the plate pass too, and one in-flight slot held
-  across both stages. Splitting the stages and answering `boxes` first is what moved
-  it.
+- **Live-scan latency: green boxes 80 ms p50 / 341 ms p95**, round trip 83 / 377 ms,
+  plate boxes 196 / 736 ms, and the OCR text seconds after that — measured
+  end-to-end over the real WebSocket with the real models (`scripts/live_scan_test.py`,
+  83 frames, 4.2 fps, 0 unanswered, 105.8 s CPU over 22.1 s wall = 4.79 cores, peak
+  RSS 556 MB, on an 8-core box). The p50 target of 120 ms is met; **the p95 is not**.
+  The earlier ~240 ms figure was two things at once: the old single `boxes` message
+  that waited for the plate pass too, and one in-flight slot held across both stages.
+  Splitting the stages and answering `boxes` first is what moved it.
+- **The p95 tail is OCR contending with the pass the phone renders, not detection
+  cost.** `scripts/probe_leg_contention.py` sends the *same* 1280 px one-car frame
+  three ways and the box reply is **2.7x** slower when the plate reads: 317 ms p50 /
+  1289 ms p95 with the plate readable, 118 / 230 with the plate cropped out of frame,
+  122 / 709 with it blurred. Both legs share one process and
+  `torch.set_num_threads(2)` (`live_scan.py:57`), so a readable plate costs the
+  vehicle pass its threads for the ~2 s the OCR takes. Once a car's plate has been
+  read (conf ≥ 0.8 sets `plate_settled`) no more OCR is queued for it and the box
+  timing returns to baseline. So the cost curve has to be read from the *unreadable*
+  column; the readable column is contention on top.
+  - **`torch.set_num_threads(2)` is deliberately not raised.** It would clear most
+    of the p95 on this 8-core laptop and push the same work onto a 4-core target
+    machine. That is a hardware decision, not a bug fix. The alternative — moving OCR
+    to its own process — removes the contention outright but doubles the resident
+    model set.
+  - `scripts/speed_check.py` measures 1 / 4 / 6 vehicles at a **fixed 1280 px width**,
+    because an earlier version pasted cars side by side and so tripled the pixels to
+    decode along with the vehicle count — it was measuring the JPEG decoder, not the
+    cost of another detection. Geometry shrinks each car as the count grows, so at 6
+    the plates are too small to read; the box timing is what is under test. It reports
+    a closed-loop run (one frame in flight, what the phone does) and a saturated run
+    (250 ms regardless) separately, and budgets only the closed loop.
+  - `scripts/speed_notes.py` is the reconciliation, written because the three probes
+    disagreed. One of them, `scripts/probe_static_scene.py`, is **void**: it ran both
+    phases on one connection, so the first phase read the plate and set
+    `plate_settled`, and the "static" phase inherited an already-settled track, never
+    queued a crop and so was never contended. It is kept, not deleted, because anyone
+    comparing the two scripts would otherwise think they contradict each other.
+- **`POST /complaints/{id}/reject` cannot undo a Verify.** It only accepts `PENDING`
+  or `UNDER_REVIEW` and returns `409` on a `HOTLISTED` complaint. That is deliberate
+  (a verified theft report should not be discarded by a later click), but it means
+  "rejecting removes the plate" is the wrong mental model for the hot-list path: once
+  a plate is listed, `PATCH /hotlist/{id}` with `{"status":"CLOSED"}` is what takes it
+  off (`hotlist_service` → `cache_service.remove_active_plate`), and that is what a cop
+  uses when the car is recovered. Both are exercised by `scripts/chain_check.py`.
+- **`GET /api/v1/sightings` has no `plate` filter** — only `hotlist_id`. Any other
+  query parameter is silently ignored and the response is the most recent 500 rows for
+  *every* plate. A `?plate=` request looks like it works and quietly returns unrelated
+  rows, which is how a privacy check counting sightings can pass or fail for the wrong
+  reason. Filter client-side until there is a server-side filter worth having.
+- **`/api/v1/geo/heat` caching is only observable via `generated_at`.** The query is a
+  couple of cells wide on a demo database, so a cache hit and a miss differ by less
+  than request overhead and any timing-based check of the 10 s TTL is pure noise.
+  `generated_at` is stamped when the payload is *built*, so an identical timestamp
+  across two calls proves the cache and a new one after the TTL proves the expiry —
+  that is what `scripts/heat_check.py` checks.
 - **The demo road video yields plate detections but no COCO vehicle detections**, so a live
   `/ws/scan` run writes cells with `frames = N` and all vehicle counts zero. That is correct
   (an empty road is low density, not missing data) but means real density needs a real road.

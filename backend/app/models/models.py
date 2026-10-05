@@ -179,6 +179,25 @@ class Sighting(Base):
     hotlist: Mapped["Hotlist"] = relationship(back_populates="sightings")
     device: Mapped["Device"] = relationship(back_populates="sightings")
 
+    # Derived, not stored.
+    #
+    # There is deliberately no `plate` column on `sightings`: the plate belongs to
+    # the hot-list entry, and duplicating it would let the two drift apart. But a
+    # sightings list that shows only `hotlist_id` cannot be matched to a plate by
+    # anything reading the API, so the value is exposed as a property instead of
+    # a column. That keeps the schema unchanged while making the list usable, and
+    # it means the list endpoint must eager-load both relationships or this costs
+    # one query per row.
+    @property
+    def plate(self) -> str | None:
+        return self.hotlist.plate if self.hotlist is not None else None
+
+    @property
+    def camera(self) -> str | None:
+        if self.device is None:
+            return None
+        return self.device.device_name or self.device.device_type
+
     __table_args__ = (
         Index("idx_sightings_detected_at", "detected_at"),
         Index("idx_sightings_device_id", "device_id"),

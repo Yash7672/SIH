@@ -22,6 +22,11 @@ dist/
 # dumps under data/debug_out/ are committed, but these are regenerable from a
 # fixture in the repo and would otherwise dirty the tree on every run.
 data/debug_out/live_view_*.jpg
+# `scripts/speed_check.py` writes its composite 1/4/6-vehicle scenes here so they
+# can be looked at by eye after a run. Same reasoning as the debug dumps above:
+# regenerable from data/test_plates/road_scene.jpg, and nothing reads them at
+# runtime.
+data/speed_scenes/
 build/
 *.log
 .DS_Store

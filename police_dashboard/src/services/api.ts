@@ -168,6 +168,10 @@ export interface AlertEvent {
   timestamp: string;
   confidence?: number;
   hotlist_id: string;
+  /** Which camera saw it. Both alert paths send it; older rows may not. */
+  camera?: string;
+  device_id?: string;
+  last_seen_at?: string | null;
 }
 
 export interface Overview {

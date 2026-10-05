@@ -97,10 +97,18 @@ class SightingOut(BaseModel):
     id: UUID
     hotlist_id: UUID
     device_id: UUID
+    # The plate is included deliberately. A sighting row only ever exists for a
+    # plate that is already on the police hot-list (sighting_service returns None
+    # otherwise), so this discloses nothing the officer cannot already see - and
+    # without it the sightings list is a column of hot-list ids that cannot be
+    # matched to anything on screen.
+    plate: Optional[str] = None
     latitude: float
     longitude: float
     detected_at: datetime
     confidence: Optional[float] = None
+    # Which camera saw it, from the device. Same reason.
+    camera: Optional[str] = None
 
 
 class DeviceRegister(BaseModel):

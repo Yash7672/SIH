@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_cop, require_volunteer
@@ -76,6 +77,10 @@ async def create_sighting(
         "timestamp": sighting.detected_at.isoformat(),
         "confidence": sighting.confidence,
         "hotlist_id": str(sighting.hotlist_id),
+        # Same field the live scanner sends, so both paths into the dashboard's
+        # alert feed look identical to whatever consumes it.
+        "camera": device.device_name or device.device_type or "unknown",
+        "device_id": str(device.id),
         "last_seen_at": hotlist_entry.last_seen_at.isoformat() if hotlist_entry and hotlist_entry.last_seen_at else None,
     }
     await alert_manager.broadcast("hotlist_detection", alert_payload)
@@ -98,6 +103,10 @@ def list_sightings(
     stmt = select(Sighting).order_by(Sighting.detected_at.desc()).limit(500)
     if hotlist_id:
         stmt = stmt.where(Sighting.hotlist_id == hotlist_id).order_by(Sighting.detected_at.asc())
+    # SightingOut.plate and .camera are derived from these two relationships, so
+    # they are eager-loaded here: without this, rendering 500 rows costs 1000
+    # extra queries.
+    stmt = stmt.options(selectinload(Sighting.hotlist), selectinload(Sighting.device))
     return list(db.execute(stmt).scalars())
 
 

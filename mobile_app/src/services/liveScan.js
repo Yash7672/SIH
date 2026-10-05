@@ -68,6 +68,15 @@ export class LiveScanClient {
     this._refreshTried = false;
   }
 
+  /**
+   * Open the socket.
+   *
+   * Declared `async` for the one thing it awaits (the stored device id), but it
+   * is written so it cannot reject: `new WebSocket()` throws synchronously on a
+   * malformed URL, and this is called from a reconnect timer and from an effect
+   * body, neither of which is watching for a promise. A failed connect has to
+   * show up as OFFLINE on screen, not as an unhandled rejection.
+   */
   async connect() {
     if (this.ws) return;
     this._closed = false;
@@ -88,7 +97,15 @@ export class LiveScanClient {
     if (this._closed) return;
 
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/api/v1/ws/scan";
-    const ws = new WebSocket(wsUrl);
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (e) {
+      // An unusable base URL is a configuration fault, not a dropped connection.
+      this._state("OFFLINE");
+      this._scheduleReconnect();
+      return;
+    }
     this.ws = ws;
 
     ws.onopen = () => {
@@ -206,7 +223,7 @@ export class LiveScanClient {
       } catch (e) {
         // A dead socket surfaces as a close next tick.
       }
-      this._maybeReauth();
+      this._maybeReauth().catch(() => {});
     }, PING_MS);
   }
 

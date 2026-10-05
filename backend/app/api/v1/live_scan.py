@@ -49,7 +49,14 @@ from app.services.hotlist_service import HotlistService
 from app.services.sighting_service import SightingService
 from app.services.traffic_service import traffic_accumulator
 from app.ws.manager import alert_manager
-from app.ws.scan_manager import COCO_CLASS_IDS, Detection, ScanConnection, Track, VehicleTracker
+from app.ws.scan_manager import (
+    COCO_CLASS_IDS,
+    ORPHAN_MAX_ATTEMPTS,
+    Detection,
+    ScanConnection,
+    Track,
+    VehicleTracker,
+)
 
 # AI dependencies
 import torch
@@ -164,6 +171,19 @@ ocr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LiveOCR")
 OCR_MAX_IN_FLIGHT = 2
 _ocr_inflight = 0
 _ocr_lock = threading.Lock()
+
+# Plate-shaped detections with no vehicle around them get drawn and read like any
+# other, but they are the least likely thing in the frame to be a car and the most
+# likely to be a sign, a shopfront or a bus back. One per frame, and one attempt
+# ever each (`ORPHAN_MAX_ATTEMPTS`), is enough to know what it says and cheap
+# enough that it cannot starve the pass the phone actually renders.
+MAX_ORPHAN_READS_PER_FRAME = 1
+# Track ids for plates with no vehicle around them are negative, counting down from
+# here. The tracker hands out positive ids counting up from 1, so the two ranges
+# cannot meet however long a connection lives. The base is -1, not 0: the first
+# orphan must already be negative, because `assign_plates` derives the id from how
+# many crops it has collected so far, and that count starts at zero.
+ORPHAN_TID_BASE = -1
 
 
 def _ocr_reserve(want: int) -> int:
@@ -331,8 +351,24 @@ def assign_plates(
     test is what makes the red box sit inside the green one on screen, and it is
     why the client can key the red box by track id instead of guessing.
 
-    Returns the wire list plus ``{track_id: (box, conf)}`` for the tracks that
-    are worth reading.
+    A plate with NO vehicle around it is still reported, still drawn and still
+    read - it just gets a synthetic negative track id instead of a real one.
+    Vehicle ids count up from 1, so negatives can never collide, and the phone
+    keys its plate boxes on nothing but this id, so it cannot tell the difference
+    and needs no change.
+
+    That case is real: the vehicle detector misses a car that is half out of
+    frame, at night, or occluded - and the plate detector, which is a different
+    model looking at a much smaller pattern, still sees the plate. Dropping it
+    meant the one detection that mattered was the one we threw away.
+
+    The cost of keeping them is OCR budget, which is why they are handled apart
+    from real tracks: `infer_plates` gives them one read each, never more (see
+    `MAX_ORPHAN_READS_PER_FRAME` and `OrphanBudget`). A sign on a wall is not a
+    licence to spend a second of CPU on it every frame.
+
+    Returns the wire list plus ``{track_id: (box, conf)}`` for everything worth
+    reading, orphans included under their negative ids.
     """
     plates: List[dict] = []
     crops: Dict[int, Tuple[List[float], float]] = {}
@@ -347,22 +383,22 @@ def assign_plates(
                 area = (tx2 - tx1) * (ty2 - ty1)
                 if host is None or area < host[0]:
                     host = (area, track)
-        if host is None:
-            # A plate with no vehicle around it has no green box to sit in, and
-            # nothing to hang a track id off. Drawing it anyway is what produced
-            # stray red rectangles floating over empty road.
-            continue
-        track = host[1]
-        if track.tid in crops:
+        tid = host[1].tid if host is not None else None
+        if tid is not None and tid in crops:
             continue
         box_px = (box[2] - box[0]) * width
         box_py = (box[3] - box[1]) * height
         if box_px < MIN_PLATE_PX or box_py < 12:
             continue
+        if tid is None:
+            # Stable across frames while the thing stays put, so the budget below
+            # can recognise it as "the same sign I already gave up on" and leave
+            # it alone instead of re-reading it every frame.
+            tid = ORPHAN_TID_BASE - len(crops)
         plates.append(
-            {"track": track.tid, "conf": round(float(conf), 4), "box": [round(float(v), 5) for v in box]}
+            {"track": tid, "conf": round(float(conf), 4), "box": [round(float(v), 5) for v in box]}
         )
-        crops[track.tid] = (box, conf)
+        crops[tid] = (box, conf)
     return plates, crops
 
 
@@ -398,6 +434,7 @@ def infer_plates(
     tracks: List[Track],
     tracker: VehicleTracker,
     ocr_busy: Optional[set] = None,
+    conn: Optional["ScanConnection"] = None,
 ):
     """Stage 2: one plate-detector call for the frame, assigned to vehicles.
 
@@ -411,20 +448,39 @@ def infer_plates(
     not a read, and charging it against the per-track budget would settle a car
     that was never actually looked at, so its chip would read "reading..." for
     ever.
+
+    Negative track ids are the plates with no vehicle around them (see
+    `assign_plates`). They are drawn either way, but they have no per-car budget,
+    so they are charged against the connection's orphan budget instead and `conn`
+    is what carries it. They are also strictly last: a car that was detected is
+    worth more OCR than a rectangle that might be a sign.
     """
     plate_dets = detect_plates(bgr)
     plates, found = assign_plates(tracks, plate_dets, w, h)
 
     busy = ocr_busy or set()
-    widths = {tid: (box[2] - box[0]) * w for tid, (box, _c) in found.items()}
+    hosted = {tid: width for tid, width in ((t, (b[2] - b[0]) * w) for t, (b, _c) in found.items()) if tid > 0}
     crops: Dict[int, np.ndarray] = {}
-    for track, _px in tracker.plates_to_read(widths, MAX_READS_PER_FRAME, PLATE_CONF_DONE):
+    for track, _px in tracker.plates_to_read(hosted, MAX_READS_PER_FRAME, PLATE_CONF_DONE):
         if track.tid in busy:
             continue
         crop = _crop_for_ocr(bgr, found[track.tid][0])
         if crop is not None:
             track.attempts += 1
             crops[track.tid] = crop
+
+    if conn is not None:
+        now = time.monotonic()
+        spent = 0
+        for tid, (box, _conf) in found.items():
+            if tid > 0 or spent >= MAX_ORPHAN_READS_PER_FRAME:
+                continue
+            if not conn.claim_orphan(tid, box, now, ORPHAN_MAX_ATTEMPTS):
+                continue
+            crop = _crop_for_ocr(bgr, box)
+            if crop is not None:
+                crops[tid] = crop
+                spent += 1
     return plates, crops
 
 
@@ -530,6 +586,11 @@ async def _check_hotlist_and_record(
             "timestamp": sighting.detected_at.isoformat(),
             "confidence": sighting.confidence,
             "hotlist_id": str(sighting.hotlist_id),
+            # Which camera saw it. A cop deciding whether to roll needs to know
+            # whether this is the junction camera or a volunteer's phone, and an
+            # alert with only coordinates is not actionable at night.
+            "camera": device.device_name or device.device_type or "unknown",
+            "device_id": str(device.id),
             "last_seen_at": entry.last_seen_at.isoformat() if entry and entry.last_seen_at else None,
         },
     )
@@ -676,7 +737,7 @@ async def ws_live_scan(websocket: WebSocket):
                     try:
                         plates, crops = await loop.run_in_executor(
                             inference_pool,
-                            lambda: infer_plates(bgr, w, h, tracks, conn.tracker, conn.ocr_tracks),
+                            lambda: infer_plates(bgr, w, h, tracks, conn.tracker, conn.ocr_tracks, conn),
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Live scan plate pass error: %s", exc)
@@ -725,23 +786,37 @@ async def ws_live_scan(websocket: WebSocket):
                 for tid, crop in crops.items():
                     try:
                         track = conn.tracker.get(tid)
-                        if track is None:
+                        orphan = track is None and tid < 0
+                        if track is None and not orphan:
                             # The vehicle left view while OCR was queued.
                             continue
                         result = await loop.run_in_executor(ocr_pool, run_ocr, crop)
                         if result is None:
                             # Keep the chip honest: no read this attempt. The track
                             # stays eligible until it runs out of attempts.
-                            if track.attempts >= MAX_READ_ATTEMPTS:
+                            box = conn.take_orphan_box(tid)
+                            if orphan:
+                                if box is not None:
+                                    conn.settle_orphan(box, ORPHAN_MAX_ATTEMPTS)
+                            elif track.attempts >= MAX_READ_ATTEMPTS:
                                 track.plate_settled = True
                             continue
 
-                        track.plate_text = result["text"]
-                        track.plate_conf = result["conf"]
-                        track.plate_valid = result["valid"]
-                        if result["conf"] >= PLATE_CONF_DONE or track.attempts >= MAX_READ_ATTEMPTS:
-                            # Good enough, or out of budget: stop paying for this car.
-                            track.plate_settled = True
+                        if orphan:
+                            # No vehicle to write back to, and nothing to settle -
+                            # the budget in `claim_orphan` is the whole lifetime.
+                            # The read still goes to the phone, because a plate
+                            # nobody detected a vehicle around is still a plate.
+                            box = conn.take_orphan_box(tid)
+                            if box is not None:
+                                conn.settle_orphan(box, ORPHAN_MAX_ATTEMPTS)
+                        else:
+                            track.plate_text = result["text"]
+                            track.plate_conf = result["conf"]
+                            track.plate_valid = result["valid"]
+                            if result["conf"] >= PLATE_CONF_DONE or track.attempts >= MAX_READ_ATTEMPTS:
+                                # Good enough, or out of budget: stop paying for this car.
+                                track.plate_settled = True
 
                         stolen = False
                         if result["valid"]:
@@ -752,24 +827,28 @@ async def ws_live_scan(websocket: WebSocket):
                                 )
                             finally:
                                 db.close()
-                        track.plate_stolen = bool(stolen and result["valid"])
 
                         try:
                             await send({
                                 "type": "plate",
                                 "track": tid,
-                                "label": track.label,
+                                # No vehicle means no class to name it, and a chip
+                                # reading "CAR 1" over a plate with no car would be
+                                # a lie. The red box and its text are the whole
+                                # report.
+                                "label": None if orphan else track.label,
                                 "seq": seq,
                                 "text": result["text"],
                                 "norm": result["norm"],
                                 "conf": result["conf"],
                                 "valid": result["valid"],
-                                "stolen": track.plate_stolen,
+                                "stolen": bool(stolen and result["valid"]),
                             })
                         except Exception:  # noqa: BLE001 - client gone
                             return
                     finally:
                         conn.ocr_tracks.discard(tid)
+                        conn.orphan_boxes.pop(tid, None)
             finally:
                 conn.ocr_claims.discard(claim)
                 claim.release()

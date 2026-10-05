@@ -69,7 +69,15 @@ export default function ScannerScreen({ user, onLogout }) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      let id = await AsyncStorage.getItem(DEVICE_KEY);
+      // Every await in here is guarded: an IIFE that rejects with nobody
+      // listening is exactly the "Uncaught (in promise)" noise this screen
+      // used to produce.
+      let id = null;
+      try {
+        id = await AsyncStorage.getItem(DEVICE_KEY);
+      } catch (e) {
+        id = null;
+      }
       if (!id) {
         try {
           const dev = await registerDevice(`Scanner-${Date.now() % 10000}`);
@@ -189,7 +197,9 @@ export default function ScannerScreen({ user, onLogout }) {
       },
     });
     client.setDeviceId(deviceId);
-    client.connect();
+    // connect() is async and constructs the socket; a malformed base URL would
+    // reject here with nobody listening, so it is settled explicitly.
+    Promise.resolve(client.connect()).catch(() => {});
     clientRef.current = client;
 
     return () => {
@@ -219,6 +229,12 @@ export default function ScannerScreen({ user, onLogout }) {
       onError: (message) => {
         setCameraFault(message);
       },
+      // The loop only calls this once it has produced a frame again, so the
+      // "Camera error, retrying" notice disappears the moment the camera is
+      // healthy instead of hanging around until the next unrelated fault.
+      onRecover: () => {
+        setCameraFault(null);
+      },
     });
     loopRef.current = loop;
     loop.start();
@@ -226,9 +242,14 @@ export default function ScannerScreen({ user, onLogout }) {
     setCameraFault(null);
 
     return () => {
-      loop.stop();
+      // React does not await an effect cleanup, so the stop promise is settled
+      // here rather than left to surface as an unhandled rejection. The loop
+      // itself chains a start() that lands mid-teardown onto this one, so the
+      // "never two loops" guarantee holds even if focus flaps.
+      const stopping = loop.stop();
       loopRef.current = null;
       setCameraActive(false);
+      Promise.resolve(stopping).catch(() => {});
     };
   }, [deviceReady, streaming, focused]);
 
@@ -270,10 +291,13 @@ export default function ScannerScreen({ user, onLogout }) {
     }
   }
 
-  async function onLogoutClear() {
-    await AsyncStorage.removeItem(DEVICE_KEY);
-    onLogout();
-  }
+  // React Native does not await `onPress`, so this handler must be unable to
+  // reject: losing the logout over a failed key removal would be a bad trade.
+  const onLogoutClear = useCallback(() => {
+    Promise.resolve(AsyncStorage.removeItem(DEVICE_KEY))
+      .catch(() => {})
+      .then(() => onLogout());
+  }, [onLogout]);
 
   return (
     <ScannerScreenView

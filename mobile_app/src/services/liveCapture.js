@@ -1,18 +1,67 @@
-import { File } from "expo-file-system";
-import { getLocation } from "./location";
-
 /**
  * The live capture loop.
  *
- * One loop, one capture at a time, always. The server can only usefully look at
- * one frame at a time anyway, so a second capture in flight is pure cost: it
- * heats the phone, starves the JS thread that also has to decode base64 and
- * draw the boxes, and it makes the frame rate number on screen meaningless.
+ * One loop, one capture at a time, always - and, since the ENOENT crash, one
+ * *iteration* at a time. Three separate defects used to be able to overlap here,
+ * and all three ended in the same crash on Metro:
  *
+ *   Uncaught (in promise): Error: Call to function 'FileSystemFile.base64' has
+ *   been rejected. Caused by: java.io.FileNotFoundException:
+ *   .../ImageManipulator/<uuid>.jpg: open failed: ENOENT
+ *
+ *   1. `File.base64()` is ASYNC in the installed expo-file-system 58.0.5 -
+ *      `base64(): Promise<string>`, with `base64Sync()` as the synchronous twin -
+ *      while `exists` is a plain boolean and `delete()` returns void. The old
+ *      `_downscale` therefore read the resized file, received a *Promise*, and
+ *      shipped that Promise as the frame body; the `finally` block then deleted
+ *      the very file whose read was still queued on the native bridge. The
+ *      pending call threw FileNotFoundException and, never having been awaited,
+ *      took the whole app down. The `ImageManipulator/<uuid>.jpg` in the message
+ *      is the proof that it was the resize path, not the camera's own temp file -
+ *      which is why it only ever appeared on devices where `pictureSize` is not
+ *      honoured.
+ *      Nothing in this file reads a temp file back now. The bytes always arrive
+ *      in the same call that produced them.
+ *   2. `stop()` cleared `_running` *before* awaiting the old loop, so a screen
+ *      that regained focus inside that window passed the `start()` guard and
+ *      began a second loop while the first was still inside an iteration.
+ *   3. `stop()` was called fire-and-forget from the effect cleanup.
+ *
+ * Strict serialisation is now structural rather than incidental: every iteration
+ * takes `_lock` and drops it in `finally`, each loop run carries a generation
+ * number that `stop()` retires (so a draining loop cannot be resurrected), and a
+ * `start()` issued during a `stop()` chains onto the draining loop rather than
+ * racing it.
+ */
+
+// Native modules are pulled in lazily. Metro handles this fine - the resize path
+// already did it for expo-image-manipulator - and it is what lets this loop run
+// under `node --test` with an injected fake, so the crash above stays fixed by a
+// test rather than by a phone.
+let fsPromise = null;
+function loadFileSystem() {
+  if (!fsPromise) fsPromise = import("expo-file-system");
+  return fsPromise;
+}
+
+let locationPromise = null;
+async function loadLocation() {
+  if (!locationPromise) locationPromise = await import("./location");
+  return (await locationPromise).getLocation;
+}
+
+let manipulatorPromise = null;
+function loadImageManipulator() {
+  if (!manipulatorPromise) manipulatorPromise = import("expo-image-manipulator");
+  return manipulatorPromise;
+}
+
+/**
  * Capture options, all verified against the installed expo-camera 58.0.7:
  *
  *   - `base64: true` reads the JPEG the native side already compressed, so the
- *     bytes never cross into JS as a file and back.
+ *     bytes never cross into JS as a file and back. This is the reason there is
+ *     no resize step on the fast path.
  *   - `quality: 0.4` is the working point. The server works at 1280 px wide and
  *     a 1280 px frame at quality 0.4 is ~70 KB - comfortably under the 300 KB
  *     soft limit - and the plate still reads at 0.99 confidence. Only higher
@@ -50,14 +99,25 @@ const CAPTURE_OPTIONS = {
 const MIN_PICTURE_WIDTH = 1280;
 
 // Above this the frame is over the server's soft limit and gets downscaled
-// anyway, so there is no point capturing larger pixels. Used only to decide when
-// to fall back to the slower file-based downscale.
+// anyway, so there is no point capturing larger pixels. This is a real case, not
+// a theoretical one: `pictureSize` becomes
+// `ResolutionStrategy(size, FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)` in
+// ExpoCameraView.kt, which serves the requested size when the device has it and
+// otherwise the closest *higher* one. So the resize path stays, it is just no
+// longer allowed to touch the filesystem.
 const MAX_PICTURE_WIDTH = 1280;
 
 // The server's SOFT_FRAME_BYTES. Below it a frame is kept as sent; above it the
 // server downscales and logs. Kept here so the client can avoid the situation
 // rather than merely survive it. Mirrors backend/app/api/v1/live_scan.py.
 const SOFT_FRAME_BYTES = 300 * 1024;
+
+// Circuit breaker. Five captures in a row that produce no frame means something
+// structural is wrong (permission revoked, the camera is held by another app, the
+// sensor is gone), and retrying at 5 fps just buries the evidence. Back off for
+// two seconds, say so on screen, then carry on.
+const FAILURE_LIMIT = 5;
+const FAILURE_BACKOFF_MS = 2000;
 
 /** Decoded JPEG size of a bare base64 payload, without decoding it. */
 export function base64Bytes(b64) {
@@ -77,6 +137,19 @@ const SLOW_INTERVAL_MS = 600;
 // Give up on a frame rather than letting the loop wedge.
 const IDLE_TIMEOUT_MS = 2000;
 const SLEEP_SLICE_MS = 120;
+
+/** A failure we can describe in one line for the operator. */
+class CaptureFault extends Error {}
+
+/** One concise line per failure type - no stack traces into the event log. */
+function describeFault(e) {
+  if (e instanceof CaptureFault) return e.message;
+  const message = String((e && e.message) || e || "");
+  if (/permission/i.test(message)) return "Camera permission denied";
+  if (/CameraNotReady|not ready|camera is not/i.test(message)) return "Camera is not ready";
+  if (/busy|another camera/i.test(message)) return "Camera is in use by another app";
+  return "Camera capture failed";
+}
 
 /** Parse expo-camera's pictureSize strings ("640x480"). */
 function parsePictureSize(size) {
@@ -118,38 +191,94 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
  * and a test double with no `if (process.env.NODE_ENV)` in sight.
  */
 export class LiveCaptureLoop {
-  constructor({ cameraRef, client, onStats, onError, onPause }) {
-    this.cameraRef = cameraRef;
-    this.client = client;
+  constructor({
+    cameraRef,
+    client,
+    onStats,
+    onError,
+    onPause,
+    onRecover,
+    fs,
+    location,
+    image,
+    minIntervalMs,
+    slowIntervalMs,
+    idleTimeoutMs,
+    failureBackoffMs,
+  } = {}) {
+    this.cameraRef = cameraRef || { current: null };
+    this.client = client || null;
     this.onStats = onStats || (() => {});
     this.onError = onError || (() => {});
     this.onPause = onPause || (() => {});
+    this.onRecover = onRecover || (() => {});
+    // Injected native seams; null means "resolve it lazily on first use".
+    this._fs = fs || null;
+    this._locationFn = location || null;
+    this._image = image || null;
+    // Pacing policy. Overridable so the regression harness can run 500
+    // iterations in seconds instead of a minute.
+    this._minIntervalMs = minIntervalMs == null ? MIN_INTERVAL_MS : minIntervalMs;
+    this._slowIntervalMs = slowIntervalMs == null ? SLOW_INTERVAL_MS : slowIntervalMs;
+    this._idleTimeoutMs = idleTimeoutMs == null ? IDLE_TIMEOUT_MS : idleTimeoutMs;
+    this._failureBackoffMs = failureBackoffMs == null ? FAILURE_BACKOFF_MS : failureBackoffMs;
 
     this._running = false;
+    // Every `start()` bumps this. `stop()` bumps it too, which retires the
+    // current run: a loop that is still draining cannot be kept alive by a
+    // focus event arriving in the meantime.
+    this._generation = 0;
+    // Serialises iterations. Taken before any await in an iteration, dropped in
+    // `finally`, so there is no window in which two captures can be in flight.
+    this._lock = false;
     this._loop = null;
+    // Start() during a stop() chains here rather than racing it.
+    this._queue = Promise.resolve();
     this._frames = 0;
     this._lastStatsAt = 0;
-    this._intervalMs = MIN_INTERVAL_MS;
+    this._intervalMs = this._minIntervalMs;
+    this._failures = 0;
+    this._faulted = false;
   }
 
   start() {
     if (this._running) return;
     this._running = true;
-    this._loop = this._run();
+    const gen = ++this._generation;
+    this._loop = this._queue.then(() => this._run(gen));
+    // The chain must never look unhandled, even though every link is caught
+    // where it is awaited.
+    this._queue = this._loop.catch(() => {});
   }
 
+  /**
+   * Retire the current run and wait for it to finish.
+   *
+   * Safe to call when already stopped, and safe to call twice: the second call
+   * sees `_running === false` and simply waits on whatever is left.
+   */
   async stop() {
     this._running = false;
-    if (this._loop) await this._loop.catch(() => {});
-    this._loop = null;
+    // Retire the generation *before* awaiting, so an in-flight iteration that
+    // checks "am I still wanted?" stops at its next checkpoint.
+    this._generation += 1;
+    const loop = this._loop;
+    if (!loop) return;
+    await loop.catch(() => {});
+    if (this._loop === loop) this._loop = null;
   }
 
   get running() {
     return this._running;
   }
 
-  async _run() {
-    while (this._running) {
+  /** Has this run been superseded or stopped? */
+  _retired(gen) {
+    return !this._running || gen !== this._generation;
+  }
+
+  async _run(gen) {
+    while (!this._retired(gen)) {
       const cam = this.cameraRef.current;
       const client = this.client;
 
@@ -161,58 +290,80 @@ export class LiveCaptureLoop {
         continue;
       }
 
+      if (this._lock) {
+        // Unreachable while `start()` serialises properly, and kept anyway: it
+        // turns any future mistake about loop lifecycle into a skipped frame
+        // instead of a duplicate capture.
+        await sleep(SLEEP_SLICE_MS);
+        continue;
+      }
+
+      this._lock = true;
       try {
-        await this._tick(cam, client);
+        await this._tick(cam, client, gen);
+        if (this._faulted) {
+          this._faulted = false;
+          this.onRecover();
+        }
       } catch (e) {
-        // One bad capture - a ref released mid-shot, the camera still warming
-        // up - must never kill the loop.
-        this.onError(e?.message || String(e));
+        if (this._retired(gen)) break;
+        this._faulted = true;
+        this._failures += 1;
+        this.onError(describeFault(e));
+      } finally {
+        this._lock = false;
+      }
+
+      if (this._failures >= FAILURE_LIMIT && !this._retired(gen)) {
+        this.onError("Camera error, retrying");
+        this._failures = 0;
+        const until = Date.now() + this._failureBackoffMs;
+        while (!this._retired(gen) && Date.now() < until) {
+          await sleep(SLEEP_SLICE_MS);
+        }
       }
     }
   }
 
-  async _tick(cam, client) {
+  async _tick(cam, client, gen) {
     const startedAt = Date.now();
-
-    // One capture, awaited. Nothing else may take a picture until it resolves.
-    const photo = await cam.takePictureAsync(CAPTURE_OPTIONS);
-    if (!this._running) return;
-
-    if (!photo?.base64) {
-      this.onError("Camera returned no image");
-      return;
-    }
-    // base64 gives us the bytes without a file, but expo-camera still writes the
-    // temp JPEG to its cache directory. Over a long shift those add up, so the
-    // file is removed as soon as the frame is on the wire.
-    const tempFile = photo?.uri ? new File(photo.uri) : null;
-    let extraFile = null;
+    // Every temp JPEG this iteration creates, deleted in the `finally` once the
+    // frame is on the wire.
+    const writtenUris = [];
 
     try {
+      // One capture, awaited. Nothing else may take a picture until it resolves.
+      const photo = await cam.takePictureAsync(CAPTURE_OPTIONS);
+      if (photo?.uri) writtenUris.push(photo.uri);
+      if (this._retired(gen)) return;
+
+      if (!photo?.base64) {
+        throw new CaptureFault("Camera returned no image");
+      }
       let width = photo.width > 0 ? photo.width : 0;
       let height = photo.height > 0 ? photo.height : 0;
       if (!width || !height) {
         // The native side reported no usable dimensions. Sending them anyway
         // would make every box on screen project against an unknown frame.
-        this.onError("Camera returned an unknown frame size");
-        return;
+        throw new CaptureFault("Camera returned an unknown frame size");
       }
 
+      // The bytes are already here, from the same call that created them.
       let base64 = photo.base64;
 
-      // Safety net for the devices where `pictureSize` is not honoured (it is a
-      // shared ResolutionSelector on Android, and iOS rounds to whatever the
-      // sensor supports). A 12 MP capture at quality 0.4 is still ~2 MB, which is
-      // past the server's 400 KB ceiling and would come back as "frame too large"
-      // eight times a second. Downscale it the slow, obvious way - only when it is
-      // actually needed, because the fast path stays file-free.
+      // Safety net for the devices where `pictureSize` is not honoured: the
+      // ResolutionSelector falls back to the closest higher size, so a capture
+      // can come back at 1920 px. At quality 0.4 that is ~250 KB, past the
+      // server's 300 KB soft limit and approaching the 400 KB ceiling that comes
+      // back as "frame too large" five times a second. Only when it is actually
+      // needed, because the fast path stays file-free.
       if (width > MAX_PICTURE_WIDTH && base64Bytes(base64) > SOFT_FRAME_BYTES) {
         const shrunk = await this._downscale(photo.uri, MAX_PICTURE_WIDTH);
         if (shrunk) {
           base64 = shrunk.base64;
           width = shrunk.width;
           height = shrunk.height;
-          extraFile = shrunk.file;
+          if (shrunk.uri) writtenUris.push(shrunk.uri);
         }
       }
 
@@ -220,28 +371,26 @@ export class LiveCaptureLoop {
       // request per frame; it is a cache read. The frame still carries the
       // coordinates, which is what lets a hot-list sighting be placed on a map.
       const loc = await this._location();
-      if (!this._running) return;
+      if (this._retired(gen)) return;
+
       client.sendFrame(width, height, loc.latitude, loc.longitude, base64);
       this._frames += 1;
     } finally {
-      for (const f of [tempFile, extraFile]) {
-        if (!f) continue;
-        try {
-          if (f.exists) f.delete();
-        } catch (e) {
-          // A cache file we failed to delete is not worth breaking the stream.
-        }
-      }
+      // Only now, with the frame handed to the socket, are the temp JPEGs worth
+      // removing. Over a long shift they would otherwise fill the app's cache.
+      await this._discard(writtenUris);
     }
+
+    if (this._retired(gen)) return;
 
     // Wait for the answer before capturing again: that is what keeps exactly one
     // frame in flight, and it is also what makes the round trip the pace.
-    await client.whenIdle(IDLE_TIMEOUT_MS);
-    if (!this._running) return;
+    await client.whenIdle(this._idleTimeoutMs);
+    if (this._retired(gen)) return;
 
     // Pace off the round trip the server just reported.
     const rt = client.lastRoundTripMs;
-    const target = rt > SLOW_ROUND_TRIP_MS ? SLOW_INTERVAL_MS : MIN_INTERVAL_MS;
+    const target = rt > SLOW_ROUND_TRIP_MS ? this._slowIntervalMs : this._minIntervalMs;
     this._intervalMs = target;
     const elapsed = Date.now() - startedAt;
     if (elapsed < target) await sleep(target - elapsed);
@@ -249,7 +398,31 @@ export class LiveCaptureLoop {
     this._publishStats(rt);
   }
 
+  /**
+   * Delete temp images, ignoring anything that is already gone.
+   *
+   * `delete()` is synchronous and `exists` is a plain boolean in the installed
+   * expo-file-system, but both are awaited/guarded anyway so this keeps working
+   * if either becomes asynchronous. A cache file Android collected first is the
+   * expected case on a long session, not a fault.
+   */
+  async _discard(uris) {
+    for (const uri of uris) {
+      if (!uri) continue;
+      try {
+        const { File } = this._fs || (await loadFileSystem());
+        const file = new File(uri);
+        if (!file.exists) continue;
+        await Promise.resolve(file.delete());
+      } catch (e) {
+        // ENOENT, or a permission we do not have. Never fatal, never logged: a
+        // missing temp file is not information the operator needs.
+      }
+    }
+  }
+
   async _location() {
+    const getLocation = this._locationFn || (await loadLocation());
     try {
       return await getLocation();
     } catch (e) {
@@ -263,6 +436,12 @@ export class LiveCaptureLoop {
   /**
    * Resize + recompress one capture through expo-image-manipulator.
    *
+   * The base64 comes back in the SAME call that wrote the file, via the
+   * `base64` save option (expo-image-manipulator 58.0.11:
+   * `SaveOptions.base64?: boolean` -> `ImageResult.base64?: string`). Nothing is
+   * read back off disk, which is the only reason this path cannot produce the
+   * FileNotFoundException the loop used to throw.
+   *
    * Returns null on any failure: an oversized frame the server then refuses with
    * "frame too large" is a far better outcome than an exception that kills the
    * capture loop.
@@ -270,16 +449,14 @@ export class LiveCaptureLoop {
   async _downscale(uri, width) {
     if (!uri) return null;
     try {
-      const { manipulateAsync, SaveFormat } = await import("expo-image-manipulator");
+      const { manipulateAsync, SaveFormat } = this._image || (await loadImageManipulator());
       const out = await manipulateAsync(uri, [{ resize: { width } }], {
+        base64: true,
         compress: CAPTURE_OPTIONS.quality,
         format: SaveFormat.JPEG,
       });
-      if (!out?.uri) return null;
-      const file = new File(out.uri);
-      const base64 = file.base64();
-      if (!base64) return null;
-      return { base64, width: out.width || width, height: out.height || 0, file };
+      if (!out?.base64) return null;
+      return { base64: out.base64, width: out.width || width, height: out.height || 0, uri: out.uri };
     } catch (e) {
       this.onError("Could not downscale an oversized frame");
       return null;
@@ -296,4 +473,12 @@ export class LiveCaptureLoop {
   }
 }
 
-export { CAPTURE_OPTIONS, MIN_PICTURE_WIDTH, MAX_PICTURE_WIDTH, SLOW_ROUND_TRIP_MS, SOFT_FRAME_BYTES };
+export {
+  CAPTURE_OPTIONS,
+  FAILURE_BACKOFF_MS,
+  FAILURE_LIMIT,
+  MAX_PICTURE_WIDTH,
+  MIN_PICTURE_WIDTH,
+  SLOW_ROUND_TRIP_MS,
+  SOFT_FRAME_BYTES,
+};

@@ -49,6 +49,13 @@ CLASS_LABELS: Dict[int, str] = {
 # the detector's own confidence threshold), so a single miss must not renumber
 # every chip on screen. ~700 ms at 4 fps.
 MAX_MISSES = 3
+# A plate-shaped thing with no vehicle around it is read this many times, ever.
+# One is the whole point: we want to see whether it reads, not to keep watching
+# it. See `ScanConnection.claim_orphan`.
+ORPHAN_MAX_ATTEMPTS = 1
+# How long an orphan entry is remembered. Long enough to cover a car sitting at a
+# light, short enough that a new sign in the same place gets a fresh look.
+ORPHAN_MEMORY_SECONDS = 30.0
 
 # IoU needed to consider a detection "the same vehicle" as a live track.
 # Deliberately low: a car approaching the camera grows quickly between frames,
@@ -307,6 +314,53 @@ class ScanConnection:
     # One-shot handles for the OCR capacity each in-flight read is holding, so the
     # connection's cleanup can hand it back even for a task that never started.
     ocr_claims: set = field(default_factory=set)
+    # What has already been spent on plate-shaped things with no vehicle around
+    # them. Real tracks get a per-car attempt budget that ends when the car is
+    # read or leaves; an orphan has no car to hang that on, so it gets this
+    # instead, keyed by where it is on screen. Without it, a poster that reads as
+    # a plate would be sent to OCR on every single frame for as long as the screen
+    # was open, and OCR is the slowest thing in the system by an order of
+    # magnitude.
+    orphans: dict = field(default_factory=dict)
+    # The box each in-flight orphan read belongs to, keyed by its negative track
+    # id. The crop alone cannot tell the budget where the thing was, and the
+    # alternative - widening `infer_plates`' return type - would reach every
+    # caller of it, including the offline helper.
+    orphan_boxes: dict = field(default_factory=dict)
+
+    def claim_orphan(self, tid: int, box: Sequence[float], now: float, max_attempts: int) -> bool:
+        """True when this plate-shaped thing is allowed one more read.
+
+        Keyed by a coarse cell rather than the exact box, so a plate that jitters
+        by a pixel or two between frames is recognised as the same object and does
+        not earn a fresh budget every time. Old entries are swept here rather than
+        by a timer, so an idle connection holds nothing.
+        """
+        key = (round(box[0] * 40), round(box[1] * 40))
+        # Swept before the lookup, not only on a miss. Doing it only on the
+        # "brand new plate" branch meant an entry that had already spent its
+        # budget - which is the common case for a phone held on a wall - was never
+        # a candidate for the sweep, so the dict only ever grew.
+        for stale in [k for k, (_n, seen) in self.orphans.items() if now - seen > ORPHAN_MEMORY_SECONDS]:
+            self.orphans.pop(stale, None)
+        spent = self.orphans.get(key)
+        if spent is not None:
+            if spent[0] >= max_attempts:
+                return False
+            self.orphans[key] = (spent[0] + 1, spent[1])
+        else:
+            self.orphans[key] = (1, now)
+        self.orphan_boxes[tid] = tuple(float(v) for v in box)
+        return True
+
+    def take_orphan_box(self, tid: int) -> Optional[Tuple[float, ...]]:
+        """The box an orphan read was claimed for, forgotten on the way out."""
+        return self.orphan_boxes.pop(tid, None)
+
+    def settle_orphan(self, box: Sequence[float], max_attempts: int) -> None:
+        """Mark a plate-shaped thing as done with, so it is never offered again."""
+        key = (round(box[0] * 40), round(box[1] * 40))
+        self.orphans[key] = (max_attempts, self.orphans.get(key, (0, 0.0))[1])
 
     def begin_frame(self, now: float) -> bool:
         """Claim the single in-flight slot. False when a frame is already running."""
