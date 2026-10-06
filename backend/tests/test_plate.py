@@ -121,10 +121,32 @@ def test_other_fake_state_codes_are_rejected(raw):
 
 def test_ocr_noise_cases_are_repaired():
     assert normalize_plate("MH12A81234").normalized == "MH12AB1234"
-    assert normalize_plate("MH1ZAB1234").normalized == "MH12AB1234"
     assert normalize_plate("MHI2AB1234").normalized == "MH12AB1234"
     # NH is not a valid code, so the N/M confusion is fixed in favour of MH.
     assert normalize_plate("NH12AB1234").normalized == "MH12AB1234"
+
+
+def test_a_valid_read_is_never_overwritten_by_a_prettier_layout():
+    # "MH1ZAB1234" and "MH12AB1234" are *both* well-formed plates of two
+    # different real cars. Preferring the dominant 2-digit-RTO layout used to
+    # rewrite the first into the second, which reported a stolen car as an
+    # innocent one. An exact read now always survives: only reads that are not
+    # plates at all (MH12A81234, MHI2AB1234, NH...) get repaired.
+    p = normalize_plate("MH1ZAB1234")
+    assert p.valid is True
+    assert p.normalized == "MH1ZAB1234"
+    assert p.repaired is False
+
+
+def test_two_character_rewrites_never_win_over_an_exact_read():
+    # The reported case: the plate is DL 1 ZA 9092 and the reader produced
+    # DL12AG092 by reading Z as 2 and 9 as G. That is a different, valid plate.
+    for raw in ("DL 1 ZA 9092", "DL1ZA9092", "dl1za9092"):
+        p = normalize_plate(raw)
+        assert p.normalized == "DL1ZA9092", raw
+        assert p.repaired is False, raw
+    # A short tail is still a plate; it is not padded out to four digits.
+    assert normalize_plate("DL1ZA909").normalized == "DL1ZA909"
 
 
 def test_ambiguous_state_code_is_never_guessed():

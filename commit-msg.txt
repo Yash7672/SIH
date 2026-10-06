@@ -1,0 +1,8 @@
+plate-accuracy: single verdict path, reader variants+per-char confidence, hi-res on-demand, verdict-driven mobile UI
+
+- Root cause: _score_candidate preferred format over exact edits; normalisation could rewrite 0-edit read to prettier layout. Added _edit_trust above format; tests guard rewrites.
+- New: plate_verdict (STOLEN/POSSIBLE/CLEAR/UNREAD, strict syntax, ambiguous, weighted fuzzy, per-track consensus/winner timestamps, weak indices), plate_reader (variants raw/clahe/colour/deskew upscaled INTER_CUBIC, text_rec char_confs, vote, grammar correction never forces validity, plate box plausibility, vehicle NMS, DEBUG_SAVE_PLATE_CROPS guard).
+- Live scan: per-track verdicts; verdict-only plate message includes verdict+weak+reason+reads; hires split (downscaled boxes vs hires plate), rate-limited 1/2s, 900KB only for hires.
+- Mobile: verdict-driven banners/cards, amber POSSIBLE, read count, grey '?' chips, need_hires consumed before capture (q0.7), capture/encode/send timed separately, overlays follow verdict.
+- Tests: 290 backend (+21 hires,+38 verdict,+42 reader,+8 chain) pass; 53 mobile pass. Bench: 4/5?5/5 (plate_1 fixed), p50 box 48ms. All scripts green, expo export OK.
+- Known: citizen_web untouched, 6 named TS plates absent, pytest-timeout missing.
