@@ -259,6 +259,16 @@ class PlateRead:
     valid: bool = False
     char_confs: Optional[Tuple[float, ...]] = None
     reason: str = ""
+    # Did the per-character verifier actually run on this read? `False` means
+    # "nobody checked the glyphs" - model missing, segmenter declined, or
+    # CHAR_VERIFY=off - and `evaluate` treats that as *less* evidence, not as
+    # neutral: a single unverified read never corroborates itself.
+    verified: bool = False
+    # Positions the verifier refused to call (`run_ocr` marked them AMBIGUOUS).
+    # Kept apart from `char_confs` because those are confidences and these are
+    # decisions: a position can have a respectable confidence and still be a
+    # Z that could be a 2.
+    amb: Tuple[int, ...] = ()
 
     @property
     def grammar_ok(self) -> bool:
@@ -462,21 +472,45 @@ class TrackVerdict:
             r for r in self.reads if r.norm == norm and (r.valid or not ok)
         ] or [r for r in self.reads if r.valid]
         char_confs = next((r.char_confs for r in reads_for_best if r.char_confs), None)
+
+        # Two different kinds of doubt, deliberately not conflated:
+        #
+        # * `amb`   - the OCR's own per-character confidence is below the bar for
+        #             a glyph that can be read two ways. Consensus can lift it:
+        #             two frames that agree are evidence the first was right.
+        # * `ver_amb` - the verifier cross-checked this glyph against the model
+        #             and refused to call it. That is not a lack of evidence, it
+        #             is *evidence of a tie* (Z or 2, still both in play after
+        #             looking at the pixels), and a tie is never settled by
+        #             asking the same model again.
+        #
+        # `ver_amb` comes from the read the cluster is actually reporting, so a
+        # later frame that resolves the glyph resolves the verdict with it.
         amb = ambiguous_positions(norm, char_confs)
+        best_read = next((r for r in reads_for_best if r.norm == norm), None)
+        if best_read is None:
+            best_read = reads_for_best[0] if reads_for_best else None
+        ver_amb = (
+            tuple(i for i in (best_read.amb if best_read else ()) if 0 <= i < len(norm))
+        )
+        weak = sorted({*amb, *ver_amb})
+        # Did any read of *this* string have its glyphs checked? Reads that
+        # settled on a different string say nothing about this one.
+        verified_any = any(r.verified for r in reads_for_best if r.norm == norm)
         repaired = any(r.reason.startswith("repaired") for r in reads_for_best)
 
         base = {
             "plate": norm,
             "confidence": conf,
             "reads": reads,
-            "ambiguous": bool(amb),
+            "ambiguous": bool(weak),
             "repaired": repaired,
             # *Which* glyphs the recogniser was unsure of, so the phone can put a
             # "?" on the character itself. A verdict of POSSIBLE because of one
             # doubtful `Z` is a different situation from one doubtful because of
             # four characters, and the volunteer walking up to the car is the last
             # line of defence either way.
-            "weak": tuple(amb),
+            "weak": tuple(weak),
         }
 
         if not ok:
@@ -493,10 +527,24 @@ class TrackVerdict:
 
         # ---- the hot-list, exactly
         if norm in plates:
-            corroborated = (backing >= 2 and self._within_window(norm)) or (
-                conf >= SINGLE_READ_CONF
-                and (char_confs is None or min(char_confs) >= MIN_CHAR_CONF)
-                and not amb
+            # Two ways to be sure: two reads that agree inside the window, or
+            # one read that was *verified glyph by glyph* and has no weak
+            # character in it. Without the verifier there is no second opinion
+            # about individual characters, so a single read - however confident -
+            # is never enough on its own: consensus is required.
+            #
+            # `not ver_amb` sits outside both routes: a glyph the verifier
+            # refused to call blocks STOLEN even when the string is agreed on,
+            # because agreeing on the string is exactly what a Z/2 confusion
+            # produces - two legal readings of the same car.
+            corroborated = not ver_amb and (
+                (backing >= 2 and self._within_window(norm))
+                or (
+                    verified_any
+                    and conf >= SINGLE_READ_CONF
+                    and (char_confs is None or min(char_confs) >= MIN_CHAR_CONF)
+                    and not amb
+                )
             )
             if corroborated:
                 if not cooldown_ok and self._last_stolen_at is not None:
@@ -510,7 +558,7 @@ class TrackVerdict:
                 how = (
                     f"{backing} reads within {CONSENSUS_WINDOW_S:.0f}s"
                     if backing >= 2
-                    else f"single read at {conf:.2f} with no weak character"
+                    else f"single read at {conf:.2f}, verified glyph by glyph with no weak character"
                 )
                 return Verdict(
                     state=STOLEN,
@@ -521,6 +569,11 @@ class TrackVerdict:
             # Exact but uncorroborated: this is the DL1ZA9092 -> DL12AG092 case.
             # Say so plainly rather than either hiding it or raising a banner.
             near, score = best_fuzzy_match(norm, plates)
+            why_not = (
+                "ambiguous character"
+                if weak
+                else ("read was not verified" if not verified_any else "below the single-read bar")
+            )
             if near and near != norm:
                 return Verdict(
                     state=POSSIBLE,
@@ -535,7 +588,7 @@ class TrackVerdict:
                 state=POSSIBLE,
                 reason=(
                     f"on the hot-list but uncorroborated ({backing} read"
-                    f"{', ambiguous character' if amb else ''}); not alerting"
+                    f", {why_not}); not alerting"
                 ),
                 score=1.0,
                 **{**base, "matches": norm},

@@ -33,8 +33,22 @@ from app.services.plate_verdict import (
 HOT = {"DL1ZA9092"}
 
 
-def _read(text, norm=None, conf=0.95, at=0.0, char_confs=None, valid=None):
-    """One observation. `at` is monotonic seconds, so tests can age reads."""
+def _read(
+    text,
+    norm=None,
+    conf=0.95,
+    at=0.0,
+    char_confs=None,
+    valid=None,
+    verified=True,
+    amb=(),
+):
+    """One observation. `at` is monotonic seconds, so tests can age reads.
+
+    `verified=True` by default because these tests are about the *confidence*
+    bars; the separate question of what happens when nobody checked the glyphs
+    has its own tests (in `test_char_verifier.py`, and `verified=False` here).
+    """
     n = norm if norm is not None else text
     return PlateRead(
         text=text,
@@ -43,6 +57,8 @@ def _read(text, norm=None, conf=0.95, at=0.0, char_confs=None, valid=None):
         at=at,
         valid=strict_syntax(n)[0] if valid is None else valid,
         char_confs=tuple(char_confs) if char_confs else None,
+        verified=verified,
+        amb=tuple(amb),
     )
 
 

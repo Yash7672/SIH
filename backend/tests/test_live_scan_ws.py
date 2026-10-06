@@ -184,8 +184,19 @@ def _frame(seq: int, lat=17.4, lng=78.4, jpeg: bytes | None = None):
 
 
 def _read(plate="MH12JK4567", conf=0.94):
-    """A stubbed OCR read, for the tests about what happens *around* a read."""
-    return lambda crop: {"text": plate, "norm": plate, "conf": conf, "valid": True}
+    """A stubbed OCR read, for the tests about what happens *around* a read.
+
+    ``verified: True`` models the real ``run_ocr`` having checked every glyph.
+    The hotlist test below is about the hotlist path and runs one frame; with an
+    unverified read the verdict (correctly) waits for a second frame instead.
+    """
+    return lambda crop: {
+        "text": plate,
+        "norm": plate,
+        "conf": conf,
+        "valid": True,
+        "verified": True,
+    }
 
 
 @pytest.fixture

@@ -218,6 +218,85 @@ adb shell am start -a android.intent.action.VIEW -d "exp://127.0.0.1:8081"
 | Expo Metro bundler | http://localhost:8081 (device via `adb reverse`) |
 | Mobile app | Expo Go on vivo I2202 (`exp://127.0.0.1:8081`) |
 
+## Phase 16 — Character verifier: a second opinion on every glyph ✅
+
+### Why
+`DL1ZA9092` and `DL12AG092` are both legal plates, so no validator can tell the
+field report's misread from the truth. The line score cannot either: it is one
+number for nine characters. This phase gives the pipeline a per-character
+cross-check and, more importantly, a rule for what to do when the two opinions
+disagree — which is to *not* act.
+
+### What was built
+| File | Role |
+|---|---|
+| `scripts/gen_char_data.py` | Dataset generator: Indian plates in 4 colour schemes, 40 fonts (8 held out), heavy augmentation (blur/defocus/JPEG/perspective/skew/glare/shadows/dirt/moiré), 2× oversampling of the 10 hard pairs, real crops segmented out of `data/generated/*.png` with a 35% holdout. Never labels a crop it is not sure about |
+| `scripts/train_char_classifier.py` | Seeds, early stopping, temperature scaling (grid NLL), ECE before/after, confusion PNG+CSV per split, per-class accuracy, 10 worst confusions, ONNX export (opset 12) + parity check |
+| `ai/char_grammar.py` | `<state:2A><RTO:1-2D><series:1-3A><tail:1-4D>` templates, per-position whitelist, valid-state whitelist (lazy import), `decode()` picks the parse the OCR already agrees with |
+| `ai/char_segment.py` | Honest glyph segmenter: returns `[]` rather than a guessed split |
+| `ai/char_verifier.py` | ONNX session + `preprocess_char`, `restricted_max`, `probability_of`; never fatal — missing model/runtime/OpenCV ⇒ `is_enabled()` False |
+| `backend/app/api/v1/live_scan.py` | `_fuse_chars` (grammar × classifier, geometric-mean confidence), `run_ocr` verification + skip paths, `chars`/`verified`/`ambiguous`/`grammar` on the result, `chars` in the plate message |
+| `backend/app/services/plate_verdict.py` | Two kinds of doubt, not conflated: OCR-confidence weakness lifts with consensus; a verifier refusal (`ver_amb`) blocks STOLEN outright. Single-read STOLEN now requires `verified=True` |
+| `backend/app/core/config.py`, `.env.example` | `CHAR_VERIFY` on/off |
+| `backend/tests/test_char_verifier.py` | 24 tests: grammar/templates, fusion in both directions of every hard pair, all four skip paths, the verdict gate |
+| `scripts/eval_char_verifier.py` | The before/after evidence below, → `data/debug_out/char_eval.json` |
+
+Rules, in one line each: segment or skip (never guess); correct only inside the
+slot's class; replace only at classifier ≥ 0.75 and OCR ≤ 0.20, otherwise mark
+AMBIGUOUS; fuse with a geometric mean; never rewrite a confident read on a
+doubtful glyph.
+
+### Verification
+- `pytest backend/tests` → **316 passed** (26 of them the new verifier tests)
+- Training (`--quick` then full, seed 42, early stop epoch 22, 371 s):
+
+  | split | acc | ECE before → after |
+  |---|---:|---:|
+  | test (held-out synth, 1410) | 0.9404 | 0.0658 → 0.0120 |
+  | font_held (1423) | 0.7667 | 0.0610 → 0.0485 |
+  | real_test (18) | 0.7778 | 0.1381 → 0.1268 |
+  | val (temperature fitted here) | 0.9189 | 0.0705 → 0.0184 |
+
+  Temperature **T = 0.7026**; ONNX parity max |Δlogit| 4e-6, max |Δprob| 1e-6 (tol 1e-3).
+  Worst test confusions: `1→I` (6), `0→O` (3), `8→6` (3), `D→U` (2), `G→C` (2).
+- `python scripts/eval_char_verifier.py` → before/after (raw argmax vs calibrated + grammar-restricted):
+
+  | split | acc | ECE | Z→7 | Z→2 | Z read as any digit |
+  |---|---:|---:|---:|---:|---:|
+  | test | 94.0% → 95.2% | .066 → .012 | 0 → 0 | 0 → 0 | 1 → 0 |
+  | font_held | 76.7% → 79.6% | .061 → .049 | 0 → 0 | 1 → 0 | 2 → 0 |
+  | real_test | 77.8% → 77.8% | .138 → .127 | 0 → 0 | 0 → 0 | 0 |
+
+  End to end on the 6 demo plates: **6/6 exact both ways and `verified=True`
+  on all six** (before the compaction fix the "after" column was a no-op — see
+  the bug row above). The verifier agrees with the OCR on these clean renders
+  and rewrites nothing; what it does change is *how much the read is to be
+  believed*. On `DL8CBF4890`, for instance, the model reads the leading `D` as
+  an `A` (0.54), the grammar holds the position to `D` and the fused confidence
+  collapses to ~0.10 — the character is not rewritten, and a single-frame
+  STOLEN is blocked, which is the whole point.
+  Cost: classify **0.39 ms p50 / 0.45 ms p95** per glyph,
+  verifier box **22.7 ms p50 / 71.2 ms p95** per plate.
+
+### Bug found while proving it works
+| Problem | Fix |
+|---|---|
+| **Every real plate silently skipped verification.** RapidOCR keeps the spaces it saw, so `read.text` was `DL 8C BF 4890` — 13 characters against a 10-glyph plate. `segment_chars` counts alphanumeric glyphs only, so `len(crops) == len(text)` could never hold and `run_ocr` fell through to `verified=False` without a word; the returned string looked completely normal, so nothing failed loudly. Caught by `scripts/char_probs.py`, which printed `segmented 10/13 glyphs` instead of 10/10 | `run_ocr` compacts the read once up front — the form `read_crop`'s `char_confs` and `normalize_plate` already assume — and drops a `char_confs` list whose length does not fit the string instead of shifting every doubt onto the wrong glyph. Two regression tests: a spaced read must verify, and a misaligned confidence list must be discarded |
+
+### Known gaps
+- `real_test` is 18 crops and `font_held` is the weak split (76.7%): the model
+  generalises to unseen fonts worse than to unseen synthetic noise. Real crops
+  are limited by the six demo plates — more real plates is the highest-value data.
+- The character-level "after" column restricts to the *ground-truth* slot class
+  (a bare crop has no position), so it isolates classifier+grammar rather than
+  the whole pipeline; the plate-level table is the end-to-end number.
+- Docker: `backend/Dockerfile` now copies `models/char_cls.*` (without it the
+  container silently runs with `CHAR_VERIFY` disabled and falls back to
+  consensus — correct, but half the feature). Still unverified locally: no
+  Docker on this machine.
+
+---
+
 ## Next Phase
 
 Project complete and verified end-to-end, including a real on-device run. Remaining optional

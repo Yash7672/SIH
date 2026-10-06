@@ -72,6 +72,15 @@ from ultralytics import YOLO  # noqa: E402
 # (`plate_verdict`) instead of being answered by a single `plate in hotlist`.
 from ai.detector import _load_plate_detector, _pad_box  # noqa: E402
 from ai.ocr_engine import get_engine  # noqa: E402  (used only to warm the engine)
+
+# Optional character verification. All three are allowed to be missing (a
+# machine without onnxruntime, or a repo where the model has not been trained
+# yet); the read then simply reports itself unverified and the verdict falls
+# back to needing two agreeing reads.
+try:  # noqa: E402
+    from ai import char_grammar, char_segment, char_verifier
+except Exception:  # noqa: E402, BLE001 - optional: reported as "unverified"
+    char_grammar = char_segment = char_verifier = None  # type: ignore[assignment]
 from app.services.plate import normalize_plate  # noqa: E402
 from app.services.plate_reader import (  # noqa: E402
     CropRead,
@@ -631,36 +640,202 @@ def decode_and_infer(jpeg_bytes: bytes, tracker: VehicleTracker):
 # --------------------------------------------------------------------------- #
 # OCR (off the hot path)
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Character verifier fusion
+# --------------------------------------------------------------------------- #
+# A replacement is only made when the classifier is *sure* and the OCR is *not*.
+# Below these bars the position is kept as the OCR read it and marked
+# AMBIGUOUS: two legal plates differing by one glyph is the exact failure this
+# whole path exists to catch, so a half-sure correction must be visible as
+# uncertainty rather than silently folded into a confident-looking string.
+CHAR_REPLACE_MIN_P = 0.75
+CHAR_REPLACE_MAX_OCR_P = 0.20
+
+
+def _unverified_chars(text: str, confs: Sequence[float]) -> List[dict]:
+    return [
+        {
+            "i": i,
+            "c": ch,
+            "p": float(confs[i]),
+            "ocr": ch,
+            "ocr_p": float(confs[i]),
+            "cls": None,
+            "cls_p": 0.0,
+            "status": "unverified",
+        }
+        for i, ch in enumerate(text)
+    ]
+
+
+def _fuse_chars(
+    text: str,
+    ocr_confs: Sequence[float],
+    verdicts: Sequence[dict],
+) -> Tuple[List[dict], str]:
+    """Per-position grammar + classifier fusion.
+
+    Returns ``(details, pattern)`` where each detail is
+
+    ======== ==========================================================
+    ``c``    the character this position now holds
+    ``p``    how much the read is to be believed (see below)
+    ``ocr``  what the OCR said before the verifier was asked
+    ``cls``  what the classifier would put here under the grammar
+    ``status`` ``ok`` / ``replaced`` / ``ambiguous``
+    ======== ==========================================================
+
+    Confidence is a geometric mean, because that is the only combination that
+    stays low when *either* source is unsure:
+
+    * agreement    ``sqrt(ocr_p * cls_p)``
+    * replacement  ``sqrt((1 - ocr_p) * cls_p)`` - a correction can only be as
+                   trusted as the doubt the OCR had in what it read. When the
+                   OCR violated the grammar outright (a letter where only
+                   digits parse) its stated confidence is demonstrably
+                   miscalibrated, so that term floors at 0.5 rather than
+                   letting a confident wrong answer veto its own correction.
+    * ambiguous    ``sqrt(ocr_p * P(classifier's answer))`` - low on purpose,
+                   which is what stops a half-sure glyph reaching STOLEN.
+    """
+    n = len(text)
+    if char_grammar is None:
+        return _unverified_chars(text, ocr_confs), ""
+
+    probs = [v["probs"] for v in verdicts]
+    grammar = char_grammar.decode(text, probs)
+    pattern = grammar.pattern
+    details: List[dict] = []
+
+    for i, ch in enumerate(text):
+        vi = verdicts[i]
+        allowed = grammar.allowed[i] if grammar.ok else None
+        ocr_p = float(ocr_confs[i])
+        cls_c, cls_p = char_verifier.restricted_max(vi, allowed)
+        if cls_c is None:  # unconstrained position: take the classifier's best
+            cls_c, cls_p = vi["max_c"], float(vi["max_p"])
+        else:
+            cls_p = float(cls_p)
+        p_ocr = char_verifier.probability_of(vi, ch)
+        grammar_legal = allowed is None or ch in allowed
+
+        detail = {
+            "i": i,
+            "c": ch,
+            "p": float(ocr_p),
+            "ocr": ch,
+            "ocr_p": float(ocr_p),
+            "cls": cls_c,
+            "cls_p": cls_p,
+            "status": "ok",
+        }
+        if cls_c == ch and grammar_legal:
+            detail["p"] = float((ocr_p * cls_p) ** 0.5)
+        elif cls_p >= CHAR_REPLACE_MIN_P and (not grammar_legal or ocr_p <= CHAR_REPLACE_MAX_OCR_P):
+            floor = max(1.0 - ocr_p, 0.5) if not grammar_legal else (1.0 - ocr_p)
+            detail["c"] = cls_c
+            detail["p"] = float((floor * cls_p) ** 0.5)
+            detail["status"] = "replaced"
+        else:
+            # Disagreement we will not act on. The confidence collapses towards
+            # whatever the classifier thought of the OCR's character, so a
+            # position nobody agrees about reads as weak downstream.
+            detail["status"] = "ambiguous"
+            detail["p"] = float((ocr_p * max(p_ocr, 1e-3)) ** 0.5)
+        details.append(detail)
+
+    return details, pattern
+
+
 def run_ocr(crop_bgr: np.ndarray) -> Optional[dict]:
-    """Read one plate crop, as carefully as the crop allows.
+    """Read one plate crop, verified character by character when possible.
 
-    Several renderings of the same pixels are recognised and the readings are
-    voted on (`plate_reader.read_crop`), which returns per-character confidence
-    alongside the string. That is what makes a *single* weak read unable to
-    become an alert downstream.
+    The return shape is unchanged (``text`` / ``norm`` / ``conf`` / ``valid`` /
+    ``char_confs`` / ``variant``), so the WebSocket path, the offline scripts
+    and every test that stubs this function keep working. Verification adds
+    ``chars``, ``verified``, ``ambiguous`` and ``grammar``.
 
-    Return shape is unchanged from the original version of this function - the
-    offline scripts and the WebSocket tests both depend on it - with two extra
-    keys the verdict needs. It still returns ``None`` for anything below the
-    confidence floor, which is how "this attempt produced nothing" is reported.
+    Verification is skipped - not failed - when the model is missing, the
+    segmenter cannot cut exactly one glyph per character, or the crop is too
+    small to cut at all. A skipped verification leaves every position
+    ``unverified`` and ``verified=False``, which is what makes
+    ``plate_verdict`` demand two agreeing reads instead of one.
     """
     read = read_crop(crop_bgr)
     if read is None:
         return None
-    norm = normalize_plate(read.text, ocr_score=read.conf)
-    valid = bool(norm.valid and read.conf >= MIN_PLATE_CONFIDENCE)
+
+    # RapidOCR keeps the spaces it saw - "DL 8C BF 4890" is thirteen characters
+    # for a ten-glyph plate. The segmenter counts alphanumeric glyphs only and
+    # the grammar has no slot for a space, so a spaced `text` made
+    # `len(crops) == n` impossible: verification was skipped on every real read
+    # while the returned string still looked perfectly normal. Everything below
+    # therefore works on the compact form, which is also what `read_crop`'s
+    # `char_confs` is aligned to (it drops spaces with the characters they sat
+    # between) and what `normalize_plate` would produce anyway.
+    text = "".join(ch for ch in str(read.text or "").upper() if ch.isalnum())
+    if not text:
+        text = str(read.text or "")
+    n = len(text)
+    ocr_confs = [float(c) for c in read.char_confs] if read.char_confs else None
+    if ocr_confs is not None and len(ocr_confs) != n:
+        # Confidences for a different string than the one they would be
+        # attached to. The line score is honest; a shifted per-character list
+        # would put every doubt on the wrong glyph.
+        ocr_confs = None
+
+    def conf_at(i: int) -> float:
+        return ocr_confs[i] if ocr_confs and i < len(ocr_confs) else float(read.conf)
+
+    confs = [conf_at(i) for i in range(n)]
+    details = _unverified_chars(text, confs)
+    verified = False
+    pattern = ""
+
+    can_verify = (
+        settings.CHAR_VERIFY
+        and n >= 4
+        and char_verifier is not None
+        and char_segment is not None
+    )
+    if can_verify:
+        try:
+            crops = char_segment.segment_chars(crop_bgr, text)
+            # The segmenter returns [] rather than a guessed split when it is
+            # not sure. A wrong number of glyphs means the labels would not
+            # line up with the characters, so nothing here is verified.
+            if len(crops) == n and char_verifier.is_enabled():
+                verdicts = char_verifier.classify_batch(crops)
+                if verdicts and all(v is not None for v in verdicts):
+                    fused, pattern = _fuse_chars(text, confs, verdicts)
+                    details = fused
+                    verified = True
+                    confs = [float(d["p"]) for d in details]
+                    text = "".join(d["c"] for d in details)
+        except Exception:  # noqa: BLE001 - a verifier fault must never lose the read
+            details = _unverified_chars(text, confs)
+            verified = False
+            pattern = ""
+
+    ambiguous = [int(d["i"]) for d in details if d["status"] == "ambiguous"]
+    mean_conf = float(np.mean(confs)) if confs else float(read.conf)
+    norm = normalize_plate(text, ocr_score=mean_conf)
+    valid = bool(norm.valid and mean_conf >= MIN_PLATE_CONFIDENCE)
     result = {
-        "text": read.text,
+        "text": text,
         "norm": norm.normalized,
-        "conf": read.conf,
+        "conf": mean_conf,
         "valid": valid,
-        "char_confs": list(read.char_confs) if read.char_confs else None,
+        "char_confs": [float(c) for c in confs] if n else None,
         "variant": read.best_variant,
+        "reason": read.reason,
+        "chars": details,
+        "verified": bool(verified),
+        "ambiguous": ambiguous,
+        "grammar": pattern,
     }
-    # Low-confidence or ambiguous reads are the ones worth a human eye, so this
-    # is where the diagnostic crop is written - plate crops only, never a frame.
     if result["char_confs"] and min(result["char_confs"]) < 0.85:
-        save_plate_crop(crop_bgr, norm.normalized or read.text, read.conf, read.reason)
+        save_plate_crop(crop_bgr, norm.normalized or text, result["conf"], read.reason)
     return result
 
 
@@ -1079,6 +1254,12 @@ async def ws_live_scan(websocket: WebSocket):
                                 valid=bool(result["valid"]),
                                 char_confs=tuple(char_confs) if char_confs else None,
                                 reason=result.get("reason", ""),
+                                # Did the glyph verifier actually get to look at
+                                # this read? `False` (model missing, segmenter
+                                # declined, CHAR_VERIFY=off) is what makes the
+                                # verdict demand a second agreeing read.
+                                verified=bool(result.get("verified", False)),
+                                amb=tuple(result.get("ambiguous") or ()),
                             )
                         )
                         # A STOLEN verdict on the previous read must not be
@@ -1123,6 +1304,15 @@ async def ws_live_scan(websocket: WebSocket):
                                 # The whole verdict, so the phone never has to
                                 # decide anything for itself.
                                 "verdict": vd.as_dict(),
+                                # Optional: per-character detail when the
+                                # verifier ran. Omitted otherwise so a client
+                                # can tell "nobody checked the glyphs" from
+                                # "they were checked and all fine".
+                                **(
+                                    {"chars": result["chars"]}
+                                    if result.get("verified") and result.get("chars")
+                                    else {}
+                                ),
                                 "police_alerted": alerted,
                             })
                         except Exception:  # noqa: BLE001 - client gone

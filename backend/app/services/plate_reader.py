@@ -65,6 +65,18 @@ from app.services.plate_verdict import (
     strict_syntax,
 )
 
+try:
+    from ai import char_verifier, char_segment
+except Exception:  # pragma: no cover
+    try:
+        import sys
+        from pathlib import Path
+        sys.path.append(str(Path(__file__).resolve().parents[2]))
+        from ai import char_verifier, char_segment
+    except Exception:
+        char_verifier = None
+        char_segment = None
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #

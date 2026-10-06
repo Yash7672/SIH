@@ -165,7 +165,13 @@ def alerts(monkeypatch):
 
 
 def _stub_read(text, conf, char_confs=None, seq=None):
-    """A stubbed OCR read. Optionally a different read per call."""
+    """A stubbed OCR read. Optionally a different read per call.
+
+    ``verified: True`` - the stub stands in for the real ``run_ocr``, which
+    cross-checks every glyph when the model is present. Tests that care about
+    what happens when nobody checked have their own cases in
+    ``test_char_verifier.py``.
+    """
     call = {"n": 0}
 
     def _read(crop):
@@ -174,7 +180,13 @@ def _stub_read(text, conf, char_confs=None, seq=None):
             plate, this_conf = seq[min(call["n"] - 1, len(seq) - 1)]
         else:
             plate, this_conf = text, conf
-        out = {"text": plate, "norm": plate, "conf": this_conf, "valid": True}
+        out = {
+            "text": plate,
+            "norm": plate,
+            "conf": this_conf,
+            "valid": True,
+            "verified": True,
+        }
         if char_confs:
             out["char_confs"] = tuple(char_confs)
         return out

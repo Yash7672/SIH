@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     AI_MODEL_PATH: str = ""
     OCR_MODEL_PATH: str = ""
 
+    # Per-character verification of a plate read (ai/char_verifier.py). Off
+    # means the read is never verified, which makes plate_verdict require two
+    # agreeing reads before STOLEN instead of one confident one.
+    CHAR_VERIFY: bool = True
+
     API_BASE_URL: str = "http://localhost:8000"
 
     DETECTION_COOLDOWN_SECONDS: int = 60

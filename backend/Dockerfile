@@ -23,6 +23,13 @@ COPY backend/app ./app
 COPY ai ./ai
 # Trained detector weights (~5 MB) baked in; keep in sync with AI_MODEL_PATH.
 COPY backend/models ./models
+# Character-verifier ONNX + the temperature it was calibrated with (see
+# requirements-train.txt / scripts/train_char_classifier.py; onnxruntime arrives
+# with rapidocr-onnxruntime). Without these `ai.char_verifier.is_enabled()` is
+# False inside the container and the verdict quietly falls back to demanding
+# two agreeing reads - correct, but half the feature.
+COPY models/char_cls.onnx ./models/char_cls.onnx
+COPY models/char_cls.calib.json ./models/char_cls.calib.json
 # Demo data seeding (scripts/seed_demo.py) is run via `python -m scripts.seed_demo`.
 COPY scripts ./scripts
 
