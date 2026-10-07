@@ -6,7 +6,7 @@ frames/video, only (plate, lat, lng, ts, confidence, device_id).
 
 Usage:
     python scripts/device_simulator.py --email volunteer@example.com --password Volunteer@123
-    python scripts/device_simulator.py --video data/generated/demo_road.mp4 --plate-only TS09AB1234
+    python scripts/device_simulator.py --video data/generated/demo_road.mp4 --frame-skip 3
 """
 
 import argparse
@@ -16,10 +16,17 @@ import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 
 import cv2
 
-sys.path.append(".")
+# Resolve `ai` and `backend` packages regardless of the calling directory,
+# matching the other scripts (stream_camera.py, benchmark_ocr.py, ...).
+ROOT = Path(__file__).resolve().parents[1]
+for extra in (ROOT, ROOT / "backend"):
+    if str(extra) not in sys.path:
+        sys.path.insert(0, str(extra))
+
 from ai.pipeline import detect_and_read  # noqa: E402
 
 DEFAULT_BASE = "http://127.0.0.1:8000"
