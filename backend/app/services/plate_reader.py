@@ -61,7 +61,6 @@ from app.services.plate import VALID_STATE_CODES, normalize_plate
 from app.services.plate_verdict import (
     AMBIGUOUS_PAIRS,
     MIN_CHAR_CONF,
-    PlateRead,
     strict_syntax,
 )
 
@@ -70,7 +69,7 @@ try:
 except Exception:  # pragma: no cover
     try:
         import sys
-        from pathlib import Path
+
         sys.path.append(str(Path(__file__).resolve().parents[2]))
         from ai import char_verifier, char_segment
     except Exception:

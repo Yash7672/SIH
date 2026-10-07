@@ -53,7 +53,6 @@ Run: python scripts/speed_notes.py
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

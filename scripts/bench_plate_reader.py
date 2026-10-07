@@ -45,7 +45,7 @@ import numpy as np  # noqa: E402
 import app.api.v1.live_scan as ls  # noqa: E402
 from ai.detector import _load_plate_detector, _pad_box, preprocess_crop  # noqa: E402
 from ai.ocr_engine import best_plate, candidates, read_text  # noqa: E402
-from app.services.plate_reader import build_variants, read_crop  # noqa: E402
+from app.services.plate_reader import read_crop  # noqa: E402
 
 PLATE_DIR = ROOT / "data" / "test_plates"
 GENERATED_DIR = ROOT / "data" / "generated"

@@ -20,14 +20,14 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "backend"))
 
 from ai.pipeline import detect_and_read  # noqa: E402
-from app.services.plate import is_valid_plate, normalize_plate  # noqa: E402
+from app.services.plate import is_valid_plate  # noqa: E402
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 DEFAULT_DIRS = [ROOT / "data" / "test_plates", ROOT / "data" / "generated"]

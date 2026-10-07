@@ -24,7 +24,7 @@ from ai.detector import (
     focus_plate,
     preprocess_crop,
 )
-from ai.ocr_engine import OcrHit, best_plate, candidates, read_text
+from ai.ocr_engine import best_plate, candidates, read_text
 
 try:
     from app.services.plate import MIN_REPORT_CONFIDENCE, is_valid_plate, plate_read_reliable

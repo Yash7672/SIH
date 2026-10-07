@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import math
 import threading
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, Mapping, Tuple
 

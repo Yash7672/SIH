@@ -1,11 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.security import decode_token
-from app.db.session import SessionLocal
-from app.models import Role, User
+from app.models import Role
 from app.ws.manager import alert_manager
-from uuid import UUID
 
 router = APIRouter()
 

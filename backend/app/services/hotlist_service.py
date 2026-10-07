@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Complaint, ComplaintStatus, Hotlist, HotlistStatus, Role, User
+from app.models import Complaint, ComplaintStatus, Hotlist, HotlistStatus
 from app.core.config import settings
 from app.services.cache import cache_service
 

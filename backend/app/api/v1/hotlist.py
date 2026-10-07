@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_admin, require_cop
 from app.db.session import get_db
-from app.models import Hotlist, Role, User
+from app.models import Hotlist, User
 from app.schemas.entities import HotlistCreate, HotlistOut, HotlistPatch
 from app.services.audit_service import log_action
 from app.services.hotlist_service import HotlistService

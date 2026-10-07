@@ -26,7 +26,10 @@ can therefore never show the same label at the same time.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:  # annotation-only: scan_manager must import without the services
+    from app.services.plate_verdict import TrackVerdict
 
 # YOLOv8n COCO class ids. This is the *whole* vocabulary: the COCO checkpoint has
 # no auto-rickshaw class, so there is no "AUTO" label to emit. Inventing one

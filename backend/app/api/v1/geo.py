@@ -20,7 +20,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_cop
-from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import get_db
 from app.models import User

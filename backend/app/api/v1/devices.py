@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, require_admin, require_volunteer
+from app.api.deps import require_admin, require_volunteer
 from app.db.session import get_db
 from app.models import Device, User
 from app.schemas.entities import DeviceOut, DeviceRegister

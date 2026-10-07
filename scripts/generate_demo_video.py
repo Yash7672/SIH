@@ -19,7 +19,6 @@ from scripts.generate_plate_images import render_plate  # reuse the plate render
 def build_plate_image(plate: str, width: int = 460) -> np.ndarray:
     tmp = "data/generated/_plate_tmp.png"
     os.makedirs("data/generated", exist_ok=True)
-    import random
 
     # reuse the renderer with a stable seed-free spec (width, rotation, blur, noise)
     render_plate(plate, tmp, width, 0.0, 0.0, 0)

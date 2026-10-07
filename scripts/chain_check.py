@@ -36,7 +36,6 @@ import os
 import sys
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path

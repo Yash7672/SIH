@@ -15,7 +15,6 @@ import random
 import sys
 import time
 import urllib.request
-import uuid
 from datetime import datetime, timezone
 
 import cv2

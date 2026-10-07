@@ -350,8 +350,6 @@ def _contour_skew(gray: np.ndarray, crop: np.ndarray, max_angle: float) -> Optio
     if abs(angle) > max_angle:
         return None
     return float(angle)
-    _log(f"deskew: rotated {angle:.2f} deg")
-    return rotated, float(angle)
 
 
 def _scale_for_ocr(image: np.ndarray) -> np.ndarray:

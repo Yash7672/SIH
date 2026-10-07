@@ -40,6 +40,7 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from PIL import Image, ImageOps
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.security import decode_token
@@ -71,7 +72,6 @@ from ultralytics import YOLO  # noqa: E402
 # and the stolen/not-stolen question moved into one tested function
 # (`plate_verdict`) instead of being answered by a single `plate in hotlist`.
 from ai.detector import _load_plate_detector, _pad_box  # noqa: E402
-from ai.ocr_engine import get_engine  # noqa: E402  (used only to warm the engine)
 
 # Optional character verification. All three are allowed to be missing (a
 # machine without onnxruntime, or a repo where the model has not been trained
@@ -83,8 +83,6 @@ except Exception:  # noqa: E402, BLE001 - optional: reported as "unverified"
     char_grammar = char_segment = char_verifier = None  # type: ignore[assignment]
 from app.services.plate import normalize_plate  # noqa: E402
 from app.services.plate_reader import (  # noqa: E402
-    CropRead,
-    build_variants,
     debug_crops_enabled,
     plate_box_plausible,
     read_crop,
@@ -93,13 +91,8 @@ from app.services.plate_reader import (  # noqa: E402
     warn_debug_enabled_once,
 )
 from app.services.plate_verdict import (  # noqa: E402
-    CLEAR,
-    MAX_READS,
-    POSSIBLE,
     STOLEN,
-    UNREAD,
     PlateRead,
-    TrackVerdict,
 )
 
 logger = logging.getLogger(__name__)
@@ -698,7 +691,6 @@ def _fuse_chars(
     * ambiguous    ``sqrt(ocr_p * P(classifier's answer))`` - low on purpose,
                    which is what stops a half-sure glyph reaching STOLEN.
     """
-    n = len(text)
     if char_grammar is None:
         return _unverified_chars(text, ocr_confs), ""
 

@@ -17,7 +17,6 @@ than no health check.
 from __future__ import annotations
 
 import argparse
-import importlib
 import io
 import json
 import os

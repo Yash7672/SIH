@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import select
@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.models import Device, HotlistStatus, Sighting, utcnow
+from app.models import Device, Sighting, utcnow
 from app.services.cache import cache_service
 from app.services.hotlist_service import HotlistService
 
