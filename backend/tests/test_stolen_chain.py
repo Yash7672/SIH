@@ -40,7 +40,7 @@ from tests.test_live_scan_ws import (
     _collect,
     _drain,
     _frame,
-    register_device,  # noqa: F401 - a fixture, imported to be visible to pytest
+    register_device,  # noqa: F401 - used as a pytest fixture in some of these tests
 )
 
 # The plate in the report: the citizen writes it with spaces, the database holds

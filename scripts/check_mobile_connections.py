@@ -223,11 +223,11 @@ def run_error_suite(base: str, token: str, plates: list[Path]) -> None:
     status, body, elapsed, _ = scan_json(base, token, too_many, timeout=30)
     check("four frames -> 422", status == 422, f"HTTP {status} in {elapsed:.0f} ms  {body[:90].decode(errors='replace')}")
 
-    raw, ctype = b"\x00\x01", "text/plain"
+    raw = b"\x00\x01"
     body_bytes, _ = _multipart("image", "x.txt", raw.decode(), b"x")
     status, body, elapsed, _ = _request(
         f"{base}/api/v1/scanner/scan", method="POST", data=body_bytes,
-        headers={"Content-Type": f"multipart/form-data; boundary=----RAKSHAKFormBoundary7MA4YWxkTrZu0gW",
+        headers={"Content-Type": "multipart/form-data; boundary=----RAKSHAKFormBoundary7MA4YWxkTrZu0gW",
                  "Authorization": f"Bearer {token}"}, timeout=30,
     )
     check("multipart text/plain -> 415", status in (415, 422), f"HTTP {status} in {elapsed:.0f} ms")
@@ -247,7 +247,7 @@ def run_legacy_multipart(base: str, token: str, plates: list[Path]) -> None:
         js = json.loads(resp)
         check("multipart 1-frame", _matches(_expected(path), js), f"HTTP {status} in {elapsed:.0f} ms  {describe(js)}")
 
-    parts, ctype = b"", f"multipart/form-data; boundary=----RAKSHAKFormBoundary7MA4YWxkTrZu0gW"
+    parts, ctype = b"", "multipart/form-data; boundary=----RAKSHAKFormBoundary7MA4YWxkTrZu0gW"
     boundary = "----RAKSHAKFormBoundary7MA4YWxkTrZu0gW"
     buf = io.BytesIO()
     for p in plates[:2]:

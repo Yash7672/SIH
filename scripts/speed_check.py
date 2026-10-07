@@ -257,7 +257,7 @@ async def main() -> int:
     print("\n=== item 8: server ms with 1, 4 and 6 vehicles ===\n")
     print(f"  fixture : {os.path.relpath(FIXTURE, ROOT)}")
     print(f"  frames  : {FRAME_WIDTH} px wide for every phase, q{STREAM_QUALITY}, so only the")
-    print(f"            vehicle count changes - not the pixel count")
+    print("            vehicle count changes - not the pixel count")
     print(f"  budget  : boxes reply p95 <= {args.budget:.0f} ms\n")
 
     token = login("volunteer@example.com", "Volunteer@123")

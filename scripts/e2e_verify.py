@@ -350,7 +350,6 @@ def main() -> int:
     t1 = "2026-09-23T04:12:00Z"
     status, sighting = http("POST", base, "/api/v1/sightings", tokens["volunteer"], detection(my_device, 17.4510, 78.3520, 0.93, t0))
     check("hotlist detection recorded as a sighting", status == 200 and "id" in sighting, f"status={status} {sighting}")
-    first_sighting_id = sighting.get("id") if isinstance(sighting, dict) else None
 
     status, second_sighting = http(
         "POST", base, "/api/v1/sightings", tokens["volunteer"], detection(second_device, 17.4625, 78.3710, 0.96, t1)

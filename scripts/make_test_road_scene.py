@@ -214,7 +214,7 @@ def main() -> int:
 
     problems = []
     if not vehicles:
-        problems.append(f"expected a vehicle box, got none")
+        problems.append("expected a vehicle box, got none")
     if not plates:
         problems.append("no plate was assigned to a vehicle")
     if PLATE_TEXT not in {norm for norm, _conf in extra["ocr"].values()}:

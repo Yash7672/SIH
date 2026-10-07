@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 
 from app.services.plate_reader import (
-    MAX_PLATE_AREA_FRACTION,
     MIN_PLATE_WIDTH_PX,
     build_variants,
     correct_by_grammar,
