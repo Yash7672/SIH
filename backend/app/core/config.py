@@ -71,6 +71,10 @@ class Settings(BaseSettings):
 
     API_BASE_URL: str = "http://localhost:8000"
 
+    # Registered fixed cameras (no cameras table in this schema). Relative paths
+    # are resolved against the repo root, never the process CWD.
+    STREAM_SOURCES_PATH: str = "config/stream_sources.json"
+
     DETECTION_COOLDOWN_SECONDS: int = 60
     MAX_UPLOAD_MB: int = 5
     RATE_LIMIT_DETECTIONS_PER_MINUTE: int = 60

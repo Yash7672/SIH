@@ -259,6 +259,9 @@ export class LiveCaptureLoop {
     slowIntervalMs,
     idleTimeoutMs,
     failureBackoffMs,
+    captureOptions,
+    zone,
+    onZoneFrame,
   } = {}) {
     this.cameraRef = cameraRef || { current: null };
     this.client = client || null;
@@ -273,6 +276,20 @@ export class LiveCaptureLoop {
     this._fs = fs || null;
     this._locationFn = location || null;
     this._image = image || null;
+    // The quality preset: every ordinary frame is captured with these options.
+    // Defaults to the measured CAPTURE_OPTIONS; the screen swaps in a preset
+    // (or the user drags quality) without rebuilding the loop.
+    this._captureOptions = captureOptions || CAPTURE_OPTIONS;
+    // The read zone: normalised {x, y, w, h} against the full capture, or null
+    // for full-frame captures. When set, every ordinary frame is cropped to it
+    // before it is sent, so the server's detector and OCR focus on one strip of
+    // the road instead of the whole pavement.
+    this._zone = zone || null;
+    // Called with the full-frame capture size every time a frame was cropped to
+    // the zone, so the overlay can re-anchor the zone rectangle to the pixels
+    // the sensor actually produced. Optional; kept a callback rather than a
+    // store import so this module still runs under `node --test`.
+    this._onZoneFrame = onZoneFrame || null;
     // Pacing policy. Overridable so the regression harness can run 500
     // iterations in seconds instead of a minute.
     this._minIntervalMs = minIntervalMs == null ? MIN_INTERVAL_MS : minIntervalMs;
@@ -332,6 +349,23 @@ export class LiveCaptureLoop {
 
   get running() {
     return this._running;
+  }
+
+  /**
+   * Swap the quality preset live. Read on the next capture, so it never
+   * restarts the loop or the camera.
+   */
+  setCaptureOptions(options) {
+    if (options) this._captureOptions = options;
+  }
+
+  /**
+   * Swap the read zone live. `null` returns to full-frame captures. Read on
+   * the next capture; the overlay is told through `setZone` on the store, which
+   * also clears the now-misleading geometry.
+   */
+  setZone(zone) {
+    this._zone = zone || null;
   }
 
   /** Has this run been superseded or stopped? */
@@ -405,7 +439,7 @@ export class LiveCaptureLoop {
         ? client.consumeHiresRequest()
         : null;
       const settings = hires ? pickHiresSettings(hires) : {};
-      const options = hires ? { ...HIRES_CAPTURE_OPTIONS, ...settings } : CAPTURE_OPTIONS;
+      const options = hires ? { ...HIRES_CAPTURE_OPTIONS, ...settings } : this._captureOptions;
       this._hiresActive = Boolean(hires);
       this._hiresWantWidth = Number(hires && hires.width) || 0;
 
@@ -435,6 +469,34 @@ export class LiveCaptureLoop {
       let base64 = photo.base64;
       let encodeMs = 0;
 
+      // Read zone: crop every ordinary frame to the strip the volunteer picked
+      // on screen, so the detector and OCR concentrate on that part of the road
+      // instead of the whole pavement. A hi-res frame is deliberately exempt
+      // (the whole point of one is the extra sensor area), and a full-frame
+      // "zone" is the no-op it looks like. The crop also resizes oversized
+      // captures, so it replaces the downscale safety net on this path.
+      const zone = this._zone;
+      const zoneActive = Boolean(
+        zone &&
+          zone.w > 0 &&
+          zone.h > 0 &&
+          !(zone.x === 0 && zone.y === 0 && zone.w >= 0.999 && zone.h >= 0.999)
+      );
+      if (!hires && zoneActive) {
+        const t1 = Date.now();
+        const cropped = await this._cropToZone(photo.uri, width, height, zone);
+        encodeMs = Date.now() - t1;
+        if (cropped) {
+          base64 = cropped.base64;
+          width = cropped.width;
+          height = cropped.height;
+          if (cropped.uri) writtenUris.push(cropped.uri);
+          if (this._onZoneFrame) this._onZoneFrame(photo.width, photo.height);
+        }
+        // On a crop failure the frame is sent uncropped rather than dropped:
+        // the server still sees pixels, and a miss is preferable to a stall.
+      }
+
       // Safety net for the devices where `pictureSize` is not honoured: the
       // ResolutionSelector falls back to the closest higher size, so a capture
       // can come back at 1920 px. At quality 0.4 that is ~250 KB, past the
@@ -443,9 +505,11 @@ export class LiveCaptureLoop {
       // needed, because the fast path stays file-free.
       //
       // A hi-res frame is deliberately exempt: resizing it back to 1280 px would
-      // throw away the extra pixels the server explicitly asked for.
+      // throw away the extra pixels the server explicitly asked for. So is a
+      // zone-cropped one, which was already resized when it was cropped.
       if (
         !hires &&
+        !zoneActive &&
         width > MAX_PICTURE_WIDTH &&
         base64Bytes(base64) > SOFT_FRAME_BYTES
       ) {
@@ -580,13 +644,54 @@ export class LiveCaptureLoop {
       const { manipulateAsync, SaveFormat } = this._image || (await loadImageManipulator());
       const out = await manipulateAsync(uri, [{ resize: { width } }], {
         base64: true,
-        compress: CAPTURE_OPTIONS.quality,
+        compress: this._captureOptions.quality,
         format: SaveFormat.JPEG,
       });
       if (!out?.base64) return null;
       return { base64: out.base64, width: out.width || width, height: out.height || 0, uri: out.uri };
     } catch (e) {
       this.onError("Could not downscale an oversized frame");
+      return null;
+    }
+  }
+
+  /**
+   * Crop one capture to the read zone (resizing first when the capture is
+   * oversized), then recompress at the active preset quality.
+   *
+   * Same file-free contract as `_downscale`: `base64` comes back in the same
+   * native call that wrote the file. Returns null on any failure so the caller
+   * can fall back to sending the whole frame rather than stalling the loop.
+   */
+  async _cropToZone(uri, width, height, zone) {
+    if (!uri) return null;
+    try {
+      const { manipulateAsync, SaveFormat } = this._image || (await loadImageManipulator());
+      // The zone is normalised against the capture. When the capture arrives
+      // wider than the server wants, resize first and stay inside the resized
+      // canvas - the zone then crops the same strip, just smaller.
+      const scale = Math.min(1, MAX_PICTURE_WIDTH / (width || 1));
+      const w = Math.max(1, Math.round(width * scale));
+      const h = Math.max(1, Math.round(height * scale));
+      const actions = [];
+      if (scale < 1) actions.push({ resize: { width: MAX_PICTURE_WIDTH } });
+      actions.push({
+        crop: {
+          originX: Math.max(0, Math.round(zone.x * w)),
+          originY: Math.max(0, Math.round(zone.y * h)),
+          width: Math.max(1, Math.min(w, Math.round(zone.w * w))),
+          height: Math.max(1, Math.min(h, Math.round(zone.h * h))),
+        },
+      });
+      const out = await manipulateAsync(uri, actions, {
+        base64: true,
+        compress: this._captureOptions.quality,
+        format: SaveFormat.JPEG,
+      });
+      if (!out?.base64 || !out?.width || !out?.height) return null;
+      return { base64: out.base64, width: out.width, height: out.height, uri: out.uri };
+    } catch (e) {
+      this.onError("Could not crop to the read zone");
       return null;
     }
   }

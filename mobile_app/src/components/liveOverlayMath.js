@@ -132,6 +132,41 @@ export function projectBox(box, t) {
   };
 }
 
+/**
+ * The read-zone's rectangle on the preview, as a transform-like object.
+ *
+ * When the phone crops the captured frame to a read zone, the server's boxes
+ * arrive normalised against the *cropped* image. `projectBox(box, t)` can still
+ * place them if `t` describes the zone's own rectangle instead of the whole
+ * image, because projectBox only needs an offset and a draw size. The zone's
+ * screen rect itself is derived from the *full* image (its aspect ratio decides
+ * the cover crop the native preview applies), which is why the zone is stored
+ * as normalised coordinates against the full capture.
+ *
+ * `zone` = { x, y, w, h } in 0..1 against `image`; `image` is the full-frame
+ * capture size. Returns null when there is nothing drawable.
+ */
+export function zoneTransform(preview, zone, image, mode = "cover") {
+  if (!zone || !(isFinite(zone.w) && zone.w > 0) || !(isFinite(zone.h) && zone.h > 0)) {
+    return null;
+  }
+  const ft = computeTransform(preview, image, mode);
+  if (!ft) return null;
+  return {
+    scale: ft.scale,
+    // The zone is what the cropped image occupies, so the "draw size" of a
+    // box arriving normalised against the cropped frame is the zone rect.
+    drawW: ft.drawW * zone.w,
+    drawH: ft.drawH * zone.h,
+    offX: ft.offX + zone.x * ft.drawW,
+    offY: ft.offY + zone.y * ft.drawH,
+    // A sub-rectangle of the image can still hang over a preview edge on a
+    // cover (the image overflows on that axis) - projectBox clips.
+    previewW: ft.previewW,
+    previewH: ft.previewH,
+  };
+}
+
 const area = (b) => Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
 
 /** Fresh, empty overlay state. */
@@ -143,7 +178,42 @@ export function createOverlayState() {
     vehicles: new Map(),
     plates: new Map(),
     image: { width: 0, height: 0 },
+    // The phone's read zone: normalised {x,y,w,h} against the full capture, and
+    // that capture's own size. Both are needed to draw the zone (and the boxes
+    // inside it) in the right place on the cover-cropped preview. Null zone =
+    // full frame, the pre-read-zone behaviour.
+    zone: null,
+    zoneImage: { width: 0, height: 0 },
   };
+}
+
+/**
+ * Set the read zone the frames are cropped to. `image` is the full-frame
+ * capture size the zone is normalised against. Pass `zone == null` to go back
+ * to full-frame captures.
+ */
+export function applyZone(state, zone, image) {
+  state.zone = zone && isFinite(zone.w) && zone.w > 0 && zone.h > 0 ? zone : null;
+  if (image && image.width > 0 && image.height > 0) {
+    state.zoneImage = { width: image.width, height: image.height };
+  }
+  return state;
+}
+
+/**
+ * Refine the full-frame size the zone is drawn against. Called by the capture
+ * loop with the actual capture dimensions (the requested pictureSize can differ
+ * from the sensor's closest size). Does not clear boxes: it only nudges the
+ * rect they are drawn inside. Returns true when the rect actually moved.
+ */
+export function updateZoneImage(state, image) {
+  if (state.zone && image && image.width > 0 && image.height > 0) {
+    if (state.zoneImage.width !== image.width || state.zoneImage.height !== image.height) {
+      state.zoneImage = { width: image.width, height: image.height };
+      return true;
+    }
+  }
+  return false;
 }
 
 function upsert(map, id, box, now, patch) {
@@ -301,13 +371,19 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
   if (!state) return [];
   const t = computeTransform(preview, state.image, mode);
   if (!t) return [];
+  // With a read zone the boxes arrive normalised against the cropped frame;
+  // project them inside the zone's own rectangle instead of the whole image.
+  const project = state.zone
+    ? zoneTransform(preview, state.zone, state.zoneImage, mode)
+    : t;
+  if (!project) return [];
 
   const vehicles = [];
   state.vehicles.forEach((rec, id) => {
     if (!Array.isArray(rec.box)) return;
     // A fading box holds its last position: sliding it while it dissolves looks
     // like a bug, not like a car driving away.
-    const rect = projectBox(rec.fading ? rec.box : predictBox(rec), t);
+    const rect = projectBox(rec.fading ? rec.box : predictBox(rec), project);
     if (!rect) return;
     vehicles.push({
       key: `v:${id}`,
@@ -333,7 +409,7 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
   const plates = [];
   state.plates.forEach((rec, id) => {
     if (!Array.isArray(rec.box)) return;
-    const rect = projectBox(rec.fading ? rec.box : predictBox(rec), t);
+    const rect = projectBox(rec.fading ? rec.box : predictBox(rec), project);
     if (!rect) return;
     const pct = typeof rec.score === "number" ? Math.round(rec.score * 100) : null;
     const state = rec.state || "CLEAR";
@@ -350,7 +426,7 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
         ? `${markWeak(rec.read, rec.weak)}${pct != null ? ` ${pct}%` : ""}`
         : "reading...",
       reading: !rec.read,
-      chipBelow: chipBelowBox(rect, t.previewH),
+      chipBelow: chipBelowBox(rect, project.previewH),
       score: rec.score,
       valid: rec.valid,
       fading: Boolean(rec.fading),

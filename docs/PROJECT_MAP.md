@@ -1,7 +1,9 @@
 # Project Map
 
-reviewed at commit `live-detect` (branch) — see `git log -1`
-Last full review: 2026-10-04, after the live-detection and Maps-heatmap work.
+reviewed at commit `audit-speed` (branch) — see `git log -1`
+Last full review: 2026-10-07, after the audit: A1 code audit, A2 plate-accuracy
+(eval_plates), A3 speed, PART B stream mode, PART C phone zoom / read-zone /
+quality presets.
 
 ## Architecture Overview
 
@@ -62,7 +64,7 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget), `ScanConnection` (in-flight slots, OCR claims, device, per-track verdicts, hires_pending/hires_active/last_hires_at) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `stream_camera.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
 | `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |
@@ -234,10 +236,10 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
 | --- | --- |
 | `src/screens/ScannerScreen.js` | All I/O: device registration, location, socket, capture loop, vibration, the event log. Renders the view component. |
 | `src/components/ScannerScreenNew.js` | Presentation only (memoised): camera fills the top ~65%, compact panel below (last plate + confidence, stolen banner, recent events, LIVE/RECONNECTING/OFFLINE pill, fps + latency). |
-| `src/services/liveCapture.js` | `LiveCaptureLoop` — one async loop, never two captures at once. Deps injected so the pacing logic is testable off-device. |
+| `src/services/liveCapture.js` | `LiveCaptureLoop` — one async loop, never two captures at once. Deps injected so the pacing logic is testable off-device. PART C: `captureOptions` + `zone` params, `setCaptureOptions`/`setZone` setters (never restart the loop), `_cropToZone()` for the phone-side read zone, `onZoneFrame` for overlay re-anchoring. |
 | `src/services/liveScan.js` | The socket. One instance, StrictMode-safe, re-auth on token refresh, seq-gated acks. |
 | `src/components/liveOverlayStore.js` | External store (`useSyncExternalStore`) holding the current boxes. |
-| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 37 unit tests, no React, no native. |
+| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 44 unit tests, no React, no native. PART C: `zoneTransform` / `applyZone` / `updateZoneImage` let a committed read zone re-map server boxes into the zone's screen rectangle. |
 | `src/components/LiveDetectionOverlay.js` | Draws the rectangles. Reads the store directly. |
 
 Four decisions that are load-bearing, and would be easy to undo by accident:
@@ -264,6 +266,24 @@ Four decisions that are load-bearing, and would be easy to undo by accident:
   On Android `pictureSize` also feeds the Preview `ResolutionSelector`
   (`ExpoCameraView.kt` builds one selector and hands it to both use cases), so a
   narrower capture would blur the preview as well — two reasons for the same floor.
+
+### PART C — zoom, read zone, quality presets (fixed-camera aiming)
+
+- **Capture zoom**: a hand-built `PanResponder` track (`ZoomBar`, no slider
+  dependency) feeds `CameraView`'s `zoom`, so the preview *and* the capture
+  zoom together — a fixed camera zoomed onto the lane hands the detector a
+  bigger plate, not just a closer-looking preview.
+- **Read zone (ROI)**: there is **no server-side ROI**. The zone is a
+  phone-side crop — the capture loop crops the captured frame to the zone
+  before upload and sends the cropped `w`/`h`; server boxes (normalised to the
+  cropped frame) are mapped into the zone's screen rect by a fake cover
+  transform (`zoneTransform` in `liveOverlayMath.js`), reusing `projectBox`
+  unchanged. The editor commits only on `USE`; `setZone`/`setCaptureOptions`
+  are loop setters read on the next capture, so zone/preset changes **never
+  restart the camera loop** (loop effect deps stay `[deviceReady, streaming,
+  focused]`). `onZoneFrame` re-anchors the overlay to the sensor's real dims.
+- **Quality presets**: FAST / BALANCED / SHARP change only `quality`
+  (0.25 / 0.4 / 0.7). 0.4 stays the measured working point.
 
 ### Never read a temp file back — this is what caused the crash
 
@@ -315,6 +335,28 @@ Removed on purpose: the Scan-plate shutter button, the guide frame, the dashed
 rectangle and the hint strip. There is no shutter on a live feed, and text drawn over
 the plate area lowers plate-read accuracy on screen. `useKeepAwake` is held only
 while the stream is actually running, so the rest of the app still sleeps.
+
+## Stream Mode (fixed camera / phone as IP camera)
+
+There is **no cameras table** in this schema, so fixed cameras are registered
+as source descriptors in `config/stream_sources.json` — the single registry
+shared by both consumers:
+
+| File | Role |
+| --- | --- |
+| `config/stream_sources.json` | Named camera registry. Kinds: `mjpeg` (http MJPEG URL), `rtsp`, `usb` (device index), `video` (file path, loops). |
+| `backend/stream_source.py` | `StreamSource` — one named camera. `read_jpeg()` with **latest-frame-wins** (`skip_buffered()` throws away frames queued inside the capture backend) and **auto-reconnect** with bounded backoff for network kinds (`mjpeg`/`rtsp`), so a Wi-Fi blip shows as a pause, not a dead stream. 5 s read timeout, 10 s backoff cap. Frames are memory-only; nothing is persisted. |
+| `scripts/stream_camera.py` | Streams one source into the live path: reads the real WS `/ws/scan` protocol (auth first message, `boxes`/`plates`/`plate` — verdicts read from the `verdict` dict), prints `SOURCE CONFIRMED`, then `WS /ws/scan CONFIRMED`, then per-frame STOLEN / POSSIBLE / CLEAR. Reconnects a dropped WS with backoff. |
+
+`DEFAULT_SOURCES_PATH` is anchored to the repo root (the `.env` default
+`config/stream_sources.json` is meaningless resolved against `backend/` where
+uvicorn/pytest start) — pinned by `backend/tests/test_stream_source.py`.
+
+Demo flow: `python scripts/stream_camera.py --source demo_road --username
+volunteer@example.com --password "Volunteer@123"`. On a 140-frame run of the
+demo clip, 137 frames produced a verdict; 3 were dropped by latest-frame-wins
+under load. `demo_road` is `data/generated/demo_road.mp4` (synthetic plate
+transit, PART A2) — its UNREAD verdicts are the known clipped-render artifact.
 
 ## Maps Heatmap
 
@@ -395,7 +437,7 @@ Defined in `backend/app/core/config.py`, documented in `.env.example`:
 `STORAGE_LOCAL_PATH`, `AI_MODEL_PATH`, `OCR_MODEL_PATH`, `API_BASE_URL`,
 `DETECTION_COOLDOWN_SECONDS`, `MAX_UPLOAD_MB`, `RATE_LIMIT_DETECTIONS_PER_MINUTE`,
 `RATE_LIMIT_AUTH_PER_MINUTE`, `HEAT_TAU_HOURS`, `VITE_API_URL`, `VITE_WS_URL`,
-`EXPO_PUBLIC_API_URL`.
+`EXPO_PUBLIC_API_URL`, `CHAR_VERIFY`, `STREAM_SOURCES_PATH`.
 
 Web clients read `VITE_API_URL` / `VITE_WS_URL`; the mobile app reads
 `EXPO_PUBLIC_API_URL`. `mobile_app/.env` ships it **empty on purpose** — the app derives
@@ -421,10 +463,16 @@ PC on the network.
 | `test_live_scan_ws.py` | the whole wire contract end-to-end with the detectors stubbed: `boxes`/`plates`/`plate` ordering, per-connection trackers, auth + RBAC close codes, latest-frame-wins, split in-flight slots, OCR queue depth, privacy (a non-hot-listed plate stores nothing) |
 | `test_scan_tracker.py` | `VehicleTracker`: IoU matching, id stability, per-class chip numbering, expiry, plate read budget |
 | `test_orphan_plates.py` | a plate with no vehicle around it is drawn and read under a negative id; one read per frame, one attempt ever, jitter does not earn a fresh budget, the entry does not outlive its object |
+| `test_char_verifier.py` | per-character verifier vs consensus-only fallback (verdict rules) |
+| `test_plate_reader.py` | plate-reader variants + per-char confidence path |
+| `test_plate_verdict.py` | verdict state machine: CLEAR / POSSIBLE / STOLEN, corroboration window, hot-list gating |
+| `test_stolen_chain.py` | hot-list detect → STOLEN verdict → `/ws/police` alert → sighting row, end to end |
+| `test_live_scan_hires.py` | hi-res on-demand: the one-off capture keeps its pixels, marking, budget interplay |
+| `test_stream_source.py` | stream sources: repo-root-anchored defaults, kind validation, lat/lng parsing, latest-frame-wins, reconnect backoff |
 
 Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
-179 tests, all passing (`pytest -q -p no:randomly`, ~100 s).
+324 tests, all passing (`pytest -q -p no:randomly`, ~2.5 min).
 
 `scripts/live_scan_test.py` is the live-path check (needs the backend running) —
 24 checks covering auth rejection, RBAC, a self-calibrating probe of what the OCR
@@ -443,9 +491,10 @@ to keep a *fixed* expected plate string in a committed fixture. Multi-vehicle
 behaviour is covered by the deterministic `VehicleTracker` unit tests instead.
 
 Mobile tests: `node --test src/components/__tests__/liveOverlayMath.test.js
-src/services/__tests__/liveCaptureLoop.test.js` — **43 pass** (37 overlay maths, 6
-capture-loop). Run from `mobile_app` with explicit paths; from the repo root Node
-reports `MODULE_NOT_FOUND`.
+src/services/__tests__/liveCaptureLoop.test.js` — **59 pass** (44 overlay maths,
+15 capture-loop). Run from `mobile_app` with explicit paths; from the repo root Node
+reports `MODULE_NOT_FOUND`. The 3 extra overlay tests and 3 extra capture-loop
+tests (read-zone crop + preset quality) are the PART C additions.
 
 `liveCaptureLoop.test.js` is the regression harness for the ENOENT crash and it is
 built to be hard to pass by accident:
@@ -467,7 +516,7 @@ built to be hard to pass by accident:
 | --- | --- | --- |
 | `scripts/chain_check.py` | the whole chain through the real API — complaint → Verify → hot-list immediately → frame → STOLEN banner → `/ws/police` alert within 3 s → one sighting row (60 s cooldown) → heat cells → the plate coming off the list stops it. **33/33.** | backend running |
 | `scripts/heat_check.py` | items 5 and 7 over the public API only: 401 without a token, 403 for CITIZEN and VOLUNTEER, both layers, the 7-day and 5,000-cell caps, the 10 s cache via `generated_at`, and that `/sightings` refuses multipart (415), refuses image/video fields (422), and has no imagery column. **14/14.** | backend running |
-| `scripts/speed_check.py` | item 8 — 1 / 4 / 6 vehicles at fixed width, closed loop and saturated. Budget: 150 ms p95 on the boxes reply. | backend running |
+| `scripts/speed_check.py` | item 8 — 1 / 4 / 6 vehicles at fixed width, closed loop and saturated. Budget: 150 ms p95 on the boxes reply. Warm run: 97 / 130 / 91 ms p95 — passes; cold-start run trips p95 (model/OCR warm-up) but settles exactly as the warm run shows. | backend running |
 
 `chain_check.py` hard-codes no plate name: it reads `MH12JK4567` from the fixture and
 asserts against that, so the check cannot pass on an OCR result nobody actually got.

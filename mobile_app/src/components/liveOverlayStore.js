@@ -3,9 +3,11 @@ import {
   applyBoxes,
   applyPlateText,
   applyPlates,
+  applyZone,
   clearState,
   createOverlayState,
   tick,
+  updateZoneImage,
 } from "./liveOverlayMath";
 
 /**
@@ -56,6 +58,20 @@ export const liveOverlayStore = {
     const rec = applyPlateText(state, message, Date.now());
     emit();
     return rec;
+  },
+  /**
+   * Switch the read zone. Changing it invalidates every box's coordinate
+   * space - old tracks were normalised against a different frame - so the
+   * current geometry is dropped and rebuilt from the next `boxes` message.
+   */
+  setZone(zone, image) {
+    applyZone(state, zone, image);
+    clearState(state);
+    emit();
+  },
+  /** Refine the full-frame size the zone rect is drawn against. Silent. */
+  refineZoneImage(image) {
+    if (updateZoneImage(state, image)) emit();
   },
   /** Expiry sweep. Returns true when it changed anything. */
   tick(now) {

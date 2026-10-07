@@ -28,6 +28,7 @@ import {
   applyBoxes,
   applyPlateText,
   applyPlates,
+  applyZone,
   clearState,
   computeTransform,
   createOverlayState,
@@ -35,11 +36,15 @@ import {
   projectBox,
   selectItems,
   tick,
+  updateZoneImage,
+  zoneTransform,
 } from "../liveOverlayMath.js";
 
 const PREVIEW = { width: 400, height: 300 };
 // The server works at 960 px wide, so that is the frame aspect to project from.
 const FRAME = { w: 960, h: 720 };
+// applyZone/zoneTransform take full-frame dims as {width, height}.
+const FRAME_IMAGE = { width: FRAME.w, height: FRAME.h };
 
 function seed(state, vehicles, plates, now = 1000) {
   applyBoxes(state, { seq: 1, ...FRAME, vehicles }, now);
@@ -551,4 +556,57 @@ test("a moving box stays inside the preview across a whole pass", () => {
       assert.ok(it.rect.width > 0 && it.rect.height > 0, `step ${i}: positive size`);
     }
   }
+});
+
+// ---- read zone ------------------------------------------------------------ //
+
+test("a zone projects server boxes inside the zone's own rectangle", () => {
+  const state = createOverlayState();
+  // Both 4:3: the preview (400x300) draws the full 960x720 frame with no crop,
+  // so zone pixels == preview pixels. The zone is the middle half of the frame.
+  applyZone(state, { x: 0.25, y: 0.25, w: 0.5, h: 0.5 }, FRAME_IMAGE);
+  // The server sees the *cropped* frame (half width and height), so boxes are
+  // normalised against it: the whole crop fills the zone, the bottom-right
+  // quarter of the crop fills the zone's bottom-right quarter.
+  seed(state, [{ track: 1, label: "CAR 1", box: [0, 0, 1, 1] }], null, 1000);
+  seed(state, [{ track: 2, label: "CAR 2", box: [0.5, 0.5, 1, 1] }], null, 1020);
+  const items = selectItems(state, PREVIEW, "cover", 1030);
+  const a = items.find((i) => i.label === "CAR 1");
+  const b = items.find((i) => i.label === "CAR 2");
+  assert.deepEqual(a.rect, { left: 100, top: 75, width: 200, height: 150 });
+  assert.deepEqual(b.rect, { left: 200, top: 150, width: 100, height: 75 });
+});
+
+test("the zone rect is drawn from the full frame, not the cropped one", () => {
+  // Portrait preview: the full 4:3 frame is cover-cropped horizontally. The
+  // zone must sit where the volunteer drew it (on the full-frame image), which
+  // is not simply "image cropped to zone then cover-mapped". The zone is picked
+  // inside the visible strip so clipping does not hide the box.
+  const preview = { width: 390, height: 640 };
+  const state = createOverlayState();
+  applyZone(state, { x: 0.3, y: 0.3, w: 0.4, h: 0.4 }, FRAME_IMAGE);
+  seed(state, [{ track: 1, label: "CAR 1", box: [0, 0, 1, 1] }], null, 1000);
+  const items = selectItems(state, preview, "cover", 1010);
+  assert.equal(items.length, 1);
+  const t = computeTransform(preview, FRAME_IMAGE, "cover");
+  const expectLeft = t.offX + 0.3 * t.drawW;
+  const expectTop = t.offY + 0.3 * t.drawH;
+  assert.ok(Math.abs(items[0].rect.left - expectLeft) < 1e-6, "zone left on full-frame geometry");
+  assert.ok(Math.abs(items[0].rect.top - expectTop) < 1e-6, "zone top on full-frame geometry");
+});
+
+test("refining the zone image re-anchors the zone rect", () => {
+  const state = createOverlayState();
+  applyZone(state, { x: 0.25, y: 0.25, w: 0.5, h: 0.5 }, FRAME_IMAGE);
+  // The sensor returned the closest-higher size (1280 wide) after the loop
+  // asked for 960: the zone rect must move with the real aspect.
+  assert.equal(updateZoneImage(state, { width: 1280, height: 960 }), true);
+  assert.deepEqual(state.zoneImage, { width: 1280, height: 960 });
+  const t = zoneTransform(PREVIEW, state.zone, state.zoneImage, "cover");
+  // 4:3 in a 400x300 preview: still no crop, scaled by 400/1280.
+  assert.ok(Math.abs(t.offX - 0.25 * 400) < 1e-6);
+  assert.ok(Math.abs(t.drawW - 0.5 * 400) < 1e-6);
+  // A repeated, identical size reports "unchanged" so the capture loop does not
+  // re-render the overlay every frame.
+  assert.equal(updateZoneImage(state, { width: 1280, height: 960 }), false);
 });

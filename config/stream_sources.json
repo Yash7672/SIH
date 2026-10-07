@@ -1,0 +1,29 @@
+{
+  "_comment": "RAKSHAK stream-source registrations. There is no cameras table in this schema, so fixed cameras are registered here and shared by backend/stream_source.py and scripts/stream_camera.py. Kinds: mjpeg (http(s) URL of an MJPEG stream), rtsp (RTSP URL), usb (device index), video (file path). Frames are memory-only; nothing here is persisted.",
+  "phone_ip_camera": {
+    "kind": "mjpeg",
+    "url": "http://192.168.1.50:8080/video",
+    "fps": 15,
+    "quality": 88,
+    "reconnect_backoff_s": 2.0
+  },
+  "gate_cam": {
+    "kind": "rtsp",
+    "url": "rtsp://user:pass@192.168.1.60:554/stream1",
+    "fps": 15,
+    "quality": 85
+  },
+  "usb_cam": {
+    "kind": "usb",
+    "device": 0,
+    "fps": 15,
+    "quality": 90
+  },
+  "demo_road": {
+    "kind": "video",
+    "path": "data/generated/demo_road.mp4",
+    "fps": 12,
+    "quality": 90,
+    "loop": true
+  }
+}

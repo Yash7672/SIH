@@ -27,6 +27,18 @@ See `docs/` for full documentation.
 
 Stop with `.\stop.bat` / `./scripts/stop.sh`; Docker is auto-detected (`-Mode docker` to force it).
 
+### Stream mode (fixed camera / phone as IP camera) — 3-line quick start
+
+```powershell
+# 1. Put your camera URL in config/stream_sources.json (kind: mjpeg | rtsp | usb | video)
+python scripts/stream_camera.py --list-sources
+# 2. Phone as IP camera: run an MJPEG app (e.g. "IP Webcam") on the phone, note its http://<phone-ip>:<port>/video URL, add it to config/stream_sources.json as phone_ip_camera
+# 3. Stream it into WS /ws/scan (prints SOURCE CONFIRMED, then WS /ws/scan CONFIRMED, then STOLEN/POSSIBLE/CLEAR verdicts):
+python scripts/stream_camera.py --source phone_ip_camera --username volunteer@example.com --password "Volunteer@123"
+```
+
+`stream_camera.py` latest-frame-wins (drops stale frames while the detector is busy), reconnects a dropped WS with backoff, and the MJPEG/RTSP reader auto-reconnects a camera that drops. Frames are memory-only: nothing here is persisted.
+
 ## Manual setup
 
 ```bash

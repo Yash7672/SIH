@@ -557,11 +557,13 @@ test("a hi-res frame is never resized back down", async () => {
   });
   loop.start();
   try {
-    await waitFor(() => stats.sent >= 1, "one ordinary frame");
-    // The ordinary frame on its own proves the resize path is live, so the
-    // assertion below is about the hi-res frame specifically.
+    // The loop keeps pumping ordinary frames while the test waits, so exact
+    // manipulation counts race. What matters here is *that* the oversized
+    // ordinary frame was resized: the width proves it, the manipulator call
+    // proves the resize path is live at all.
+    await waitFor(() => stats.sent >= 1 && manipulates >= 1, "one ordinary frame resized");
     assert.equal(stats.bodies[0].width, 1280, "an oversized ordinary frame is resized");
-    assert.equal(manipulates, 1);
+    assert.ok(manipulates >= 1, "the resize path is live");
 
     askForHires();
     await waitFor(() => stats.bodies.some((b) => b.hires), "the answering frame");
@@ -570,11 +572,10 @@ test("a hi-res frame is never resized back down", async () => {
     const marked = stats.bodies.find((b) => b.hires);
     assert.equal(marked.width, 1920, "the hi-res frame keeps the pixels it was given");
     assert.equal(marked.height, 1280);
-    // One resize per ordinary frame up to the answer, and none for the answer
-    // itself. Counted per capture rather than as a raw total, because ordinary
-    // frames keep coming while the test waits.
-    const markedIndex = stats.bodies.findIndex((b) => b.hires);
-    assert.equal(manipulates, markedIndex, "the hi-res capture is not resized");
+    // A resized body is the 100-char stand-in this harness's manipulator emits;
+    // the untouched hi-res frame is the camera's own ~437 KB payload. A resize
+    // to 1280 px would throw away the pixels the server asked for.
+    assert.ok(marked.base64.length > 100, "the hi-res capture is not resized (its original bytes survive)");
   } finally {
     await stopWithin(loop);
   }
@@ -689,4 +690,139 @@ test("base64Bytes, choosePictureSize and the capture options still hold", () => 
     false,
     "skipProcessing discards quality and reports EXIF sizes of -1"
   );
+});
+
+test("a quality preset reaches the camera and can be swapped live", async () => {
+  const fakeFs = makeFakeFs();
+  const { cam, stats: camStats } = makeCamera(fakeFs, { width: 1280, height: 960 });
+  const { client, stats } = makeClient();
+  const loop = new LiveCaptureLoop({
+    cameraRef: { current: cam },
+    client,
+    fs: fakeFs.fs,
+    captureOptions: { ...CAPTURE_OPTIONS, quality: 0.7 },
+    ...FAST,
+  });
+  loop.start();
+  try {
+    await waitFor(() => camStats.captures >= 1, "first capture");
+    // options[0] is always the first capture (recorded synchronously in
+    // takePictureAsync), so the initial preset is deterministic.
+    assert.equal(camStats.options[0].quality, 0.7, "the preset is what the camera is asked for");
+    // The screen swaps presets without rebuilding the loop: read on the next
+    // capture, never a restart. The swap and the loop race, so the proof is a
+    // capture at the new value, not "the very next one".
+    loop.setCaptureOptions({ ...CAPTURE_OPTIONS, quality: 0.25 });
+    await waitFor(
+      () => camStats.options.some((o) => o.quality <= 0.25),
+      "a capture at the swapped preset"
+    );
+    assert.equal(stats.sent >= 1, true, "frames flowed throughout");
+  } finally {
+    await stopWithin(loop);
+  }
+});
+
+test("a read zone crops every ordinary frame and re-anchors the overlay", async () => {
+  const fakeFs = makeFakeFs();
+  const { cam, stats: camStats } = makeCamera(fakeFs, { width: 1280, height: 960 });
+  const { client, stats, askForHires } = makeClient();
+  const manipulations = [];
+  const fullFrames = [];
+  const image = {
+    // Immediate, like the mocked seams the other tests use; the loop counts on
+    // it resolving for size and base64 in the same pass.
+    async manipulateAsync(uri, acts, opts) {
+      manipulations.push({ uri, acts, compress: opts.compress });
+      return { base64: "c", width: 640, height: 480, uri: "file:///cache/crop.jpg" };
+    },
+    SaveFormat: { JPEG: 1 },
+  };
+  const zone = { x: 0.25, y: 0.2, w: 0.5, h: 0.4 };
+  const loop = new LiveCaptureLoop({
+    cameraRef: { current: cam },
+    client,
+    fs: fakeFs.fs,
+    image,
+    zone,
+    onZoneFrame: (w, h) => fullFrames.push([w, h]),
+    ...FAST,
+  });
+  loop.start();
+  try {
+    await waitFor(() => stats.sent >= 1 && manipulations.length >= 1, "one cropped frame");
+    const first = manipulations[0];
+    // 1280x960 capture, zone 25%/20% size 50%/40%, scaled 1:1 (within 1280).
+    assert.deepEqual(first.acts, [
+      {
+        crop: { originX: 320, originY: 192, width: 640, height: 384 },
+      },
+    ]);
+    assert.equal(first.compress, CAPTURE_OPTIONS.quality, "crop recompresses at the active preset");
+    assert.equal(first.uri, "file:///cache/frame-1.jpg", "it crops the capture itself, not a temp copy");
+    assert.deepEqual(fullFrames[0], [1280, 960], "the overlay is told the full-frame size");
+    assert.equal(stats.bodies[0].width, 640, "the sent frame reports the cropped dims");
+    assert.equal(stats.bodies[0].height, 480);
+    assert.equal(stats.bodies[0].base64, "c");
+
+    // A hi-res frame keeps the full sensor area: the read zone is about the
+    // ordinary stream, not the one-off the server asked more pixels from.
+    askForHires();
+    await waitFor(() => stats.bodies.some((b) => b.hires), "hi-res frame");
+    const marked = stats.bodies.find((b) => b.hires);
+    assert.equal(marked.width, 1280, "a hi-res frame ignores the read zone");
+    assert.equal(marked.height, 960);
+
+    // setZone(null) returns to full-frame captures on the next frame.
+    loop.setZone(null);
+    await waitFor(() => stats.bodies.some((b) => b.width === 1280), "a full-frame frame after the swap");
+    assert.equal(
+      stats.bodies.filter((b) => b.width === 640).length >= 1,
+      true,
+      "cropped frames were sent before the swap"
+    );
+  } finally {
+    await stopWithin(loop);
+  }
+});
+
+test("a read zone inside an oversized capture is resized then cropped", async () => {
+  // The camera ignores pictureSize and returns 1920 px. The zone must apply to
+  // the resized canvas (the strip is the same, just smaller), so the crop
+  // coordinates are computed against 1280 px rather than 1920.
+  const fakeFs = makeFakeFs();
+  const { cam, stats: camStats } = makeCamera(fakeFs, { width: 1920, height: 1280 });
+  const { client, stats } = makeClient();
+  const manipulations = [];
+  const image = {
+    async manipulateAsync(uri, acts) {
+      manipulations.push(acts);
+      return { base64: "d", width: 640, height: 640, uri: "file:///cache/crop.jpg" };
+    },
+    SaveFormat: { JPEG: 1 },
+  };
+  const loop = new LiveCaptureLoop({
+    cameraRef: { current: cam },
+    client,
+    fs: fakeFs.fs,
+    image,
+    zone: { x: 0.5, y: 0, w: 0.5, h: 1 },
+    ...FAST,
+  });
+  loop.start();
+  try {
+    await waitFor(() => stats.sent >= 1 && manipulations.length >= 1, "one cropped frame");
+    // 1920 px capture is resized to 1280 first (the server's working width),
+    // and the zone is applied to the RESIZED canvas - the strip is the same,
+    // just smaller. 1280x854 after a width-only resize, right half = 640 wide.
+    assert.equal(manipulations[0].length, 2, "resize then crop, in one native call");
+    assert.deepEqual(manipulations[0][0], { resize: { width: 1280 } });
+    assert.deepEqual(manipulations[0][1], {
+      crop: { originX: 640, originY: 0, width: 640, height: 853 },
+    });
+    assert.equal(stats.bodies[0].width, 640);
+    assert.equal(stats.bodies[0].height, 640);
+  } finally {
+    await stopWithin(loop);
+  }
 });

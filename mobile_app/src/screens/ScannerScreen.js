@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState, Vibration } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { normalizePlate, registerDevice, reportSighting, healthCheck } from "../services/api";
 import { getLocation } from "../services/location";
 import ScannerScreenView from "../components/ScannerScreenNew";
 import { LiveScanClient, socketStatusLabel } from "../services/liveScan";
-import { LiveCaptureLoop, choosePictureSize } from "../services/liveCapture";
+import { LiveCaptureLoop, CAPTURE_OPTIONS, choosePictureSize } from "../services/liveCapture";
 import { liveOverlayStore } from "../components/liveOverlayStore";
 import { CameraView } from "expo-camera";
 
@@ -26,6 +26,19 @@ const POSSIBLE_HOLD_MS = 4000;
 // was busy for a moment".
 const SLOW_FRAME_MS = 700;
 const LOG_LIMIT = 12;
+
+/**
+ * The three quality presets. Only `quality` changes - the rest of the capture
+ * contract (base64 fast path, no shutter sound, no processing shortcuts) is the
+ * same object every preset spreads from. Measured working points from the
+ * audit: 0.4 is the balanced middle, 0.25 halves the upload for a smaller
+ * read-good distance, 0.7 is what the hi-res path already pays for sharpness.
+ */
+const QUALITY_PRESETS = {
+  fast: { ...CAPTURE_OPTIONS, quality: 0.25 },
+  balanced: CAPTURE_OPTIONS,
+  sharp: { ...CAPTURE_OPTIONS, quality: 0.7 },
+};
 
 function formatClock(d) {
   const h = String(d.getHours()).padStart(2, "0");
@@ -58,6 +71,17 @@ export default function ScannerScreen({ user, onLogout }) {
   const [cameraActive, setCameraActive] = useState(false);
   const [pictureSize, setPictureSize] = useState(undefined);
   const [log, setLog] = useState([]);
+  // ---- PART C: the volunteer's aim on a fixed camera --------------------- //
+  // Capture zoom 0..1, fed straight into CameraView (preview and capture).
+  const [zoom, setZoom] = useState(0);
+  // Read zone: normalised {x,y,w,h} against the full capture, or null for the
+  // whole frame. When set, the capture loop crops every ordinary frame to it.
+  const [zone, setZone] = useState(null);
+  // Edit mode for the zone: the camera shows a draggable/resizable rectangle
+  // instead of the passive outline.
+  const [zoneEditing, setZoneEditing] = useState(false);
+  // The quality preset ("fast" | "balanced" | "sharp") from QUALITY_PRESETS.
+  const [qualityPreset, setQualityPreset] = useState("balanced");
 
   const camRef = useRef(null);
   const clientRef = useRef(null);
@@ -278,6 +302,13 @@ export default function ScannerScreen({ user, onLogout }) {
     const loop = new LiveCaptureLoop({
       cameraRef: camRef,
       client: clientRef.current,
+      captureOptions: QUALITY_PRESETS[qualityPreset],
+      zone,
+      // The zone is normalised against the full capture, and the requested
+      // pictureSize can differ from the sensor's closest size. The loop reports
+      // what it actually captured so the overlay draws the zone where the
+      // pixels are.
+      onZoneFrame: (w, h) => liveOverlayStore.refineZoneImage({ width: w, height: h }),
       onStats: ({ fps, roundTripMs }) => {
         setLiveScan((s) => ({ ...s, fps, roundTripMs }));
       },
@@ -331,6 +362,56 @@ export default function ScannerScreen({ user, onLogout }) {
       Promise.resolve(stopping).catch(() => {});
     };
   }, [deviceReady, streaming, focused]);
+
+  // Zone and preset are applied live through setters, not by rebuilding the
+  // loop: tearing the camera down and back up for every drag of a rectangle (or
+  // every tap on a quality chip) would flicker the preview and reset the cycle.
+  useEffect(() => {
+    const loop = loopRef.current;
+    if (loop) loop.setZone(zone);
+  }, [zone]);
+  useEffect(() => {
+    const loop = loopRef.current;
+    if (loop) loop.setCaptureOptions(QUALITY_PRESETS[qualityPreset]);
+  }, [qualityPreset]);
+
+  // The zone lives in image-normalised coordinates. The overlay needs the same
+  // frame of reference to draw it: the requested pictureSize is the best
+  // available guess until the capture loop reports the real thing.
+  const zoneImage = useMemo(() => {
+    if (!pictureSize) return null;
+    const [zw, zh] = String(pictureSize).toLowerCase().split("x").map(Number);
+    return zw > 0 && zh > 0 ? { width: zw, height: zh } : null;
+  }, [pictureSize]);
+
+  // Commit an edited zone. A full-frame zone is indistinguishable from "no
+  // zone" for the crop, so it is normalised back to null.
+  const handleApplyZone = useCallback(
+    (next) => {
+      const isFull =
+        next &&
+        next.x <= 0 &&
+        next.y <= 0 &&
+        next.w >= 0.999 &&
+        next.h >= 0.999;
+      setZone(isFull ? null : next);
+      liveOverlayStore.setZone(isFull ? null : next, zoneImage || undefined);
+      setZoneEditing(false);
+    },
+    [zoneImage]
+  );
+
+  // Enter/leave edit mode; leaving without applying discards the draft.
+  const handleEditZone = useCallback((editing) => {
+    setZoneEditing(editing);
+  }, []);
+
+  // A reset asks for the whole frame back in one tap.
+  const handleResetZone = useCallback(() => {
+    setZone(null);
+    liveOverlayStore.setZone(null, zoneImage || undefined);
+    setZoneEditing(false);
+  }, [zoneImage]);
 
   const onToggleStreaming = useCallback(() => setStreaming((v) => !v), []);
 
@@ -393,6 +474,16 @@ export default function ScannerScreen({ user, onLogout }) {
       cameraActive={cameraActive}
       cameraFault={cameraFault}
       pictureSize={pictureSize}
+      zoom={zoom}
+      onZoom={setZoom}
+      zone={zone}
+      zoneEditing={zoneEditing}
+      zoneImage={zoneImage || { width: 1280, height: 960 }}
+      onApplyZone={handleApplyZone}
+      onEditZone={handleEditZone}
+      onResetZone={handleResetZone}
+      qualityPreset={qualityPreset}
+      onQualityPreset={setQualityPreset}
     />
   );
 }

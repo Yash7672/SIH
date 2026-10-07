@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
   AppState,
+  PanResponder,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -23,6 +24,7 @@ import { Card } from "./ui/Card";
 import { LoadingState } from "./ui/Banner";
 import { fontSize, fontWeight, radius, spacing } from "../theme";
 import { useTheme } from "../theme/ThemeContext";
+import { computeTransform } from "./liveOverlayMath";
 
 /**
  * The live scanner.
@@ -39,9 +41,12 @@ import { useTheme } from "../theme/ThemeContext";
  * volunteer is holding the phone outdoors. Only the chrome tints follow the
  * palette.
  *
- * No watermark or guide frame over the viewfinder: text on top of the plate
- * preview lowers plate-read accuracy, and live detection already draws real
- * boxes over the feed.
+ * No watermark or always-on guide frame over the viewfinder: text on top of the
+ * plate preview lowers plate-read accuracy, and live detection already draws
+ * real boxes over the feed. The single exception is the *volunteer-drawn* read
+ * zone: it is off by default, and when it is on it is a tool the person aimed,
+ * not decoration. It shows a thin outline in capture mode and the full editor
+ * (drag to move, corner to resize) while the zone button is active.
  */
 
 const LOG_LIMIT = 12;
@@ -65,6 +70,16 @@ export default function ScannerScreen({
   cameraActive,
   cameraFault,
   pictureSize,
+  zoom,
+  onZoom,
+  zone,
+  zoneEditing,
+  zoneImage,
+  onApplyZone,
+  onEditZone,
+  onResetZone,
+  qualityPreset,
+  onQualityPreset,
 }) {
   const { colors, isDark, setMode } = useTheme();
   const insets = useSafeAreaInsets();
@@ -214,6 +229,14 @@ export default function ScannerScreen({
         camRef={camRef}
         streaming={streaming}
         pictureSize={pictureSize}
+        zoom={zoom}
+        onZoom={onZoom}
+        zone={zone}
+        zoneEditing={zoneEditing}
+        zoneImage={zoneImage}
+        onApplyZone={onApplyZone}
+        onEditZone={onEditZone}
+        onResetZone={onResetZone}
       />
 
       <ScrollView
@@ -244,6 +267,8 @@ export default function ScannerScreen({
           stalePlate={stalePlate}
           streaming={streaming}
           onToggleStreaming={onToggleStreaming}
+          qualityPreset={qualityPreset}
+          onQualityPreset={onQualityPreset}
           colors={colors}
           s={s}
         />
@@ -291,7 +316,23 @@ function LivePill({ live, colors, s }) {
  * Camera preview plus its overlays, memoised so a new log line never re-renders
  * the camera. Nothing that changes per message may be passed in here.
  */
-const CameraSection = memo(function CameraSection({ height, colors, s, focused, camRef, streaming, pictureSize }) {
+const CameraSection = memo(function CameraSection({
+  height,
+  colors,
+  s,
+  focused,
+  camRef,
+  streaming,
+  pictureSize,
+  zoom,
+  onZoom,
+  zone,
+  zoneEditing,
+  zoneImage,
+  onApplyZone,
+  onEditZone,
+  onResetZone,
+}) {
   // The overlay must be laid out against the preview box, so the box measures
   // itself and hands the result down. `height` is the intended height, used
   // until the first onLayout lands.
@@ -304,6 +345,12 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
     [box.width, box.height]
   );
 
+  // The zoom knob and the zone editor sit over the preview. Their drags are
+  // deliberate, slow gestures, so pointer events are only ever captured while
+  // one is actually being used; the rest of the preview stays out of the way.
+  const editing = zoneEditing;
+  const hasZone = Boolean(zone && zone.w > 0 && zone.h > 0);
+
   return (
     <View style={[s.cameraWrap, { height }]} onLayout={measure}>
       {focused ? (
@@ -312,7 +359,7 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
           style={StyleSheet.absoluteFill}
           facing="back"
           autofocus="on"
-          zoom={0}
+          zoom={zoom}
           flash="off"
           animateShutter={false}
           // The smallest size the plate is still readable at. Without it the
@@ -326,6 +373,23 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
           above has no state and must not re-render just to move a rectangle. */}
       <LiveDetectionOverlay preview={box} />
 
+      {/* The volunteer's read zone. Passive outline in capture mode, a full
+          draggable/resizable rectangle while editing. */}
+      <ReadZoneOverlay
+        preview={box}
+        image={zoneImage}
+        zone={zone}
+        editing={editing}
+        hasZone={hasZone}
+        colors={colors}
+        s={s}
+        onApplyZone={onApplyZone}
+        onEditZone={onEditZone}
+        onResetZone={onResetZone}
+      />
+
+      <ZoomBar zoom={zoom} onZoom={onZoom} colors={colors} s={s} />
+
       {!streaming ? (
         <View style={s.pausedVeil} pointerEvents="none">
           <Ionicons name="pause-circle" size={34} color="#FFFFFF" />
@@ -335,6 +399,316 @@ const CameraSection = memo(function CameraSection({ height, colors, s, focused, 
     </View>
   );
 });
+
+/** Keep a normalised value inside 0..1, with a minimum square in this editor. */
+function clamp01(n) {
+  return Math.min(1, Math.max(0, n));
+}
+
+/**
+ * The capture-zoom slider, drawn at the bottom of the preview.
+ *
+ * Drag or tap the track; the value (0..1) goes straight into `CameraView`'s
+ * `zoom`, which moves the preview *and* the capture together - so a fixed
+ * camera zoomed onto the lane hands the detector a bigger plate, not just a
+ * closer-looking preview. Deliberately a plain absolute track drawn here
+ * rather than a slider package: the app ships no slider dependency.
+ */
+function ZoomBar({ zoom, onZoom, colors, s }) {
+  const trackRef = useRef(null);
+  const [track, setTrack] = useState({ w: 0, x: 0 });
+  const measure = useCallback((e) => {
+    const { width: w, x: left } = e.nativeEvent.layout;
+    if (w > 0 && (w !== track.w || left !== track.x)) setTrack({ w, x: left });
+  }, [track.w, track.x]);
+
+  // The knob is the value's position; dragging sets it directly. `gestureState`
+  // is not used: the responder belongs to the whole track, so locationX is
+  // enough and there is nothing to accumulate.
+  const responder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: (e) => onZoom(clamp01(e.nativeEvent.locationX / (track.w || 1))),
+        onPanResponderMove: (e) => onZoom(clamp01(e.nativeEvent.locationX / (track.w || 1))),
+      }),
+    [track.w, onZoom]
+  );
+
+  if (!track.w) {
+    return (
+      <View style={[s.zoomBar, { backgroundColor: "rgba(10,14,20,0.55)" }]} onLayout={measure} />
+    );
+  }
+
+  const knobX = track.x + zoom * track.w;
+
+  return (
+    <View
+      style={[s.zoomBar, { backgroundColor: "rgba(10,14,20,0.55)" }]}
+      onLayout={measure}
+      {...responder.panHandlers}
+    >
+      <View style={s.zoomTrack}>
+        <View
+          style={[
+            s.zoomFill,
+            { width: `${Math.round(clamp01(zoom) * 100)}%`, backgroundColor: colors.accent[400] },
+          ]}
+        />
+        <View style={[s.zoomKnob, { left: knobX - track.x - 7, backgroundColor: "#FFFFFF" }]} />
+      </View>
+      <Ionicons name="scan-outline" size={13} color="#FFFFFF" style={s.zoomIcon} />
+    </View>
+  );
+}
+
+/**
+ * The read-zone rectangle over the preview, in its two modes.
+ *
+ * The zone is stored normalised against the *captured image* (e.g. 1280 wide),
+ * because that is the frame the crop applies to. The preview shows that image
+ * cover-cropped to a different rectangle, so both the outline and the editor's
+ * drags are mapped through the same cover transform the overlay uses - the
+ * rectangle the volunteer draws is exactly the strip the server will see.
+ *
+ * Capture mode: a thin outline (pointer-events none) plus the ZONE button that
+ * opens the editor. Edit mode: the draggable/resizable rectangle plus USE and
+ * RESET chips. The draft lives here and is only committed on USE, so backing
+ * out of the editor discards the last drag.
+ */
+function ReadZoneOverlay({ preview, image, zone, editing, hasZone, colors, s, onApplyZone, onEditZone, onResetZone }) {
+  const [draft, setDraft] = useState(() => zone && zone.w > 0 ? { ...zone } : { x: 0, y: 0, w: 1, h: 1 });
+  // Keep the draft in sync when the committed zone changes from the outside
+  // (reset, another apply), but never while the volunteer is mid-drag - the
+  // drag already owns the draft state.
+  const editingRef = useRef(editing);
+  useEffect(() => {
+    editingRef.current = editing;
+    if (!editing && zone && zone.w > 0) setDraft({ ...zone });
+  }, [editing, zone]);
+
+  // The transform from the captured image to this preview box. Cached until
+  // either side changes; drags read it every move without recomputing.
+  const t = useMemo(
+    () => (preview.width > 0 && image && image.width > 0 ? computeTransform(preview, image, "cover") : null),
+    [preview, image]
+  );
+  const MIN_EDGE = 0.06;
+
+  const rectOf = useCallback(
+    (z) => {
+      if (!t) return null;
+      return {
+        left: t.offX + z.x * t.drawW,
+        top: t.offY + z.y * t.drawH,
+        width: z.w * t.drawW,
+        height: z.h * t.drawH,
+      };
+    },
+    [t]
+  );
+
+  // Touch handling for edit mode. The responder covers the whole preview; the
+  // mode (move / resize) is decided at the moment the finger lands, from where
+  // it is relative to the draft rectangle. Drags translate image-normalised
+  // deltas straight back into the draft.
+  const gesture = useRef({ mode: null, startNx: 0, startNy: 0, start: null }).current;
+  const setDraftFrom = useCallback(
+    (next) => {
+      const n = {
+        x: clamp01(next.x),
+        y: clamp01(next.y),
+        w: clamp01(next.w),
+        h: clamp01(next.h),
+      };
+      // Keep a floor and never spill over either edge.
+      if (n.x + n.w > 1) n.w = 1 - n.x;
+      if (n.y + n.h > 1) n.h = 1 - n.y;
+      if (n.w < MIN_EDGE) {
+        n.w = MIN_EDGE;
+        if (n.x + n.w > 1) n.x = 1 - MIN_EDGE;
+      }
+      if (n.h < MIN_EDGE) {
+        n.h = MIN_EDGE;
+        if (n.y + n.h > 1) n.y = 1 - MIN_EDGE;
+      }
+      setDraft(n);
+    },
+    []
+  );
+
+  const toNorm = useCallback(
+    (px, py) => {
+      if (!t) return { x: 0, y: 0 };
+      return { x: clamp01((px - t.offX) / t.drawW), y: clamp01((py - t.offY) / t.drawH) };
+    },
+    [t]
+  );
+
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        // Only claim a touch that lands on (or on the handle of) the draft
+        // rectangle. Taps anywhere else - the action chips, the empty preview -
+        // stay with whoever would have got them.
+        onStartShouldSetPanResponder: (e) => {
+          if (!editing || !t) return false;
+          const nx = clamp01((e.nativeEvent.locationX - t.offX) / t.drawW);
+          const ny = clamp01((e.nativeEvent.locationY - t.offY) / t.drawH);
+          const r = rectOf(draft);
+          const inX = nx >= draft.x && nx <= draft.x + draft.w;
+          const inY = ny >= draft.y && ny <= draft.y + draft.h;
+          const corner = r ? { x: r.left + r.width, y: r.top + r.height } : { x: 0, y: 0 };
+          const onCorner =
+            r &&
+            Math.abs(e.nativeEvent.locationX - corner.x) <= 24 &&
+            Math.abs(e.nativeEvent.locationY - corner.y) <= 24;
+          return Boolean(r && ((inX && inY) || onCorner));
+        },
+        // Keep a claimed gesture: a drag that wanders over a chip must not be
+        // stolen mid-move.
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderGrant: (e) => {
+          if (!editing || !t) return;
+          const nx = clamp01((e.nativeEvent.locationX - t.offX) / t.drawW);
+          const ny = clamp01((e.nativeEvent.locationY - t.offY) / t.drawH);
+          const r = rectOf(draft);
+          const inX = nx >= draft.x && nx <= draft.x + draft.w;
+          const inY = ny >= draft.y && ny <= draft.y + draft.h;
+          const corner = r ? { x: r.left + r.width, y: r.top + r.height } : { x: 0, y: 0 };
+          const onCorner =
+            r &&
+            Math.abs(e.nativeEvent.locationX - corner.x) <= 24 &&
+            Math.abs(e.nativeEvent.locationY - corner.y) <= 24;
+          gesture.mode = onCorner ? "resize" : inX && inY ? "move" : null;
+          gesture.startNx = nx;
+          gesture.startNy = ny;
+          gesture.start = { ...draft };
+        },
+        onPanResponderMove: (e) => {
+          if (!gesture.mode) return;
+          const nx = clamp01((e.nativeEvent.locationX - t.offX) / t.drawW);
+          const ny = clamp01((e.nativeEvent.locationY - t.offY) / t.drawH);
+          const dx = nx - gesture.startNx;
+          const dy = ny - gesture.startNy;
+          if (gesture.mode === "move") {
+            setDraftFrom({ x: gesture.start.x + dx, y: gesture.start.y + dy, w: gesture.start.w, h: gesture.start.h });
+          } else {
+            setDraftFrom({ x: gesture.start.x, y: gesture.start.y, w: gesture.start.w + dx, h: gesture.start.h + dy });
+          }
+        },
+        onPanResponderRelease: () => {
+          gesture.mode = null;
+        },
+        onPanResponderTerminate: () => {
+          gesture.mode = null;
+        },
+      }),
+    [editing, t, draft, rectOf, setDraftFrom, gesture]
+  );
+
+  // Passive outline: only drawn when a zone is actually committed.
+  const showOutline = !editing && hasZone && zone;
+  const outlineRect = showOutline && rectOf(zone);
+  const draftRect = editing && rectOf(draft);
+
+  return (
+    <View
+      style={StyleSheet.absoluteFill}
+      {...panResponder.panHandlers}
+      // Capture mode: the outline must never intercept a touch, but the ZONE
+      // chip below it still has to be tappable - so the wrapper lets touches
+      // through and the chip is a real target.
+      pointerEvents={editing ? "auto" : "box-none"}
+    >
+      {showOutline && outlineRect ? (
+        <View
+          pointerEvents="none"
+          style={[
+            s.zoneOutline,
+            {
+              left: outlineRect.left,
+              top: outlineRect.top,
+              width: outlineRect.width,
+              height: outlineRect.height,
+              borderColor: colors.accent[300],
+            },
+          ]}
+        >
+          <Text style={[s.zoneChip, { backgroundColor: colors.accent[300], color: colors.dark[900] }]}>
+            READ ZONE
+          </Text>
+        </View>
+      ) : null}
+
+      {editing && draftRect && t ? (
+        <View
+          style={[
+            s.zoneRect,
+            {
+              left: draftRect.left,
+              top: draftRect.top,
+              width: draftRect.width,
+              height: draftRect.height,
+              borderColor: "#FFFFFF",
+            },
+          ]}
+        >
+          <View style={[s.zoneHandle, { left: draftRect.width - 9, top: draftRect.height - 9 }]} />
+          <View style={s.zoneEditorActions}>
+            <Pressable
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Keep this read zone"
+              onPress={() => onApplyZone({ ...draft })}
+              style={({ pressed }) => [s.zoneActionChip, { backgroundColor: colors.accent[300], opacity: pressed ? 0.75 : 1 }]}
+            >
+              <Text style={[s.zoneActionText, { color: colors.dark[900] }]}>USE</Text>
+            </Pressable>
+            <Pressable
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Reset to the full frame"
+              onPress={onResetZone}
+              style={({ pressed }) => [s.zoneActionChip, { backgroundColor: "rgba(255,255,255,0.18)", opacity: pressed ? 0.75 : 1 }]}
+            >
+              <Text style={[s.zoneActionText, { color: "#FFFFFF" }]}>RESET</Text>
+            </Pressable>
+            <Pressable
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Leave the editor without changing the zone"
+              onPress={() => onEditZone(false)}
+              style={({ pressed }) => [s.zoneActionChip, { backgroundColor: "rgba(255,255,255,0.18)", opacity: pressed ? 0.75 : 1 }]}
+            >
+              <Text style={[s.zoneActionText, { color: "#FFFFFF" }]}>BACK</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : (
+        <View style={s.zoneToggleWrap}>
+          <Pressable
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={hasZone ? "Edit the read zone" : "Draw a read zone"}
+            onPress={() => onEditZone(true)}
+            style={({ pressed }) => [
+              s.zoneActionChip,
+              { backgroundColor: hasZone ? colors.accent[300] : "rgba(10,14,20,0.66)", opacity: pressed ? 0.75 : 1 },
+            ]}
+          >
+            <Ionicons name="scan-outline" size={13} color={hasZone ? colors.dark[900] : "#FFFFFF"} />
+            <Text style={[s.zoneActionText, { color: hasZone ? colors.dark[900] : "#FFFFFF" }]}>
+              {hasZone ? "EDIT ZONE" : "ZONE"}
+            </Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+}
 
 /**
  * The alert banner. Two states, both from the server's verdict, nothing else.
@@ -492,7 +866,7 @@ function PlateWithWeakChips({ plate, chars, confidence, s }) {
  * independently, and the two answers could be different at the same instant on
  * the same car.
  */
-function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, colors, s }) {
+function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, qualityPreset, onQualityPreset, colors, s }) {
   const last = stalePlate;
   const state = last?.state;
   const chipColor =
@@ -513,6 +887,37 @@ function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, colors,
             <View style={[styles.detectKnob, { alignSelf: streaming ? "flex-end" : "flex-start" }]} />
           </View>
         </Pressable>
+      </View>
+
+      {/* Quality preset: how much of the upload budget every frame spends.
+          FAST for a weak link, SHARP when the plate is far and the read keeps
+          failing. Never rebuilds the capture loop - applied live to the next
+          frame. */}
+      <View style={s.presetRow}>
+        {["fast", "balanced", "sharp"].map((p) => {
+          const active = qualityPreset === p;
+          return (
+            <Pressable
+              key={p}
+              hitSlop={4}
+              accessibilityRole="button"
+              accessibilityState={{ selected: active }}
+              accessibilityLabel={`Quality preset ${p}`}
+              onPress={() => onQualityPreset(p)}
+              style={({ pressed }) => [
+                s.presetChip,
+                active && { backgroundColor: colors.accent[300], borderColor: colors.accent[300] },
+                pressed && { opacity: 0.7 },
+              ]}
+            >
+              <Text
+                style={[s.presetChipText, active && { color: colors.dark[900], fontWeight: "800" }]}
+              >
+                {p.toUpperCase()}
+              </Text>
+            </Pressable>
+          );
+        })}
       </View>
 
       {last && last.plate ? (
@@ -638,6 +1043,120 @@ function makeStyles(colors) {
       gap: 6,
     },
     pausedText: { color: "#FFFFFF", fontSize: fontSize.sm, fontWeight: fontWeight.semibold, letterSpacing: 0.6 },
+
+    // ---- capture zoom + read zone (PART C) ------------------------------- //
+    zoomBar: {
+      position: "absolute",
+      left: "22%",
+      right: "22%",
+      bottom: 10,
+      height: 30,
+      borderRadius: 15,
+      flexDirection: "row",
+      alignItems: "center",
+      paddingHorizontal: 10,
+      gap: 8,
+    },
+    zoomTrack: {
+      flex: 1,
+      height: 4,
+      borderRadius: 2,
+      backgroundColor: "rgba(255,255,255,0.28)",
+      position: "relative",
+    },
+    zoomFill: { height: 4, borderRadius: 2, position: "absolute", left: 0, top: 0 },
+    zoomKnob: {
+      position: "absolute",
+      top: -5,
+      width: 14,
+      height: 14,
+      borderRadius: 7,
+      shadowColor: "#000",
+      shadowOpacity: 0.35,
+      shadowRadius: 2,
+      shadowOffset: { width: 0, height: 1 },
+    },
+    zoomIcon: { opacity: 0.85 },
+
+    // The passive outline is a hairline so it never reads as another detection
+    // box; the "READ ZONE" tag is the only piece of text over the preview, and
+    // only while a zone is actually committed.
+    zoneOutline: {
+      position: "absolute",
+      borderWidth: 1,
+      borderStyle: "dashed",
+    },
+    zoneChip: {
+      position: "absolute",
+      top: -18,
+      left: 0,
+      fontSize: 9,
+      fontWeight: "800",
+      letterSpacing: 0.6,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: 6,
+      overflow: "hidden",
+    },
+    // The editor's rectangle: solid white with a corner handle, and the action
+    // chips (USE / RESET / BACK) in a bar on its top edge.
+    zoneRect: {
+      position: "absolute",
+      borderWidth: 2,
+    },
+    zoneHandle: {
+      position: "absolute",
+      width: 18,
+      height: 18,
+      borderRadius: 9,
+      backgroundColor: "#FFFFFF",
+      borderWidth: 3,
+      borderColor: "rgba(10,14,20,0.55)",
+    },
+    zoneEditorActions: {
+      position: "absolute",
+      top: -32,
+      right: 0,
+      flexDirection: "row",
+      gap: 6,
+      borderRadius: 8,
+      padding: 4,
+    },
+    zoneActionChip: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      borderRadius: 7,
+      paddingHorizontal: 9,
+      paddingVertical: 5,
+      minHeight: 26,
+    },
+    zoneActionText: { fontSize: 10, fontWeight: "800", letterSpacing: 0.5 },
+    zoneToggleWrap: {
+      position: "absolute",
+      top: 10,
+      right: 10,
+    },
+
+    // ---- quality presets -------------------------------------------------- //
+    presetRow: {
+      flexDirection: "row",
+      gap: 6,
+      marginTop: spacing.md,
+    },
+    presetChip: {
+      borderRadius: radius.pill,
+      borderWidth: 1,
+      borderColor: colors.dark[500],
+      paddingHorizontal: spacing.md,
+      paddingVertical: 6,
+    },
+    presetChipText: {
+      fontSize: 10,
+      fontWeight: "700",
+      letterSpacing: 0.7,
+      color: colors.onDark.muted,
+    },
 
     scroll: { flex: 1 },
     flex: { flex: 1 },
