@@ -346,8 +346,11 @@ The plate *displayed* is never rewritten: only lookups fan out. A complaint of
   rather than the compose one. `e2e_verify.py`'s direct-DB checks (audit trail,
   cleanup) then read the wrong database — the audit check passes on stale rows and
   the cleanup silently removes 0. The HTTP checks are unaffected because they go
-  through the container. The two probe rows this run created were deleted from the
-  compose DB by hand (`docker compose exec postgres psql`).
+  through the container. The accumulated probe residue was then deleted from the
+  compose DB by hand (`docker compose exec postgres psql`) — 10 hotlist rows, 16
+  complaints, 18 devices, 12 users and 15 sightings — keeping the 2 legitimate demo
+  hot-list rows and the 4 demo users, and the backend was restarted so the Redis set
+  rebuilt to just those 2 canonical keys (`TS9AB1234`, `DL1ZA9092`).
 
 ### Bug found while proving it works
 | Problem | Fix |
