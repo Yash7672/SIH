@@ -338,6 +338,16 @@ The plate *displayed* is never rewritten: only lookups fan out. A complaint of
   vehicles API paths).
 - The new behavioural tests were first run against the pre-fix code, where they
   fail — the padding cases pass only because of this change.
+- Redeployed (`docker compose build backend && docker compose up -d backend`) and
+  `scripts/e2e_verify.py` → **72/72 checks passed**, including both Redis-cache
+  checks (now canonical) and the live WebSocket `hotlist_detection` alert.
+- Caveat seen while redeploying: in this environment a *native* PostgreSQL also
+  owns `5432`, so a host connection to `localhost:5432` reaches the native DB
+  rather than the compose one. `e2e_verify.py`'s direct-DB checks (audit trail,
+  cleanup) then read the wrong database — the audit check passes on stale rows and
+  the cleanup silently removes 0. The HTTP checks are unaffected because they go
+  through the container. The two probe rows this run created were deleted from the
+  compose DB by hand (`docker compose exec postgres psql`).
 
 ### Bug found while proving it works
 | Problem | Fix |

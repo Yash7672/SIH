@@ -320,6 +320,15 @@ cd mobile_app;       node --test
 `e2e_verify.py` finds the backend's Redis by itself; override with
 `RAKSHAK_E2E_REDIS_URL=redis://…` if the backend is remote.
 
+Same idea for PostgreSQL, and it does *not* resolve itself: when a native
+PostgreSQL also listens on `5432`, a host connection to `localhost:5432` reaches
+that native database, not the compose one. The script's HTTP checks are fine
+(they go through the container), but its two direct-DB checks then read the wrong
+database — the audit check passes on rows left by earlier runs, and the cleanup
+removes nothing, so throwaway probe rows quietly accumulate in the compose DB.
+Check with `docker compose exec postgres psql -U postgres -d rakshak -c "\dt"` if
+in doubt, and clean the probes from there.
+
 Caveat: the OCR/model checks are CPU-heavy. Run them **serially** — running the
 e2e suite concurrently with the model health check caused the `/scanner/scan`
 call to exceed its timeout and fail spuriously (it passed when run alone; its
