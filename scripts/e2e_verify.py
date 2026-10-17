@@ -366,8 +366,13 @@ def main() -> int:
 
     # ------------------------------------------------------- 6. redis cache layer
     try:
+        from app.services.plate import plate_key  # type: ignore
+
         members, cache_ttl, source = _redis_snapshot()
-        check("hotlist plate cached in redis", plate in members, f"cache size={len(members)} via {source}")
+        # The cache holds canonical keys - one entry per car, whichever way the
+        # district block was written - so a padded plate is looked up by its key.
+        cached_key = plate_key(plate)
+        check("hotlist plate cached in redis", cached_key in members, f"cache size={len(members)} via {source}")
         check("hotlist cache has a TTL", cache_ttl > 0, f"ttl={cache_ttl}s via {source}")
     except Exception as exc:  # pragma: no cover - env dependent
         check("hotlist plate cached in redis", False, f"redis check failed: {exc}")
@@ -487,8 +492,10 @@ def main() -> int:
     status, recovered = http("PATCH", base, f"/api/v1/hotlist/{hotlist_id}", tokens["cop"], {"status": "RECOVERED"})
     check("hotlist recovery transition", status == 200 and recovered.get("status") == "RECOVERED")
     try:
+        from app.services.plate import plate_key  # type: ignore
+
         members, _ttl, source = _redis_snapshot()
-        check("recovered plate evicted from redis cache", plate not in members, f"via {source}")
+        check("recovered plate evicted from redis cache", plate_key(plate) not in members, f"via {source}")
     except Exception as exc:  # pragma: no cover
         check("recovered plate evicted from redis cache", False, str(exc))
 

@@ -297,6 +297,55 @@ doubtful glyph.
 
 ---
 
+## Phase 17 — One registration, two spellings (the district leading zero) ✅
+
+### Why
+An Indian district ("RTO") code is officially two digits, and the complaint form,
+the RC and the police record all write it that way — but the plate bolted to the
+car, and the read taken off it, usually drop the leading zero. `DL01ZA9092` and
+`DL1ZA9092` are the same car, yet they are different strings, so a complaint filed
+one way never matched a camera that read the other: no exact hot-list match, only a
+0.90 fuzzy one, which is amber `POSSIBLE`, writes no sighting and pages nobody. A
+stolen car drives on with the phone reading "might be".
+
+### What was built
+- `app/services/plate.py`:
+  - `plate_key(plate)` — the canonical matching form (district leading zero
+    dropped). This is what the hot-list cache stores, so one car is one entry.
+  - `plate_spellings(plate)` — every spelling of the same registration (at most
+    two), for a database lookup. Only the *district's* leading zero is
+    insignificant: `01`≡`1`, but `01`≢`02` and `12`≢`1`.
+- Every place a plate meets the hot-list is now spelling-aware:
+  - `plate_verdict.evaluate` — an equivalent spelling counts as an **exact**
+    hot-list match, so it reaches `STOLEN` (with the usual corroboration), not
+    amber `POSSIBLE`.
+  - `hotlist_service.get_active_by_plate` / `is_plate_hotlisted` — the DB lookup
+    uses `plate IN (spellings)` (still index-backed); the Redis probe tries each
+    spelling.
+  - `sighting_service.record_detection` and `get_route_for_plate` — plus the
+    detection cooldown, now keyed on the canonical form so a read that flaps
+    between spellings cannot record two sightings for one parked car.
+  - `cache_service` — stores canonical keys (one member per car).
+  - `vehicles.py` — all three police lookups (detail / timeline / route).
+- `scripts/e2e_verify.py` — the Redis-cache checks compare on the canonical key.
+
+The plate *displayed* is never rewritten: only lookups fan out. A complaint of
+`DL01ZA9092` still reads back as `DL01ZA9092`.
+
+### Verification
+- `pytest` → **390 passed** (19 new: ten `plate_key`/`plate_spellings` units, four
+  verdict cases, the full complaint → verify → alert chain, and the DB / cache /
+  vehicles API paths).
+- The new behavioural tests were first run against the pre-fix code, where they
+  fail — the padding cases pass only because of this change.
+
+### Bug found while proving it works
+| Problem | Fix |
+|---|---|
+| The rule is a *leading zero*, not "one or two digits are interchangeable": `TN12AB3456` and `TN1AB3456` are districts 12 and 1 — different cars. The first draft of the dashboard test asserted they match; the code correctly returned `404` | Kept the code, fixed the test — and pinned the trap as a unit test (`test_a_district_without_a_leading_zero_has_only_one_spelling`), moving the dashboard case to `TN01AB3456`/`TN1AB3456`, the real equivalence |
+
+---
+
 ## Next Phase
 
 Project complete and verified end-to-end, including a real on-device run. Remaining optional

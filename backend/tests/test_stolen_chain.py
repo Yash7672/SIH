@@ -47,6 +47,13 @@ from tests.test_live_scan_ws import (
 # it without.
 REPORTED = "DL1ZA9092"
 CITIZEN_TEXT = "DL 1 ZA 9092"
+# The same car, reported the other way: the district block with its leading zero,
+# as the complaint form and the RC spell it. A plate pair no other test touches, so
+# the hot-list row this test creates cannot be confused with a leftover one - the
+# test harness builds the schema once per session and never truncates between
+# tests, so a shared plate would make the assertions below meaningless.
+PADDED = "DL05ZQ1234"
+UNPADDED = "DL5ZQ1234"
 # What the camera actually managed to read on the day: two characters wrong, both
 # classic OCR confusions, and a string that is itself a perfectly valid plate.
 MISREAD = "DL12AG092"
@@ -343,6 +350,82 @@ def test_more_frames_after_the_verdict_do_not_alert_again(
     # Only the frame that earned the verdict may claim the alert was filed.
     flagged = [m for m in seen if m["police_alerted"]]
     assert len(flagged) == 1, f"{len(flagged)} frames claim to have filed the alert"
+
+
+# --------------------------------------------------------------------------- #
+# the district block: the same car, reported with the leading zero
+# --------------------------------------------------------------------------- #
+def test_a_zero_padded_report_still_pages_the_police(
+    client, demo_tokens, register_device, one_car, alerts, monkeypatch
+):
+    """`DL01ZA9092` on the complaint, `DL1ZA9092` under the camera: one car.
+
+    The district code is officially two digits, and the complaint form, the RC
+    and the police record all write it that way - while the plate on the car, and
+    the person typing, usually leave the zero out. Those were two different
+    strings: no exact hot-list match, only a 0.90 fuzzy one, which is amber
+    POSSIBLE, writes no sighting and pages nobody. A stolen car drives on with the
+    phone reading "might be".
+
+    This is the chain from the top of the file with exactly one thing changed -
+    the citizen's plate is filed the way the paperwork spells it - and it has to
+    reach the same STOLEN, one alert and one sighting.
+    """
+    from app.services.cache import cache_service
+
+    # Guard: the harness does not reset the database between tests, so if some
+    # other test ever starts using this car the assertions below would pass off
+    # its leftovers instead of this test's own work.
+    assert not any(p in _active_hotlist() for p in (PADDED, UNPADDED)), "test state leaked"
+
+    # ---- the citizen reports it, zero and all ----------------------------
+    complaint = _complaint(client, demo_tokens["citizen"], PADDED)
+    assert complaint["plate"] == PADDED, "the complaint keeps the spelling the citizen used"
+    assert complaint["status"] == "PENDING"
+
+    # ---- the cop verifies it ---------------------------------------------
+    verified = _verify(client, demo_tokens["cop"], complaint["id"])
+    assert verified["hotlist_id"]
+    assert PADDED in _active_hotlist()
+
+    # The cache is what the live path reads first, and it holds the canonical
+    # form - neither spelling verbatim unless it happens to be the canonical one.
+    # A lookup that is not spelling-aware cannot find the entry.
+    cached = cache_service.get_active_plates()
+    assert cached is None or PADDED in cached or UNPADDED in cached
+
+    # ---- the camera reads the car, without the zero ----------------------
+    # 0.79 with every glyph solid: below the single-read bar, so the track is
+    # corroborated across two frames - the realistic case, and the one that also
+    # proves consensus still works when the two reads and the listing disagree on
+    # the spelling.
+    monkeypatch.setattr(ls, "run_ocr", _stub_read(UNPADDED, 0.79, char_confs=[0.99] * 9))
+    device_id = register_device("PaddedCam")
+
+    before = _count_sightings(PADDED)
+    with client.websocket_connect("/api/v1/ws/scan") as ws:
+        assert _auth(ws, demo_tokens["volunteer"], device_id)["type"] == "ready"
+        stolen = None
+        for seq in range(1, 6):
+            ws.send_json(_frame(seq))
+            msg, _seen = _drain(ws, "plate", limit=6, timeout=6.0)
+            if msg is None:
+                continue
+            if msg["stolen"]:
+                stolen = msg
+                break
+            time.sleep(0.08)
+
+    assert stolen is not None, "a report filed with a leading zero never reached the police"
+    vd = stolen["verdict"]
+    assert vd["state"] == "STOLEN", vd
+    assert vd["plate"] == UNPADDED, "the verdict reports the plate the camera read"
+    assert vd["matches"] == UNPADDED
+    assert stolen["police_alerted"] is True
+
+    assert len(alerts) == 1, f"{len(alerts)} police alerts for one car"
+    assert alerts[0][0] == "hotlist_detection"
+    assert _count_sightings(PADDED) == before + 1, "the sighting was not filed against the entry"
 
 
 # --------------------------------------------------------------------------- #

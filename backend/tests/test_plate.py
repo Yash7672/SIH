@@ -8,7 +8,9 @@ from app.services.plate import (
     VALID_STATE_CODES,
     is_valid_plate,
     normalize_plate,
+    plate_key,
     plate_read_reliable,
+    plate_spellings,
 )
 
 
@@ -32,6 +34,72 @@ def test_norm_dots_and_slashes():
 
 def test_norm_already_clean():
     assert normalize_plate("KA01AB1234").normalized == "KA01AB1234"
+
+
+# --------------------------------------------------------------------------- #
+# the district block, written two ways
+# --------------------------------------------------------------------------- #
+def test_key_drops_the_district_leading_zero():
+    """`01` and `1` are the same RTO office, so they are the same car."""
+    assert plate_key("DL01ZA9092") == "DL1ZA9092"
+    assert plate_key("DL1ZA9092") == "DL1ZA9092"
+
+
+def test_key_leaves_a_two_digit_district_without_a_zero_alone():
+    assert plate_key("MH12AB1234") == "MH12AB1234"
+    assert plate_key("UP32XA9801") == "UP32XA9801"
+
+
+def test_key_is_the_same_under_either_spelling():
+    assert plate_key("KA01AB1234") == plate_key("KA1AB1234")
+
+
+def test_key_leaves_non_plates_unchanged():
+    """Called on a partial read or nothing at all, it must not raise."""
+    assert plate_key("") == ""
+    assert plate_key(None) == ""
+    assert plate_key("DL1ZA") == "DL1ZA"
+
+
+def test_spellings_include_both_forms_for_a_padded_district():
+    assert set(plate_spellings("DL01ZA9092")) == {"DL01ZA9092", "DL1ZA9092"}
+    assert set(plate_spellings("DL1ZA9092")) == {"DL01ZA9092", "DL1ZA9092"}
+
+
+def test_spellings_of_an_unpadded_district_are_just_itself():
+    assert plate_spellings("MH12AB1234") == ("MH12AB1234",)
+
+
+def test_spellings_always_contain_the_key():
+    """The cache stores keys and a lookup uses spellings, so they must overlap."""
+    for plate in ("DL01ZA9092", "DL1ZA9092", "KA01AB1234", "MH12AB1234", "UP32XA9801"):
+        assert plate_key(plate) in plate_spellings(plate)
+
+
+def test_spellings_never_merge_two_different_cars():
+    """Only the district's leading zero is insignificant - nothing else.
+
+    The tail digit is a different car, and the district is a different office.
+    """
+    assert set(plate_spellings("DL01ZA9092")) & set(plate_spellings("DL01ZA9093")) == set()
+    assert set(plate_spellings("DL01ZA9092")) & set(plate_spellings("DL02ZA9092")) == set()
+
+
+def test_a_district_without_a_leading_zero_has_only_one_spelling():
+    """`12` has no zero to drop, so `TN12AB3456` is not `TN1AB3456`.
+
+    The equivalence is the *leading zero* of the district block, not "one or two
+    digits are interchangeable" - district 12 and district 1 are different RTOs
+    and different cars.
+    """
+    assert plate_spellings("TN12AB3456") == ("TN12AB3456",)
+    assert set(plate_spellings("TN12AB3456")) & set(plate_spellings("TN1AB3456")) == set()
+    assert plate_spellings("MH12AB1234") == ("MH12AB1234",)
+
+
+def test_spellings_of_a_non_plate_come_back_as_itself():
+    assert plate_spellings("junk") == ("junk",)
+    assert plate_spellings(None) == ()
 
 
 def test_valid_plate_forms():

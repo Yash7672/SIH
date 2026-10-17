@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.models import Complaint, ComplaintStatus, Hotlist, HotlistStatus
 from app.core.config import settings
 from app.services.cache import cache_service
+from app.services.plate import plate_spellings
 
 
 class HotlistService:
@@ -15,19 +16,26 @@ class HotlistService:
         self.db = db
 
     def get_active_by_plate(self, plate: str) -> Optional[Hotlist]:
+        # The same car is written two ways - "DL01ZA9092" as it appears on the
+        # complaint and RC, "DL1ZA9092" as it usually appears on the metal - so
+        # the lookup tries both spellings. The list is at most two values, so it
+        # still uses the index on `plate`.
         stmt = (
             select(Hotlist)
-            .where(Hotlist.plate == plate, Hotlist.status.in_([HotlistStatus.ACTIVE, HotlistStatus.FIR_CONFIRMED]))
+            .where(
+                Hotlist.plate.in_(plate_spellings(plate)),
+                Hotlist.status.in_([HotlistStatus.ACTIVE, HotlistStatus.FIR_CONFIRMED]),
+            )
             .order_by(Hotlist.added_at.desc())
             .limit(1)
         )
         return self.db.execute(stmt).scalar_one_or_none()
 
     def is_plate_hotlisted(self, plate: str) -> bool:
-        # 1) Try Redis cache
+        # 1) Try Redis cache (holds canonical keys, so try every spelling)
         cached = cache_service.get_active_plates()
         if cached is not None:
-            return plate in cached
+            return any(spelling in cached for spelling in plate_spellings(plate))
         # 2) Fallback: query PostgreSQL (source of truth)
         return self.get_active_by_plate(plate) is not None
 

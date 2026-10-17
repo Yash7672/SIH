@@ -196,3 +196,91 @@ def test_police_ws_rejects_non_cop(client, demo_tokens):
         with pytest.raises(WebSocketDisconnect) as exc:
             ws.receive_text()
     assert exc.value.code == 4403
+
+
+# --------------------------------------------------------------------------- #
+# the district block, written two ways
+# --------------------------------------------------------------------------- #
+# An Indian district code is officially two digits and every piece of paperwork
+# writes it that way, but the plate on the car - and the read off it - usually
+# drops the leading zero. A report and a detection that disagree on that one zero
+# are the same car, and detecting it must not depend on which side dropped it.
+#
+# Each test below uses its own plate pair on purpose: the harness builds the
+# schema once for the whole session and never truncates between tests, so a car
+# shared by two tests could be "matched" by the first test's leftover hot-list row
+# and the second test would then prove nothing.
+
+
+def _flush_hotlist_cache():
+    """Empty Redis so the next lookup is answered by PostgreSQL.
+
+    The live path's fast path is the Redis set of active plates; the query
+    underneath is the fallback that has to work when Redis is down. They are two
+    different lookups, both spelling-aware, so both are tested.
+    """
+    from app.services.cache import cache_service
+
+    cache_service._client.flushdb()
+
+
+def test_a_padded_report_matches_a_plain_read_when_the_cache_is_cold(client, demo_tokens):
+    """A report filed as `GJ08UV5678` still catches a camera reading `GJ8UV5678`."""
+    make_hotlist(client, demo_tokens, plate="GJ08UV5678")
+    dev = register_device(client, demo_tokens, name="ColdCacheCam")
+    _flush_hotlist_cache()
+
+    r = client.post(
+        "/api/v1/sightings",
+        headers=auth(demo_tokens["volunteer"]),
+        json=sighting_body("GJ8UV5678", dev),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["hotlist_id"]
+
+
+def test_a_plain_report_matches_a_padded_read_when_the_cache_is_cold(client, demo_tokens):
+    """And the other direction: filed `RJ9WX6789`, read `RJ09WX6789`.
+
+    This is the direction the cache's canonical form cannot accidentally cover,
+    because the canonical form happens to be the *plain* spelling; the read has to
+    be recognised as an equivalent spelling of it.
+    """
+    make_hotlist(client, demo_tokens, plate="RJ9WX6789")
+    dev = register_device(client, demo_tokens, name="ColdCachePaddedCam")
+    _flush_hotlist_cache()
+
+    r = client.post(
+        "/api/v1/sightings",
+        headers=auth(demo_tokens["volunteer"]),
+        json=sighting_body("RJ09WX6789", dev),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["hotlist_id"]
+
+
+def test_a_different_district_is_still_an_unrelated_plate(client, demo_tokens):
+    """`10` and `1` are one RTO; `10` and `11` are two. The rule is that narrow."""
+    make_hotlist(client, demo_tokens, plate="KA10YZ7890")
+    dev = register_device(client, demo_tokens, name="OtherDistrictCam")
+    _flush_hotlist_cache()
+
+    r = client.post(
+        "/api/v1/sightings",
+        headers=auth(demo_tokens["volunteer"]),
+        json=sighting_body("KA11YZ7890", dev),
+    )
+    assert r.status_code == 202, r.text
+    assert r.json()["accepted"] is False
+
+
+def test_a_cop_opens_the_car_under_either_spelling(client, demo_tokens):
+    """The dashboard lookup follows the same rule as detection."""
+    make_hotlist(client, demo_tokens, plate="TN01AB3456")
+    for spelling in ("TN01AB3456", "TN1AB3456"):
+        detail = client.get(f"/api/v1/vehicles/{spelling}", headers=auth(demo_tokens["cop"]))
+        assert detail.status_code == 200, f"{spelling}: {detail.text}"
+        assert detail.json()["plate"] == "TN01AB3456"
+
+        timeline = client.get(f"/api/v1/vehicles/{spelling}/timeline", headers=auth(demo_tokens["cop"]))
+        assert timeline.status_code == 200, f"{spelling}: {timeline.text}"

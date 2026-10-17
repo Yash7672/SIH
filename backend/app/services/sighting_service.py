@@ -10,6 +10,7 @@ from app.core.logging import get_logger
 from app.models import Device, Sighting, utcnow
 from app.services.cache import cache_service
 from app.services.hotlist_service import HotlistService
+from app.services.plate import plate_key, plate_spellings
 
 logger = get_logger(__name__)
 
@@ -39,8 +40,10 @@ class SightingService:
         # Fast path: the Redis set of active hotlist plates answers the common
         # case (an arbitrary non-hotlisted plate) without touching PostgreSQL.
         # PostgreSQL stays the source of truth whenever the cache is missing.
+        # The set holds canonical keys, so a read of "DL1ZA9092" has to be checked
+        # against a complaint filed as "DL01ZA9092" - hence `plate_spellings`.
         cached = cache_service.get_active_plates()
-        if cached is not None and plate not in cached:
+        if cached is not None and not any(s in cached for s in plate_spellings(plate)):
             logger.info("Non-hotlist plate detected (cache miss, not stored)")
             return None
 
@@ -56,8 +59,10 @@ class SightingService:
             # Cache was cold/unavailable — warm it now that we have an answer.
             cache_service.add_active_plate(plate)
 
-        # Cooldown / duplicate suppression via Redis (fail-open if Redis down)
-        cooldown_key = f"plate:{plate}:{device.id}"
+        # Cooldown / duplicate suppression via Redis (fail-open if Redis down).
+        # Keyed by the canonical form: the same car read as "DL01ZA9092" one
+        # frame and "DL1ZA9092" the next must not record two sightings.
+        cooldown_key = f"plate:{plate_key(plate)}:{device.id}"
         if not cache_service.cooldown(cooldown_key, settings.DETECTION_COOLDOWN_SECONDS):
             logger.info("Detection throttled for plate (cooldown active)")
             return None
@@ -100,7 +105,10 @@ class SightingService:
             from app.models import Hotlist
 
             entry = self.db.execute(
-                select(Hotlist).where(Hotlist.plate == plate).order_by(Hotlist.added_at.desc()).limit(1)
+                select(Hotlist)
+                .where(Hotlist.plate.in_(plate_spellings(plate)))
+                .order_by(Hotlist.added_at.desc())
+                .limit(1)
             ).scalar_one_or_none()
         if entry is None:
             return []

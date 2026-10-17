@@ -84,6 +84,52 @@ def test_the_real_plate_read_twice_is_stolen():
     assert v.reads == 2
 
 
+def test_a_zero_padded_hot_list_entry_matches_the_plate_on_the_car():
+    """`DL01ZA9092` on the paperwork, `DL1ZA9092` on the metal: one car.
+
+    The district block is two digits on the complaint and the RC, and usually one
+    on the plate, so an entry stored with the zero must be an *exact* match for a
+    camera that dropped it - not a 0.90 fuzzy one that only ever reaches amber
+    POSSIBLE and never pages anyone.
+    """
+    v = _verdict(
+        [_read("DL1ZA9092", at=0.0), _read("DL1ZA9092", at=1.0)],
+        hot={"DL01ZA9092"},
+    )
+    assert v.state == STOLEN
+    assert v.matches == "DL1ZA9092", "the verdict reports what the camera read"
+    assert "exact hot-list match" in v.reason
+
+
+def test_the_padding_matches_in_the_other_direction_too():
+    """A citizen who typed the zero and a camera that read it as padded."""
+    v = _verdict(
+        [_read("DL01ZA9092", at=0.0), _read("DL01ZA9092", at=1.0)],
+        hot={"DL1ZA9092"},
+    )
+    assert v.state == STOLEN
+
+
+def test_a_single_solid_read_of_the_padded_spelling_is_stolen():
+    """The single-read shortcut has to survive the spelling change as well."""
+    v = _verdict([_read("DL1ZA9092", conf=0.95, char_confs=ALL_HIGH)], hot={"DL01ZA9092"})
+    assert v.state == STOLEN
+    assert v.reads == 1
+
+
+def test_the_padding_rule_does_not_blur_two_districts():
+    """`01` and `1` are one office; `01` and `02` are two cars.
+
+    The equivalence is one leading zero in the district block and nothing else,
+    so a different district number must never page the police.
+    """
+    v = _verdict(
+        [_read("DL02ZA9092", at=0.0), _read("DL02ZA9092", at=1.0)],
+        hot={"DL01ZA9092"},
+    )
+    assert v.state != STOLEN
+
+
 def test_one_perfect_read_of_a_real_plate_is_enough():
     """A single read may stand alone, but only if every character is solid.
 

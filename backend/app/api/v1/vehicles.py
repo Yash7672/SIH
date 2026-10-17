@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_cop
 from app.db.session import get_db
 from app.models import Complaint, Hotlist, Sighting, User
-from app.services.plate import normalize_plate
+from app.services.plate import normalize_plate, plate_spellings
 
 router = APIRouter()
 
@@ -16,7 +16,7 @@ def vehicle_detail(plate: str, _: User = Depends(require_cop), db: Session = Dep
     if not norm.valid:
         raise HTTPException(status_code=422, detail="Invalid plate")
     entry = db.execute(
-        select(Hotlist).where(Hotlist.plate == norm.normalized).order_by(Hotlist.added_at.desc())
+        select(Hotlist).where(Hotlist.plate.in_(plate_spellings(norm.normalized))).order_by(Hotlist.added_at.desc())
     ).scalars().first()
     if entry is None:
         raise HTTPException(status_code=404, detail="Vehicle not in hotlist")
@@ -57,7 +57,7 @@ def vehicle_detail(plate: str, _: User = Depends(require_cop), db: Session = Dep
 def vehicle_timeline(plate: str, _: User = Depends(require_cop), db: Session = Depends(get_db)):
     norm = normalize_plate(plate)
     entry = db.execute(
-        select(Hotlist).where(Hotlist.plate == norm.normalized).order_by(Hotlist.added_at.desc())
+        select(Hotlist).where(Hotlist.plate.in_(plate_spellings(norm.normalized))).order_by(Hotlist.added_at.desc())
     ).scalars().first()
     if entry is None:
         raise HTTPException(status_code=404, detail="Vehicle not in hotlist")
@@ -82,7 +82,7 @@ def vehicle_route(plate: str, _: User = Depends(require_cop), db: Session = Depe
     """Chronological route: list of [lat, lng] for polyline drawing."""
     norm = normalize_plate(plate)
     entry = db.execute(
-        select(Hotlist).where(Hotlist.plate == norm.normalized).order_by(Hotlist.added_at.desc())
+        select(Hotlist).where(Hotlist.plate.in_(plate_spellings(norm.normalized))).order_by(Hotlist.added_at.desc())
     ).scalars().first()
     if entry is None:
         raise HTTPException(status_code=404, detail="Vehicle not in hotlist")

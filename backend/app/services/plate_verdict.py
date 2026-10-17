@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from app.services.plate import VALID_STATE_CODES
+from app.services.plate import VALID_STATE_CODES, plate_spellings
 
 # --------------------------------------------------------------------------- #
 # States
@@ -526,7 +526,14 @@ class TrackVerdict:
             )
 
         # ---- the hot-list, exactly
-        if norm in plates:
+        #
+        # "Exactly" means the same *registration*, not the same bytes. The
+        # district block is written two ways - "DL 01 ZA 9092" on the paperwork,
+        # "DL1ZA9092" on the car - and a complaint filed one way must still page
+        # the police for a camera that read it the other. Both spellings are the
+        # same car, so both count as an exact match; the plate reported stays
+        # whatever the camera actually read.
+        if any(spelling in plates for spelling in plate_spellings(norm)):
             # Two ways to be sure: two reads that agree inside the window, or
             # one read that was *verified glyph by glyph* and has no weak
             # character in it. Without the verifier there is no second opinion

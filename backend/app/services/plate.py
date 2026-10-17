@@ -15,7 +15,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-INDIAN_PLATE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$")
+# Groups are named by use: state, RTO district, series letters, tail number.
+# `plate_key` needs the district block on its own to drop a leading zero.
+INDIAN_PLATE_PATTERN = re.compile(r"^([A-Z]{2})([0-9]{1,2})([A-Z]{1,3})([0-9]{1,4})$")
 DIGIT_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S", "6": "G", "7": "T", "8": "B", "9": "G"}
 LETTER_TO_DIGIT = {"O": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2", "G": "6", "T": "7"}
 
@@ -178,6 +180,53 @@ def state_code_ok(candidate: str) -> bool:
 def is_valid_plate(candidate: Optional[str]) -> bool:
     """A plate is valid only when the pattern *and* the RTO whitelist both pass."""
     return bool(candidate) and pattern_ok(candidate) and state_code_ok(candidate)
+
+
+def plate_key(plate: Optional[str]) -> str:
+    """Canonical form of a registration, for matching: the district's leading
+    zero is dropped.
+
+    An Indian district code is officially two digits - the complaint form, the
+    RC and the police record all say ``DL 01 ZA 9092`` - but the plate bolted to
+    the car, and the person filing the complaint, routinely leave the zero out:
+    ``DL1ZA9092``. The *number* identifies the RTO, so ``01`` and ``1`` are the
+    same district and the two spellings are the same car.
+
+    This is the form the hot-list cache stores, so one registration occupies one
+    entry however it was written. The plate shown to a user is never rewritten -
+    only lookups go through here.
+
+    Non-plate input is returned unchanged, so this is always safe to call.
+    """
+    if not plate:
+        return ""
+    match = INDIAN_PLATE_PATTERN.match(plate)
+    if match is None:
+        return plate
+    state, rto, series, tail = match.groups()
+    return f"{state}{rto.lstrip('0') or '0'}{series}{tail}"
+
+
+def plate_spellings(plate: Optional[str]) -> Tuple[str, ...]:
+    """Every spelling of the same registration, for a database lookup.
+
+    ``Hotlist.plate`` keeps whatever the citizen or the camera wrote, so a row
+    stored as ``DL01ZA9092`` has to be found by a read of ``DL1ZA9092`` and the
+    other way round. Returning both lets the indexed ``plate`` column answer the
+    query with a plain ``IN`` list, and ``plate_key`` is always one of the two.
+
+    Non-plate input comes back as a single-element tuple rather than being
+    dropped, so callers can use the result without a validity check.
+    """
+    if not plate:
+        return ()
+    match = INDIAN_PLATE_PATTERN.match(plate)
+    if match is None:
+        return (plate,)
+    state, rto, series, tail = match.groups()
+    stripped = rto.lstrip("0") or "0"
+    padded = rto.zfill(2)
+    return tuple(sorted({f"{state}{stripped}{series}{tail}", f"{state}{padded}{series}{tail}"}))
 
 
 def _strip_blue_band(compact: str) -> Tuple[str, bool]:

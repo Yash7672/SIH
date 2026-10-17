@@ -5,6 +5,7 @@ import redis
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.plate import plate_key
 
 logger = get_logger(__name__)
 
@@ -46,7 +47,12 @@ class CacheService:
         return self._available
 
     def get_active_plates(self) -> Optional[set[str]]:
-        """Return set of active hotlist plates, or None if cache miss/unavailable."""
+        """Return set of active hotlist plates, or None if cache miss/unavailable.
+
+        Members are canonical keys (``plate_key``), not the plate as written, so
+        "DL01ZA9092" and "DL1ZA9092" occupy a single entry. Look up with
+        ``plate_spellings`` (or ``plate_key``) rather than by the raw plate.
+        """
         if not self.available:
             return None
         try:
@@ -63,8 +69,11 @@ class CacheService:
         try:
             pipe = self._client.pipeline()
             pipe.delete(HOTLIST_CACHE_KEY)
-            if plates:
-                pipe.sadd(HOTLIST_CACHE_KEY, *plates)
+            # Canonicalise: the DB may hold the same car under either spelling of
+            # the district block, but the cache must not count it twice.
+            keys = {plate_key(p) for p in plates if p}
+            if keys:
+                pipe.sadd(HOTLIST_CACHE_KEY, *keys)
             pipe.expire(HOTLIST_CACHE_KEY, HOTLIST_TTL_SECONDS)
             pipe.execute()
         except Exception as exc:
@@ -75,7 +84,7 @@ class CacheService:
         if not self.available:
             return
         try:
-            self._client.sadd(HOTLIST_CACHE_KEY, plate)
+            self._client.sadd(HOTLIST_CACHE_KEY, plate_key(plate))
             self._client.expire(HOTLIST_CACHE_KEY, HOTLIST_TTL_SECONDS)
         except Exception as exc:
             self._available = False
@@ -85,7 +94,7 @@ class CacheService:
         if not self.available:
             return
         try:
-            self._client.srem(HOTLIST_CACHE_KEY, plate)
+            self._client.srem(HOTLIST_CACHE_KEY, plate_key(plate))
         except Exception as exc:
             self._available = False
             logger.warning("Redis remove failed: %s", exc)
