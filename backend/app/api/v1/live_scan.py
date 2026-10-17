@@ -28,6 +28,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -63,7 +64,12 @@ from app.ws.scan_manager import (
 # AI dependencies
 import torch
 
-torch.set_num_threads(2)
+# Two threads is the measured default for both legs of the live path (they
+# share this one budget, see docs/PROJECT_MAP.md). `-Light` (scripts/start.ps1)
+# exports RAKSHAK_TORCH_THREADS=1 so an 8 GB machine does not hand every core
+# to torch while the ONNX sessions are also running; with the variable absent
+# this line is exactly what it was.
+torch.set_num_threads(int(os.environ.get("RAKSHAK_TORCH_THREADS") or "2"))
 from ultralytics import YOLO  # noqa: E402
 
 # The OCR *engine* is unchanged - same RapidOCR, same detector, same

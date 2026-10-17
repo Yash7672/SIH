@@ -5,6 +5,11 @@ This module resolves that artifact, loads it once, and returns the most confiden
 If the model is unavailable or inference fails, it falls back to the legacy contour logic so
 pre-existing OCR flows continue to work.
 
+An **optional** ONNX detector (``ai/plate_detector.py``, open-image-models
+YOLOv9 end2end) can take over first when ``RAKSHAK_PLATE_DETECTOR=oim``; it is
+off by default and falls back to the YOLOv8n path above when off, absent, or it
+finds nothing.
+
 Every call to :func:`detect_plate_region` appends a human readable line to
 :data:`DETECTOR_EVENTS` so the debug tooling can prove *which* detector produced
 the crop (a silent fallback to contours is a common cause of misreads).
@@ -24,6 +29,11 @@ try:
     from ultralytics import YOLO
 except ModuleNotFoundError:  # pragma: no cover - handled when runtime dependency is missing
     YOLO = None
+
+try:
+    from ai import plate_detector as _plate_detector
+except Exception:  # pragma: no cover - the ONNX detector is strictly optional
+    _plate_detector = None
 
 MIN_ASPECT, MAX_ASPECT = 1.6, 6.5
 MIN_AREA_PCT = 0.002
@@ -210,6 +220,42 @@ def _legacy_regions(bgr: np.ndarray) -> List[PlateRegion]:
     return [best] if best is not None else []
 
 
+def _oim_regions(bgr: np.ndarray) -> List[PlateRegion]:
+    """Run the ONNX YOLOv9 end2end plate detector (open-image-models, opt-in).
+
+    Only active when ``RAKSHAK_PLATE_DETECTOR=oim`` and the weights are on disk.
+    Returns ``[]`` otherwise (or when it finds nothing) so the caller falls
+    straight through to the legacy YOLOv8n detector and then contours - the
+    default behaviour is byte-for-byte unchanged.
+
+    It is ~4x faster than the ultralytics detector on this box (one small ONNX
+    session, NMS baked into the graph) and is MIT licensed; see
+    :mod:`ai.plate_detector` and ``backend/models/open-image-models/README.md``.
+    """
+    if _plate_detector is None or not _plate_detector.is_enabled():
+        return []
+
+    boxes = _plate_detector.detect(bgr)
+    regions: List[PlateRegion] = []
+    for box in boxes:
+        if box.score < MIN_CONF:
+            continue
+        crop, padded = _crop_from_box(bgr, box.box)
+        if crop.size == 0:
+            continue
+        regions.append(
+            PlateRegion(
+                crop=crop,
+                source="oim",
+                box=padded,
+                raw_box=box.box,
+                confidence=box.score,
+            )
+        )
+    _log(f"oim: {len(regions)} box(es) >= conf {MIN_CONF}")
+    return regions
+
+
 def detect_plate_region(bgr: np.ndarray) -> Optional[PlateRegion]:
     """Locate the plate region, preferring the trained detector.
 
@@ -219,6 +265,21 @@ def detect_plate_region(bgr: np.ndarray) -> Optional[PlateRegion]:
     if bgr is None or not isinstance(bgr, np.ndarray) or bgr.size == 0:
         _log("detect: empty image")
         return None
+
+    # Opt-in ONNX detector first (RAKSHAK_PLATE_DETECTOR=oim). Off by default:
+    # when it is off, unavailable, or finds nothing, the legacy path below runs
+    # exactly as it always has.
+    try:
+        oim = _oim_regions(bgr)
+        if oim:
+            best = oim[0]
+            _log(
+                f"detect: OIM box={best.raw_box} conf={best.confidence:.3f} "
+                f"padded={best.box} crop={best.crop.shape[1]}x{best.crop.shape[0]}"
+            )
+            return best
+    except Exception as exc:  # pragma: no cover - defensive
+        _log(f"detect: OIM FAILED ({type(exc).__name__}: {exc}) - falling back")
 
     try:
         regions = _yolo_regions(bgr)

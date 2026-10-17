@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
@@ -51,7 +52,16 @@ def get_engine():
             if _engine is None:
                 from rapidocr_onnxruntime import RapidOCR
 
-                _engine = RapidOCR()
+                # rapidocr defaults intra_op_num_threads to -1 = every core, and
+                # its three ONNX sessions are the biggest thread pool in the
+                # process. `-Light` (scripts/start.ps1) exports
+                # RAKSHAK_ORT_THREADS=1 for this; with the variable absent the
+                # engine is constructed exactly as it always was.
+                threads = (os.environ.get("RAKSHAK_ORT_THREADS") or "").strip()
+                if threads.isdigit():
+                    _engine = RapidOCR(intra_op_num_threads=int(threads))
+                else:
+                    _engine = RapidOCR()
     return _engine
 
 

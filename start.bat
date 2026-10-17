@@ -6,6 +6,8 @@ REM  Any argument is forwarded, e.g.
 REM     start.bat -Mode docker
 REM     start.bat -HostIp 192.168.1.20
 REM     start.bat -NoMobile
+REM     start.bat -Light      low memory: static vite preview, no Expo,
+REM                           backend pinned to one torch/ONNX thread
 REM     start.bat -Reset
 REM     start.bat -ResetDb
 REM ---------------------------------------------------------------------------

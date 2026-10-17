@@ -3,7 +3,10 @@
 reviewed at commit `audit-speed` (branch) — see `git log -1`
 Last full review: 2026-10-07, after the audit: A1 code audit, A2 plate-accuracy
 (eval_plates), A3 speed, PART B stream mode, PART C phone zoom / read-zone /
-quality presets.
+quality presets — then re-audited the same day: every figure in this map was
+re-run (eval_plates with the fixed 6-fixture scoring, 3× speed_check, moving-
+vehicle playback, RAM under load, and the new `-Light` low-memory mode), not
+repeated from memory.
 
 ## Architecture Overview
 
@@ -40,6 +43,28 @@ and only for plates that are on the active hot-list.
 7. Seeds demo data (`scripts/seed_demo.py`), guarded by a hash marker so it runs once.
 8. Starts four processes: uvicorn `:8000`, citizen Vite `:5173`, police Vite `:5174`,
    `expo start` `:8081`.
+
+`start.bat -Light` is the low-memory mode: both web apps are built once and
+served with `vite preview` (their dist/) instead of the two dev servers, Expo
+is skipped, and the backend child is pinned to **one** torch and one ONNX
+thread (`RAKSHAK_LIGHT`, `RAKSHAK_TORCH_THREADS`, `RAKSHAK_ORT_THREADS`,
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS=1` in the child environment — set by
+`Start-BackendLocal` in `scripts/start.ps1`, read by `live_scan.py` and
+`ai/ocr_engine.py`; the default two-thread budget is unchanged when the
+variables are absent). A `|light` suffix is folded into the backend env-hash,
+so flipping `-Light` on or off restarts the backend instead of reusing one
+with the wrong thread count, and a frontend already running in the wrong
+flavour (dev vs preview) is stopped and restarted to match. Measured on the
+audit box (8 logical cores, ~8 GB chronically short of free RAM):
+
+- default: backend ~1,081 MB private / citizen ~176 / police ~163 (two large
+  Java processes additionally resident on this box)
+- `-Light`: backend ~681 MB / citizen ~116 / police ~116, ~0.9 GB free of
+  7.97 GB at rest — the switch is doing what its name promises
+- trade-off, measured with `scripts/speed_check.py`: with torch/OCR on one
+  thread the vehicle pass contends harder, so closed-loop p50 climbs to
+  ~1,116–1,264 ms and p95 to ~1,769–4,632 ms on this box — **`-Light` is a
+  memory mode, not a speed fix**.
 
 `scripts/stop.ps1` / `stop.sh` tear all of it down.
 
@@ -353,10 +378,20 @@ shared by both consumers:
 uvicorn/pytest start) — pinned by `backend/tests/test_stream_source.py`.
 
 Demo flow: `python scripts/stream_camera.py --source demo_road --username
-volunteer@example.com --password "Volunteer@123"`. On a 140-frame run of the
-demo clip, 137 frames produced a verdict; 3 were dropped by latest-frame-wins
-under load. `demo_road` is `data/generated/demo_road.mp4` (synthetic plate
-transit, PART A2) — its UNREAD verdicts are the known clipped-render artifact.
+volunteer@example.com --password "Volunteer@123"`. `demo_road` is
+`data/generated/demo_road.mp4` (synthetic plate transit, PART A2) — its UNREAD
+verdicts are the known clipped-render artifact.
+
+**Moving-vehicle playback (audit, default mode):** with `TS09AB1234` put on the
+active hot-list (cop session, `POST /api/v1/hotlist`) to exercise the WS
+scan/hot-list interplay, `stream_camera.py --source demo_road --max-frames 120`
+ran 25 s (10:22:32–10:22:57): SOURCE and WS confirmed, sent=120 frames,
+dropped=112 (latest-frame-wins under this box's CPU load), 8 verdicts all
+UNREAD (clips like `TS09AB`/`TS09A`/`RS09` fail the state grammar) and **zero
+STOLEN — no false alarm** for the hotlisted plate, which is correct behavior:
+the fixture never yields a full valid read, so there is nothing to match.
+Same run under `-Light`: sent=60, dropped=402, 9 UNREAD verdicts, still 0
+reconnects, still no STOLEN (the 1-thread backend simply queues more drops).
 
 ## Maps Heatmap
 
@@ -474,6 +509,12 @@ Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
 324 tests, all passing (`pytest -q -p no:randomly`, ~2.5 min).
 
+Re-verified 2026-10-07 after the audit changes: **324 passed** again (320.25 s on
+the loaded audit box, up from 153 s). `start.bat` is idempotent: it was run twice
+in a row — the second run reported every service already running and reused them
+(still one backend, one citizen, one police; `-Light` state properly restarted
+back to the default dev servers + two-thread backend on the next plain run).
+
 `scripts/live_scan_test.py` is the live-path check (needs the backend running) —
 24 checks covering auth rejection, RBAC, a self-calibrating probe of what the OCR
 actually reads, streaming throughput, the stolen-vehicle alert, the
@@ -516,10 +557,43 @@ built to be hard to pass by accident:
 | --- | --- | --- |
 | `scripts/chain_check.py` | the whole chain through the real API — complaint → Verify → hot-list immediately → frame → STOLEN banner → `/ws/police` alert within 3 s → one sighting row (60 s cooldown) → heat cells → the plate coming off the list stops it. **33/33.** | backend running |
 | `scripts/heat_check.py` | items 5 and 7 over the public API only: 401 without a token, 403 for CITIZEN and VOLUNTEER, both layers, the 7-day and 5,000-cell caps, the 10 s cache via `generated_at`, and that `/sightings` refuses multipart (415), refuses image/video fields (422), and has no imagery column. **14/14.** | backend running |
-| `scripts/speed_check.py` | item 8 — 1 / 4 / 6 vehicles at fixed width, closed loop and saturated. Budget: 150 ms p95 on the boxes reply. Warm run: 97 / 130 / 91 ms p95 — passes; cold-start run trips p95 (model/OCR warm-up) but settles exactly as the warm run shows. | backend running |
+| `scripts/speed_check.py` | item 8 — 1 / 4 / 6 vehicles at fixed width, closed loop and saturated. Budget: 150 ms p95 on the boxes reply. Re-measured on the audit box: **all three closed-loop runs FAIL the budget** — run 3 (warmest) 496 / 711 / 708 ms p95, run 1 1401 / 1533 / 781 ms p95 (p50 237–604) — see the latency item below for why. | backend running |
 
 `chain_check.py` hard-codes no plate name: it reads `MH12JK4567` from the fixture and
 asserts against that, so the check cannot pass on an OCR result nobody actually got.
+
+### Plate accuracy (`scripts/eval_plates.py`) and the character verifier
+
+Re-run on the audit box over the 6 generated fixtures. The fixed scoring treats
+`plate_MH12JK4567.png` as the plate its filename promises — it used to fall
+through unscored, so one fixture was silently absent from every rate the
+script fed (`scripts/bench_plate_reader.py:expected_plate`).
+
+| | exact match | char accuracy | Z read as 7 | Z read as 2 |
+|---|---:|---:|---:|---:|
+| before (old one-pass reader) | 5/6 = 83% | 90.0% | 0 | 0 |
+| after (live-scan path) | 6/6 = 100% | 100.0% | 0 | 0 |
+
+**No fixture plate contains a Z**, so the Z/7 case the whole verifier exists
+for cannot be exercised by the images on disk — the script prints that reason
+rather than letting a silent 0 read like a fix (`DL1ZA9092` is not present).
+The per-character verifier itself (`ai/char_verifier.py`, model at the repo
+**root** `models/char_cls.onnx` — not `backend/models/`; `CHAR_VERIFIER_MODEL`
+overrides the path and `CHAR_VERIFY` defaults to True) was evaluated over its
+own crops with the verifier off vs on (same OCR engine, so this is a fair
+ablation):
+
+| split | n | acc before | acc after | ECE before | ECE after | Z→7 | Z→2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| test | 1410 | 94.0% | **95.2%** | 0.0658 | 0.0120 | 0→0 | 0→0 |
+| font_held | 1423 | 76.7% | **79.6%** | 0.0610 | 0.0485 | 0→0 | **1→0** |
+| real_test | 18 | 77.8% | 77.8% | 0.1381 | 0.1268 | 0→0 | 0→0 |
+
+classify per crop p50 0.40 / p95 0.46 ms over 2851 crops; verifier box (segment
++ one batched inference) p50 26.4 / p95 66.8 ms over the whole plates. So the
+verifier moved the real Z→2 misread in `font_held`, improved calibration (ECE)
+everywhere, and costs essentially nothing — but neither fixture set can prove
+the Z→7 fix on a real malformed font because no such plate is on disk.
 
 ### `scripts/render_live_view.py`
 
@@ -621,26 +695,39 @@ area uniformly pale.
   Splitting the stages and answering `boxes` first is what moved it.
 - **The p95 tail is OCR contending with the pass the phone renders, not detection
   cost.** `scripts/probe_leg_contention.py` sends the *same* 1280 px one-car frame
-  three ways and the box reply is **2.7x** slower when the plate reads: 317 ms p50 /
-  1289 ms p95 with the plate readable, 118 / 230 with the plate cropped out of frame,
-  122 / 709 with it blurred. Both legs share one process and
-  `torch.set_num_threads(2)` (`live_scan.py:57`), so a readable plate costs the
-  vehicle pass its threads for the ~2 s the OCR takes. Once a car's plate has been
-  read (conf ≥ 0.8 sets `plate_settled`) no more OCR is queued for it and the box
-  timing returns to baseline. So the cost curve has to be read from the *unreadable*
-  column; the readable column is contention on top.
+  three ways; re-run 2026-10-07 with the backend otherwise idle, the box reply was
+  still ~1.4x p50 / ~4.6x p95 slower when the plate reads: 150 ms p50 / 779 ms p95
+  with the plate readable, 106 / 171 with the plate cropped out of frame, 102 / 141
+  with it blurred. Both legs share one process and
+  `torch.set_num_threads(int(os.environ.get("RAKSHAK_TORCH_THREADS") or "2"))`
+  (`live_scan.py:72`; the default 2 is unchanged, `-Light` exports 1), so a readable
+  plate costs the vehicle pass its threads for the ~2 s the OCR takes. Once a car's
+  plate has been read (conf ≥ 0.8 sets `plate_settled`) no more OCR is queued for it
+  and the box timing returns to baseline. So the cost curve has to be read from the
+  *unreadable* column; the readable column is contention on top. (`RapidOCR` is pinned
+  the same way via `RAKSHAK_ORT_THREADS` in `ai/ocr_engine.py`.)
   - **`torch.set_num_threads(2)` is deliberately not raised.** It would clear most
     of the p95 on this 8-core laptop and push the same work onto a 4-core target
     machine. That is a hardware decision, not a bug fix. The alternative — moving OCR
     to its own process — removes the contention outright but doubles the resident
-    model set.
+    model set. `-Light` (see the start.bat section) pins **down** to 1 thread
+    instead, giving up latency to save ~400 MB of backend RAM.
   - `scripts/speed_check.py` measures 1 / 4 / 6 vehicles at a **fixed 1280 px width**,
     because an earlier version pasted cars side by side and so tripled the pixels to
     decode along with the vehicle count — it was measuring the JPEG decoder, not the
     cost of another detection. Geometry shrinks each car as the count grows, so at 6
     the plates are too small to read; the box timing is what is under test. It reports
     a closed-loop run (one frame in flight, what the phone does) and a saturated run
-    (250 ms regardless) separately, and budgets only the closed loop.
+    (250 ms regardless) separately, and budgets only the closed loop. Re-run 3× on the
+    audit box against the default 2-thread backend, **all three FAIL** the 150 ms p95
+    budget: run 1 = 1401 / 1533 / 781 ms p95, run 2 = 615 / 839 / 674, run 3 (warm) =
+    496 / 711 / 708 (server ms, 1 / 4 / 6 cars; p50 237–604). An in-process profile of
+    the same call path is ~89 ms/call (the `infer_vehicles` docstring says ~86 ms): the
+    wall-clock gap is CPU contention on this loaded box (two large Java processes
+    resident) plus the OCR-leg contention documented above, i.e. a hardware/
+    environment decision, not a plain bug — the earlier "warm run passes" wording in
+    this map was wrong and is corrected here. `-Light` pins both legs to 1 thread and
+    is worse on latency (p50 ~1.1–1.3 s, p95 ~1.8–4.6 s), as that section records.
   - `scripts/speed_notes.py` is the reconciliation, written because the three probes
     disagreed. One of them, `scripts/probe_static_scene.py`, is **void**: it ran both
     phases on one connection, so the first phase read the plate and set

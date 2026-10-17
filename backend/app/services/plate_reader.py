@@ -76,6 +76,20 @@ except Exception:  # pragma: no cover
         char_verifier = None
         char_segment = None
 
+# Optional second, plate-specialised reader (ai/plate_ocr.py). Absent or switched
+# off means the vote below is exactly what it was before - a missing module must
+# never turn into a broken read.
+try:
+    from ai import plate_ocr
+except Exception:  # pragma: no cover
+    try:
+        import sys
+
+        sys.path.append(str(Path(__file__).resolve().parents[2]))
+        from ai import plate_ocr
+    except Exception:
+        plate_ocr = None
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +383,11 @@ class Variant:
     text: str = ""
     conf: float = 0.0
     char_confs: Optional[Tuple[float, ...]] = None
+    # How much this reading counts in the vote, relative to one RapidOCR variant.
+    # 1.0 for every RapidOCR reading; below 1.0 for the optional plate-specialised
+    # reader, so it corroborates or tips a close vote without overriding a
+    # confident RapidOCR read (its shipped weights are not India-trained).
+    weight: float = 1.0
 
 
 def build_variants(crop: np.ndarray, with_deskew: bool = True) -> List[Variant]:
@@ -479,6 +498,39 @@ def _recognise(image: np.ndarray) -> List[Tuple[str, float, Tuple[float, ...]]]:
     return out
 
 
+def _fast_observations(variants: Sequence[Variant]) -> List[Variant]:
+    """Read every rendering with the plate-specialised reader, in ONE ONNX call.
+
+    Batching is the point of this reader: the graph has a dynamic batch axis, so
+    N variant crops cost one ``session.run`` instead of N. Returns ``[]`` when the
+    reader is off, unavailable, or read nothing.
+
+    Each observation carries a discounted ``weight`` so it corroborates or tips a
+    close vote without outvoting a confident RapidOCR read on its own.
+    """
+    if plate_ocr is None or not variants or not plate_ocr.is_enabled():
+        return []
+    predictions = plate_ocr.predict_batch([v.image for v in variants])
+    if not predictions:
+        return []
+    weight = plate_ocr.vote_weight()
+    out: List[Variant] = []
+    for variant, prediction in zip(variants, predictions):
+        if not prediction or not prediction.plate:
+            continue
+        out.append(
+            Variant(
+                name=f"fpo:{variant.name}",
+                image=variant.image,
+                text=prediction.plate,
+                conf=float(prediction.mean_conf),
+                char_confs=_align_confs(prediction.plate, prediction.char_probs),
+                weight=weight,
+            )
+        )
+    return out
+
+
 def _merge_two_row(
     lines: Sequence[Tuple[str, float, Tuple[float, ...]]],
 ) -> Optional[Tuple[str, float, Tuple[float, ...]]]:
@@ -562,6 +614,12 @@ def read_crop(crop: np.ndarray, variants: Optional[Sequence[Variant]] = None) ->
     variant whose text is not a legal plate still contributes to the vote - it is
     often the best evidence about which characters are right - but it can never
     win outright.
+
+    When :mod:`ai.plate_ocr` is enabled (see ``RAKSHAK_PLATE_OCR``) each variant
+    is also read by the plate-specialised ONNX reader, and those readings join the
+    same vote at a discounted weight. It is genuine extra evidence - a different
+    model on the same pixels - not a replacement, so a confident RapidOCR read
+    still wins.
     """
     variants = list(variants if variants is not None else build_variants(crop))
     if not variants:
@@ -585,6 +643,11 @@ def read_crop(crop: np.ndarray, variants: Optional[Sequence[Variant]] = None) ->
             Variant(variant.name, variant.image, best[0], best[1], _align_confs(best[0], best[2]))
         )
 
+    # The plate-specialised reader runs once for the whole crop (all variants in a
+    # single batched ONNX call), including renderings RapidOCR could not read at
+    # all - that is where its independent evidence is worth the most.
+    observations.extend(_fast_observations(variants))
+
     observations = [o for o in observations if o.text and o.conf > 0]
     if not observations:
         return None
@@ -602,16 +665,24 @@ def read_crop(crop: np.ndarray, variants: Optional[Sequence[Variant]] = None) ->
     weight: Dict[str, float] = {}
     members: Dict[str, List[Tuple[float, Variant]]] = {}
     for norm, valid, conf, obs in scored:
-        w = conf * (1.5 if valid else 1.0)
+        w = conf * (1.5 if valid else 1.0) * obs.weight
         weight[norm] = weight.get(norm, 0.0) + w
         members.setdefault(norm, []).append((conf, obs))
 
     best_norm = max(weight, key=lambda k: (weight[k], len(k)))
     group = members[best_norm]
 
+    # Reported confidence and the per-character merge come from the primary
+    # reader only. The optional plate-specialised reader has its own confidence
+    # scale, so folding its numbers into theirs would move a RapidOCR read's
+    # reported confidence - and with it the verdict - without changing what was
+    # read. It still counts in the vote above; it just does not get a say in how
+    # sure RapidOCR is.
+    primary = [item for item in group if item[1].weight == 1.0] or group
+
     # ---- per-character merge across agreeing variants ----------------------- #
     confs_by_len: Dict[int, List[Tuple[float, ...]]] = {}
-    for _conf, obs in group:
+    for _conf, obs in primary:
         if obs.char_confs and len(obs.char_confs) == len(best_norm):
             confs_by_len.setdefault(len(best_norm), []).append(obs.char_confs)
     char_confs: Optional[Tuple[float, ...]] = None
@@ -625,11 +696,11 @@ def read_crop(crop: np.ndarray, variants: Optional[Sequence[Variant]] = None) ->
             char_confs = None
 
     norm_obj = normalize_plate(
-        max(group, key=lambda g: g[0])[1].text,
-        ocr_score=_mean([c for c, _ in group]),
+        max(primary, key=lambda g: g[0])[1].text,
+        ocr_score=_mean([c for c, _ in primary]),
     )
-    conf = _mean([c for c, _ in group])
-    best_variant = max(group, key=lambda g: g[0])[1].name
+    conf = _mean([c for c, _ in primary])
+    best_variant = max(primary, key=lambda g: g[0])[1].name
 
     amb = ()
     if char_confs:

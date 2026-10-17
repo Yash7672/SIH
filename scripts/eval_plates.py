@@ -99,6 +99,77 @@ def char_accuracy(read: Optional[str], expected: str) -> float:
     return matched / len(b)
 
 
+def pre_verifier_text(after: dict) -> str:
+    """What RapidOCR said *before* the character verifier was allowed to act.
+
+    ``run_ocr`` keeps the original glyph in ``chars[i]["ocr"]`` and only rewrites
+    ``chars[i]["c"]`` when the fusion replaces it, so this string is the reading
+    the pre-verifier path would have produced - the only way to tell "the OCR
+    misread it" from "the verifier broke it".
+    """
+    chars = after.get("chars") or []
+    if chars:
+        text = "".join(str(d.get("ocr") or "") for d in chars)
+    else:
+        text = str(after.get("text") or "")
+    return "".join(ch for ch in text.upper() if ch.isalnum())
+
+
+def failing_stage(row: dict, which: str = "after") -> str:
+    """The first stage in the pipeline that could have lost the expected plate.
+
+    The ladder walks the real path in order - decode, plate detector, OCR,
+    verifier fusion, normalisation, full-path crop assignment - and names the
+    first one that is inconsistent with the expected string. It is an
+    attribution from evidence the row already carries, not a guess: every stage
+    it names has a value in the row that proves it. ``which`` picks the reader
+    (``after`` is the live path, ``before`` is the old one-pass reader, which
+    has no verifier stage to fall back on).
+    """
+    exp = str(row.get("expected") or "")
+    if not exp:
+        return "- (no expectation)"
+    if row.get("error"):
+        return f"decode: {row['error']}"
+    if not row.get("detected"):
+        return "plate detector: no box"
+    rec = row.get(which) or {}
+    norm = str(rec.get("norm") or "")
+    pre = pre_verifier_text(rec) if which == "after" else norm
+    if norm == exp:
+        reads = [str(r.get("norm") or "") for r in (row.get("server_reads") or [])]
+        if which == "after" and reads and exp not in reads:
+            return "- crop right, full path missed"
+        return "- correct"
+    if not pre:
+        return "OCR: no read at all"
+    if which == "after" and pre == exp:
+        # OCR had the right glyphs; only the fusion or the normaliser can have
+        # turned them into something else.
+        return "char verifier fusion" if rec.get("verified") else "normalisation"
+    return "OCR recognition"
+
+
+def z_substitutions(read: str, expected: str, target: str) -> int:
+    """How often an expected ``Z`` was read as ``target`` (``7`` or ``2``).
+
+    Positions come from a longest-common-subsequence alignment, so a deleted
+    trailing digit cannot shift the comparison and invent a substitution that
+    never happened.
+    """
+    if not read or not expected:
+        return 0
+    a, b = expected.upper(), read.upper()
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    hits = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace":
+            for k in range(min(i2 - i1, j2 - j1)):
+                if a[i1 + k] == "Z" and b[j1 + k] == target:
+                    hits += 1
+    return hits
+
+
 def verdict_state_for(read: dict, hotlist: Tuple[str, ...], reads: int = 1) -> Tuple[str, str]:
     """The plate_verdict decision one (or more) reads would produce.
 
@@ -263,7 +334,15 @@ def eval_image(path: Path) -> Dict[str, object]:
 # Video (demo_road.mp4) - the live path, frame by frame
 # --------------------------------------------------------------------------- #
 def process_video(
-    path: Path, *, stride: int = 1, max_frames: int = 0, save: bool = False
+    path: Path,
+    *,
+    stride: int = 1,
+    max_frames: int = 0,
+    save: bool = False,
+    realtime: bool = True,
+    hotlist: Tuple[str, ...] = (),
+    gt_vehicles: int = 0,
+    expected: Optional[str] = None,
 ) -> Dict[str, object]:
     """Run the live path over a video and evidence tracking + verdicts.
 
@@ -273,6 +352,22 @@ def process_video(
     skipped because they had already settled (the motion/read gating that keeps a
     parked car from occupying the OCR worker), and - per track - the frame where
     each plate was read best (best-frame selection).
+
+    ``realtime`` schedules every frame at its own video timestamp on the wall
+    clock, so the run plays the clip at the speed a camera would have delivered
+    it - which is the only way the read budget, the track expiry and the 5 s
+    consensus window are exercised on the same clock the server uses. Frames are
+    never skipped to catch up: when inference outruns the schedule the shortfall
+    is reported as lag instead of being hidden.
+
+    ``hotlist`` is fed to the same ``TrackVerdict.evaluate`` the WebSocket path
+    calls, with reads timestamped ``time.monotonic()`` exactly as
+    ``live_scan`` timestamps them, so the first STOLEN frame is the alert the
+    phone would have been sent (minus the database write). ``gt_vehicles`` is
+    the number of vehicles the clip is *known* to contain - only that number
+    makes "missed completely" computable instead of a guess - and ``expected``
+    is the plate the clip is supposed to show, so correct-or-not is scored
+    against a stated string instead of eyeballed.
     """
     if not path.is_file():
         return {"error": f"{path.name} not present on disk"}
@@ -284,11 +379,24 @@ def process_video(
         f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
     )
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    raw_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+    fps = raw_fps if raw_fps > 0 else 24.0
+    period = 1.0 / fps
 
     tracker = VehicleTracker()
     conn = ScanConnection()
     verdicts: Dict[int, TrackVerdict] = {}
     per_track: Dict[int, List[dict]] = {}
+    # Per-vehicle evidence for the moving-vehicle table: when a track was first
+    # seen, when it produced its first *valid* read, and when a hot-listed plate
+    # first reached STOLEN (same evaluate() call, same clock as the server).
+    first_seen: Dict[int, dict] = {}
+    first_valid: Dict[int, dict] = {}
+    stolen_at: Dict[int, dict] = {}
+    hot_verdicts: Dict[int, TrackVerdict] = {}
+    plate_px: List[int] = []
+    sharpness: List[float] = []
+    start_wall = time.perf_counter()
 
     frames = 0
     idx = 0
@@ -302,6 +410,12 @@ def process_video(
         "frames_with_vehicles": 0,
     }
     while True:
+        if realtime:
+            # Scheduled at this frame's own video timestamp: a camera delivers
+            # on its clock, not on ours. Late is late - no skipping to catch up.
+            ahead = (start_wall + idx * period) - time.perf_counter()
+            if ahead > 0:
+                time.sleep(ahead)
         ok, frame = cap.read()
         if not ok:
             break
@@ -313,6 +427,8 @@ def process_video(
             break
         frames += 1
         totals["frames_in"] += 1
+        mono = time.monotonic()
+        sharpness.append(_sharpness(frame))
 
         # The server only ever sees JPEG. Encode like the phone would.
         ok, buf = cv2.imencode(".jpg", frame)
@@ -324,10 +440,14 @@ def process_video(
         totals["vehicle_pass_ms"].append(vehicle_ms)
         if tracks:
             totals["frames_with_vehicles"] += 1
+        for tr in tracks:
+            if tr.tid not in first_seen:
+                first_seen[tr.tid] = {"frame": frames, "t": mono, "label": tr.label}
 
         t1 = time.perf_counter()
         plates, crops = ls.infer_plates(bgr, w, h, tracks, tracker, conn=conn)
         totals["plate_pass_ms"].append((time.perf_counter() - t1) * 1000)
+        plate_px.extend(int(p.get("px_w") or 0) for p in plates if p.get("px_w"))
 
         for track in tracker.live():
             if track.tid not in verdicts:
@@ -366,7 +486,74 @@ def process_video(
                     "verified": bool(read.get("verified")),
                 }
             )
+            # ---- the moving-vehicle evidence, on the server's own clock ----- #
+            if read.get("valid") and read.get("norm") and tid not in first_valid:
+                first_valid[tid] = {
+                    "frame": frames,
+                    "t": time.monotonic(),
+                    "plate": str(read.get("norm")),
+                    "conf": round(float(read.get("conf") or 0.0), 3),
+                }
+            if hotlist:
+                # The same two calls live_scan makes per read: add with
+                # time.monotonic(), then evaluate with cooldown_ok=not already.
+                hot = hot_verdicts.setdefault(tid, TrackVerdict(tid))
+                hot.add(
+                    PlateRead(
+                        text=str(read.get("text") or ""),
+                        norm=str(read.get("norm") or ""),
+                        conf=float(read.get("conf") or 0.0),
+                        at=time.monotonic(),
+                        valid=bool(read.get("valid")),
+                        char_confs=tuple(float(c) for c in (read.get("char_confs") or ())),
+                        reason=str(read.get("reason") or ""),
+                        verified=bool(read.get("verified")),
+                        amb=tuple(int(i) for i in (read.get("ambiguous") or ())),
+                    )
+                )
+                already = hot.state == "STOLEN"
+                vd = hot.evaluate(hotlist=hotlist, now=time.monotonic(), cooldown_ok=not already)
+                hot.state = vd.state
+                if vd.state == "STOLEN" and tid not in stolen_at:
+                    stolen_at[tid] = {
+                        "frame": frames,
+                        "t": time.monotonic(),
+                        "plate": vd.plate,
+                        "conf": round(float(vd.confidence or 0.0), 3),
+                    }
     cap.release()
+    elapsed = time.perf_counter() - start_wall
+
+    # ---- the moving-vehicle rows: every track, read or not ------------------ #
+    # A track that was never read is the interesting one (that is what "missed
+    # completely" looks like), so this walks first_seen as well as the read
+    # history rather than dropping the silent tracks the verdict table skips.
+    vehicle_rows: List[dict] = []
+    for tid in sorted(set(first_seen) | set(per_track) | set(stolen_at)):
+        reads = per_track.get(tid, [])
+        seen = first_seen.get(tid) or {}
+        valid = first_valid.get(tid) or {}
+        best = max(reads, key=lambda r: r["conf"]) if reads else None
+        best_plate = str(best["norm"]) if best else None
+        vehicle_rows.append(
+            {
+                "track": tid,
+                "label": seen.get("label") or ("-" if tid < 0 else None),
+                "kind": "vehicle" if tid > 0 else "plate only (no vehicle box)",
+                "seen_frame": seen.get("frame"),
+                "seen_t": seen.get("t"),
+                "valid_frame": valid.get("frame"),
+                "valid_t": valid.get("t"),
+                "valid_plate": valid.get("plate"),
+                "valid_conf": valid.get("conf"),
+                "best_plate": best_plate,
+                "reads": len(reads),
+                "correct": (best_plate == expected) if (expected and best_plate) else None,
+                "stolen": stolen_at.get(tid),
+            }
+        )
+    vehicles_detected = len([t for t in first_seen if t > 0])
+    scheduled = max(0, idx - 1) / fps
 
     # ---- per-track verdicts at the end of the run --------------------------- #
     track_rows = []
@@ -435,11 +622,43 @@ def process_video(
         "frames_with_vehicles": totals["frames_with_vehicles"],
         "frames_without_vehicles": totals["frames_in"] - totals["frames_with_vehicles"],
         "tracks_seen": totals["tracks_seen"],
+        # --- moving-vehicle measurement (real-speed playback) --- #
+        "expected": expected,
+        "hotlist": list(hotlist),
+        "realtime": realtime,
+        "fps": round(fps, 2),
+        "clip_seconds": round(n_frames / fps, 2),
+        "scheduled_s": round(scheduled, 2),
+        "elapsed_s": round(elapsed, 2),
+        "lag_s": round(elapsed - scheduled, 2),
+        "vehicles_rows": vehicle_rows,
+        "vehicles_expected": gt_vehicles,
+        "vehicles_detected": vehicles_detected,
+        "vehicles_missed": max(0, gt_vehicles - vehicles_detected),
+        "plate_box_frames": len(plate_px),
+        "plate_px_median": int(statistics.median(plate_px)) if plate_px else 0,
+        "plate_px_min": min(plate_px) if plate_px else 0,
+        "plate_px_max": max(plate_px) if plate_px else 0,
+        "sharpness_median": round(statistics.median(sharpness), 1) if sharpness else 0.0,
+        "sharpness_min": round(min(sharpness), 1) if sharpness else 0.0,
     }
 
 
 def _p50(values: List[float]) -> float:
     return round(statistics.median(values), 1) if values else 0.0
+
+
+def _sharpness(frame: np.ndarray) -> float:
+    """Variance of the Laplacian - the standard blur metric, in one number.
+
+    Answers "was this frame too blurred to read?" with a measurement instead of
+    an impression (lower = blurrier), so "the plate was missed because of blur"
+    can be checked against the clip rather than asserted about it.
+    """
+    if frame is None or frame.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def frames_span(tid: int, tracker: VehicleTracker, verdicts: Dict[int, TrackVerdict]) -> int:
@@ -482,6 +701,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--video-stride", type=int, default=1, help="read every Nth video frame")
     ap.add_argument("--video-max-frames", type=int, default=0, help="cap video frames (0 = all)")
+    ap.add_argument(
+        "--video-plate",
+        default="TS09AB1234",
+        help="plate the clip is supposed to show AND the hot-list it is tested against "
+             "(generate_demo_video.py's default; empty string = neither score nor hot-list)",
+    )
+    ap.add_argument(
+        "--video-vehicles",
+        type=int,
+        default=0,
+        help="how many vehicles the clip actually contains - the ground truth 'missed "
+             "completely' is measured against (demo_road draws none, so the default is 0)",
+    )
+    ap.add_argument("--video-fast", action="store_true",
+                    help="decode the clip as fast as it reads instead of at its real fps")
     ap.add_argument("--save-artifacts", action="store_true",
                     help="OPT-IN: write report JSON + debug crops to data/debug_out/eval/")
     ap.add_argument("--skip-video", action="store_true")
@@ -508,9 +742,14 @@ def main() -> int:
 
     video_row: Dict[str, object] = {}
     if not args.skip_video and DEMO_VIDEO.is_file():
+        plate_expect = (args.video_plate or "").strip().upper()
         video_row = process_video(
             DEMO_VIDEO, stride=args.video_stride, max_frames=args.video_max_frames,
             save=args.save_artifacts,
+            realtime=not args.video_fast,
+            hotlist=(plate_expect,) if plate_expect else (),
+            gt_vehicles=args.video_vehicles,
+            expected=plate_expect or None,
         )
 
     ok, note = privacy_check(privacy_before)
@@ -567,6 +806,78 @@ def main() -> int:
         print("no filename-encoded expectations to score against")
     if missing:
         print(f"skipped/failed: {', '.join(missing)}")
+
+    # ------------------------------------------------------------ worst reads
+    # The single number that matters is the exact-match rate, but a rate hides
+    # *which* glyph lost and at which stage, so the worst rows are listed with
+    # the first pipeline stage inconsistent with the expectation.
+    scored = [r for r in rows if r.get("expected")]
+    if scored:
+        scored.sort(
+            key=lambda r: (float(r.get("after_char", 0.0)), float(r.get("old_char", 0.0)))
+        )
+        worst = scored[:10]
+        n_err = sum(1 for r in scored if not r.get("after_exact"))
+        print()
+        print("=" * 104)
+        print(
+            f"WORST READS: worst first, {n_err} wrong of {len(scored)} scoreable "
+            f"(showing {len(worst)})"
+        )
+        print("=" * 104)
+        print(
+            f"{'file':<26} {'expected':<11} {'before':<13} {'after':<13} "
+            f"{'b':>4} {'a':>4}  stage (before) / stage (after)"
+        )
+        print("-" * 104)
+        for r in worst:
+            after = r.get("after") or {}
+            print(
+                f"{r['file']:<26} {str(r.get('expected')):<11} "
+                f"{str((r.get('old') or {}).get('norm')):<13} {str(after.get('norm')):<13} "
+                f"{float(r.get('old_char', 0.0)):>4.0%} {float(r.get('after_char', 0.0)):>4.0%}  "
+                f"{failing_stage(r, 'old')} / {failing_stage(r, 'after')}"
+            )
+        print("-" * 104)
+        # ------------------------------------------------------------ Z / 7
+        # The case the whole verifier exists for. Counted on both readers over
+        # the same aligned positions, and reported as 0 *with the reason* when
+        # the fixture set simply has no Z in it - a silent 0 would read like a
+        # fix.
+        z7_before = z2_before = 0
+        z7_after = z2_after = 0
+        z_chars = 0
+        for r in scored:
+            exp = str(r.get("expected") or "")
+            z_chars += exp.upper().count("Z")
+            z7_before += z_substitutions(str((r.get("old") or {}).get("norm") or ""), exp, "7")
+            z2_before += z_substitutions(str((r.get("old") or {}).get("norm") or ""), exp, "2")
+            after_norm = str((r.get("after") or {}).get("norm") or "")
+            z7_after += z_substitutions(after_norm, exp, "7")
+            z2_after += z_substitutions(after_norm, exp, "2")
+        print(
+            f"Z misreads on this eval set: expected strings hold {z_chars} 'Z' characters."
+        )
+        print(
+            f"  Z read as 7: before {z7_before}   after {z7_after}\n"
+            f"  Z read as 2: before {z2_before}   after {z2_after}"
+        )
+        if z_chars == 0:
+            print(
+                "  -> no fixture plate contains a Z, so this set cannot exercise the "
+                "Z/7 case at all; the counts above are 0 because the question was "
+                "never asked of the reader, not because it was answered correctly."
+            )
+        dl = [r for r in rows if str(r.get("expected") or "").upper() == "DL1ZA9092"]
+        if dl:
+            for r in dl:
+                after = r.get("after") or {}
+                print(
+                    f"DL1ZA9092 ({r['file']}): before {(r.get('old') or {}).get('norm')} "
+                    f"after {after.get('norm')} verified={after.get('verified')}"
+                )
+        else:
+            print("DL1ZA9092: no image with that plate exists on disk - not run, not scored.")
 
     # ------------------------------------------------------------ video table
     if video_row.get("frames_read") is not None:
@@ -633,6 +944,91 @@ def main() -> int:
             "the same parked car on every frame (plus the per-frame read budget)."
         )
 
+        # ------------------------------------------------ moving vehicles
+        # What the brief asks for, per vehicle: when it was first seen, when it
+        # first produced a valid read, whether that read was right, and - with
+        # the clip's plate on the hot-list - the wall-clock moment the STOLEN
+        # verdict first came out. Everything here is measured on the wall clock
+        # the frames were scheduled on, i.e. at the clip's real speed.
+        rows_mv = video_row.get("vehicles_rows") or []
+        print()
+        print("=" * 104)
+        print(
+            "MOVING VEHICLES at real speed "
+            f"({video_row['fps']} fps, paced): {video_row['file']}"
+        )
+        print("=" * 104)
+        if not rows_mv:
+            print("nothing was tracked or read in this clip")
+        else:
+            print(
+                f"{'track':>5} {'what':<27} {'first seen':>14} "
+                f"{'first valid read':>32} {'correct':>8} {'first STOLEN':>15}"
+            )
+            print("-" * 104)
+            for r in rows_mv:
+                seen = "-" if r["seen_t"] is None else f"{r['seen_t']:.2f}s (f{r['seen_frame']})"
+                if r["valid_t"] is None:
+                    first = "never"
+                else:
+                    first = (
+                        f"{r['valid_t']:.2f}s (f{r['valid_frame']}) "
+                        f"{r['valid_plate']} {r['valid_conf']:.3f}"
+                    )
+                st = r.get("stolen")
+                stolen = "-" if st is None else f"{st['t']:.2f}s (f{st['frame']})"
+                correct = "-" if r["correct"] is None else ("yes" if r["correct"] else "no")
+                print(
+                    f"{r['track']:>5} {str(r['kind']):<27} {seen:>14} "
+                    f"{first:>32} {correct:>8} {stolen:>15}"
+                )
+            print("-" * 104)
+        print(
+            f"playback ....... {video_row['frames_read']} frames @ {video_row['fps']} fps "
+            f"(clip {video_row['clip_seconds']} s): scheduled to end at "
+            f"{video_row['scheduled_s']} s, wall clock {video_row['elapsed_s']} s "
+            f"-> lag {video_row['lag_s']:+.2f} s"
+        )
+        print(
+            f"hot-list ....... {list(video_row.get('hotlist') or []) or 'none'} - "
+            "STOLEN needs two agreeing reads inside the 5 s consensus window, so "
+            "the time above is from the first frame, not from the first read."
+        )
+        print(
+            f"vehicles ....... ground truth in the clip {video_row['vehicles_expected']}, "
+            f"detected {video_row['vehicles_detected']} "
+            f"({video_row['frames_with_vehicles']} frame(s) with a vehicle box), "
+            f"missed completely {video_row['vehicles_missed']}"
+        )
+        print(
+            f"plate boxes .... {video_row['plate_box_frames']} frame(s) with an accepted box, "
+            f"width px median {video_row['plate_px_median']} "
+            f"(min {video_row['plate_px_min']}, max {video_row['plate_px_max']}); "
+            f"MIN_PLATE_PX in the server is 45"
+        )
+        print(
+            f"frame blur ..... Laplacian variance median {video_row['sharpness_median']} "
+            f"(min {video_row['sharpness_min']}) across {video_row['frames_read']} frames - "
+            "reported because blur is one of the candidate reasons, not gated on by the server"
+        )
+        why = []
+        if video_row["vehicles_expected"] and not video_row["vehicles_detected"]:
+            why.append("detector miss (the vehicle detector returned no box in any frame)")
+        if video_row["plate_box_frames"] == 0:
+            why.append("no plate box survived the size/plausibility gates in any frame")
+        elif video_row["plate_px_median"] < 45:
+            why.append(
+                f"plate too small (median {video_row['plate_px_median']} px < MIN_PLATE_PX 45)"
+            )
+        if video_row.get("expected") and rows_mv:
+            wrong = [r for r in rows_mv if r.get("correct") is False]
+            if wrong:
+                why.append(
+                    f"{len(wrong)} track(s) read something other than "
+                    f"{video_row['expected']} - see the clipped-render note above"
+                )
+        print(f"why ............ {'; '.join(why) if why else 'nothing was missed'}")
+
     # -------------------------------------------------------------- verdicts
     if rows:
         print()
@@ -665,10 +1061,26 @@ def main() -> int:
     by_expected = {
         str(r.get("expected")): r for r in rows if r.get("server_reads") or r.get("expected")
     }
+    scene_rows = [r for r in rows if str(r.get("file", "")).startswith("road_scene")]
+    scene_reads = [
+        str(sr.get("norm")) for r in scene_rows for sr in (r.get("server_reads") or [])
+    ]
     for plate in NAMED_SIX:
         row = by_expected.get(plate)
         if row is None:
-            print(f"{plate:<12} NOT PRESENT on disk / not detected - not run, not scored")
+            # No file on disk claims this plate. The only other place it could
+            # come from is the road scene, so report what that scene actually
+            # read rather than letting an absent fixture look like a pass.
+            if plate in scene_reads:
+                print(
+                    f"{plate:<12} fixture: none  road_scene.jpg full path: OK "
+                    f"(scene reads {scene_reads})"
+                )
+            else:
+                print(
+                    f"{plate:<12} NOT PRESENT as a fixture and NOT read by road_scene.jpg "
+                    f"(it read {scene_reads or 'nothing'}) - not run, not scored"
+                )
             continue
         after = row.get("after") or {}
         reads = row.get("server_reads") or []
@@ -677,6 +1089,23 @@ def main() -> int:
         print(
             f"{plate:<12} crop {crop_flag:<5} full-path {path_flag:<5} "
             f"reads {[sr['norm'] for sr in reads]}"
+        )
+
+    # ------------------------------------------------------- full-path reads
+    # What the *whole* server path (decode -> vehicle pass -> plate pass ->
+    # crop -> OCR) produced for each image: the reading a WebSocket client
+    # would have been sent, as opposed to the detector-then-crop shortcut the
+    # accuracy table scores.
+    print()
+    print("=" * 104)
+    print("FULL SERVER PATH READS (decode -> vehicle pass -> plate pass -> crop -> OCR)")
+    print("=" * 104)
+    for r in rows:
+        reads = r.get("server_reads") or []
+        detail = [(x.get("norm"), x.get("conf")) for x in reads]
+        print(
+            f"{r['file']:<26} boxes {r.get('server_plates_found', 0)}, "
+            f"crops {r.get('server_crops', 0)} -> {detail or 'no read'}"
         )
 
     # ------------------------------------------------------------- artifacts

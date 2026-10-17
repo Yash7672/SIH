@@ -26,6 +26,16 @@ from ai.detector import (
 )
 from ai.ocr_engine import best_plate, candidates, read_text
 
+# Optional plate-specialised second reader (ai/plate_ocr.py). In this pipeline it
+# is a *rescue* reader only: it is consulted when RapidOCR produced no valid plate
+# on a rendering, so it can add a read the general engine missed but can never
+# override one it got. (The live path votes the two readers instead - see
+# app.services.plate_reader.read_crop.)
+try:
+    from ai import plate_ocr
+except Exception:  # pragma: no cover
+    plate_ocr = None
+
 try:
     from app.services.plate import MIN_REPORT_CONFIDENCE, is_valid_plate, plate_read_reliable
 except ImportError:  # allow `ai/` to run standalone without backend on sys.path
@@ -173,6 +183,31 @@ def renderings_for(bgr: np.ndarray) -> List[tuple]:
     return renderings
 
 
+def _fast_hits(image: np.ndarray) -> List:
+    """Plate-specialised reader output as OcrHit list; [] when off/unavailable."""
+    if plate_ocr is None or not plate_ocr.is_enabled():
+        return []
+    try:
+        return plate_ocr.read_plate(image)
+    except Exception:  # noqa: BLE001 - a second reader must never break the first
+        return []
+
+
+def _read_hits(image: np.ndarray) -> List:
+    """RapidOCR candidates for one rendering, rescued by the fast reader if empty.
+
+    The fast reader only runs when RapidOCR found no valid plate, which is the
+    case it exists for: a crop the general engine could not turn into a legal
+    plate. Running it unconditionally would let a non-India-trained model
+    outvote a correct RapidOCR read, which is the one thing this pipeline must
+    not do.
+    """
+    hits = candidates(read_text(image))
+    if not any(h.valid_plate for h in hits):
+        hits = hits + _fast_hits(image)
+    return hits
+
+
 def _read_single(image: Union[str, bytes, "np.ndarray"]) -> List[DetectedPlate]:
     bgr = _to_bgr(image)
     if bgr is None or bgr.size == 0:
@@ -181,7 +216,7 @@ def _read_single(image: Union[str, bytes, "np.ndarray"]) -> List[DetectedPlate]:
     dets: List[DetectedPlate] = []
 
     for stage, source, image_variant in renderings_for(bgr):
-        det = _from_hits(candidates(read_text(image_variant)), source, stage)
+        det = _from_hits(_read_hits(image_variant), source, stage)
         if det is None:
             continue
         dets.append(det)
@@ -189,7 +224,7 @@ def _read_single(image: Union[str, bytes, "np.ndarray"]) -> List[DetectedPlate]:
         if plate_read_reliable(det.plate, det.confidence):
             break
 
-    frame_det = _from_hits(candidates(read_text(bgr)), "fullframe", "fullframe")
+    frame_det = _from_hits(_read_hits(bgr), "fullframe", "fullframe")
     if frame_det is not None:
         dets.append(frame_det)
 

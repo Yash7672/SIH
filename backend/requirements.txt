@@ -18,4 +18,10 @@ opencv-python==4.10.0.84
 Pillow==11.1.0
 numpy==2.2.1
 rapidocr-onnxruntime==1.4.4
+# Direct deps of the plate-specialised reader (ai/plate_ocr.py). Both are already
+# pulled in transitively (onnxruntime by rapidocr-onnxruntime, PyYAML by
+# ultralytics); pinned here because ai/plate_ocr.py imports them directly and must
+# not silently depend on another package's requirements.
+onnxruntime==1.30.0
+PyYAML==6.0.3
 ultralytics>=8.0.0

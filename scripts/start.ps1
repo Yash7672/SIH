@@ -28,6 +28,12 @@
 .PARAMETER NoMobile
     Do not start Expo Metro.
 
+.PARAMETER Light
+    Low-memory run. Serves both web apps from their built dist/ with
+    `vite preview` instead of the two Vite dev servers, skips Expo, and pins the
+    backend's torch and ONNX sessions to one thread each. The default (no
+    switch) is unchanged: dev servers, Expo and the two-thread budget.
+
 .PARAMETER Reset
     Stop everything and wipe state: docker volumes, or drop and recreate the
     dev database (local). Asks for confirmation first.
@@ -35,6 +41,7 @@
 .EXAMPLE
     .\scripts\start.ps1
     .\scripts\start.ps1 -Mode local -NoMobile
+    .\scripts\start.ps1 -Light
     .\scripts\start.ps1 -Reset
 #>
 [CmdletBinding()]
@@ -56,8 +63,14 @@ param(
 
     [switch] $SkipFirewall,
 
-    [switch] $NoWatch
+    [switch] $NoWatch,
+
+    [switch] $Light
 )
+
+# -Light implies -NoMobile: with no phone in the loop there is nothing Metro is
+# needed for, and every process it starts is memory this machine does not have.
+if ($Light) { $NoMobile = $true }
 
 # PowerShell 5.1 compatible on purpose: no ??, no ternary, no -AsHashtable.
 $ErrorActionPreference = 'Continue'
@@ -1450,7 +1463,10 @@ function Start-BackendLocal {
     # process started, the live backend is still serving the previous CORS list
     # and every request from the LAN origin is blocked by the browser.
     $hashes = Get-StateMap -Path $HashesPath -Property 'hashes'
-    $envHash = Get-CombinedHash @($EnvPath)
+    # The thread budget is part of what a running process was started with, so
+    # flipping -Light on or off has to restart the backend instead of quietly
+    # reusing one that still has (or lacks) the one-thread limit.
+    $envHash = (Get-CombinedHash @($EnvPath)) + $(if ($Light) { '|light' } else { '' })
 
     if (Test-ServiceRunning -Name 'backend' -and (Get-ListeningPid -Port $Ports.backend) -gt 0) {
         $prevEnvHash = if ($hashes.ContainsKey('backend_env')) { [string]$hashes['backend_env'] } else { '' }
@@ -1488,6 +1504,18 @@ function Start-BackendLocal {
     # removes the variable, which is the correct restore when it was unset.
     $prevPythonPath = [System.Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
     [System.Environment]::SetEnvironmentVariable('PYTHONPATH', $RepoRoot, 'Process')
+
+    # -Light: hand the child a one-thread budget for torch and every ONNX
+    # session (RapidOCR reads RAKSHAK_ORT_THREADS, the char verifier is already
+    # intra-op 1), plus the OpenMP/BLAS knobs the native libs read at load.
+    $lightEnv = @()
+    if ($Light) {
+        foreach ($name in 'RAKSHAK_LIGHT', 'RAKSHAK_TORCH_THREADS', 'RAKSHAK_ORT_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS') {
+            $prev = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+            [System.Environment]::SetEnvironmentVariable($name, '1', 'Process')
+            $lightEnv += , @($name, $prev)
+        }
+    }
     try {
         Start-TrackedProcess -Name 'backend' -Label 'FastAPI backend' `
             -FilePath $VenvPython `
@@ -1495,6 +1523,9 @@ function Start-BackendLocal {
             -WorkingDirectory $BackendDir | Out-Null
     } finally {
         [System.Environment]::SetEnvironmentVariable('PYTHONPATH', $prevPythonPath, 'Process')
+        foreach ($pair in $lightEnv) {
+            [System.Environment]::SetEnvironmentVariable($pair[0], $pair[1], 'Process')
+        }
     }
 
     # Remember which .env this process was started with, for the check above.
@@ -1545,15 +1576,58 @@ function Initialize-NodeDeps {
 function Start-FrontendLocal {
     param([string] $Name, [string] $Dir, [int] $Port, [string] $Label, [switch] $AllowInstall)
 
+    # Decided before the reuse check: a run that asked for -Light must not
+    # silently keep a dev server, and a plain run must not keep a preview one.
+    $usePreview = [bool]$Light
+    if ($usePreview) {
+        $distIndex = Join-Path $Dir 'dist\index.html'
+        if ($Rebuild -or -not (Test-Path -LiteralPath $distIndex)) {
+            Write-Step ("{0}: building static assets (vite build) for -Light" -f $Label)
+            $npm = Test-Command 'npm'
+            $code = 1
+            if ($npm) {
+                Push-Location $Dir
+                try {
+                    & $npm run build --silent 2>&1 | Out-Null
+                    $code = $LASTEXITCODE
+                } finally {
+                    Pop-Location
+                }
+            }
+            if ($code -ne 0) {
+                Write-Warn2 ("{0}: vite build failed - falling back to the dev server" -f $Label)
+                $usePreview = $false
+            }
+        }
+        if ($usePreview -and -not (Test-Path -LiteralPath $distIndex)) {
+            Write-Warn2 ("{0}: no dist/index.html to serve - falling back to the dev server" -f $Label)
+            $usePreview = $false
+        }
+    }
+
     if (Test-ServiceRunning -Name $Name -and (Get-ListeningPid -Port $Port) -gt 0) {
-        Write-Ok ("{0} already running (reusing it)" -f $Label)
-        $script:Fresh = $false
-        return
+        $cmd = Get-ProcessCommandLine -ProcessId (Get-ListeningPid -Port $Port)
+        $isPreview = ($cmd -match '(?i)(^|\s)preview(\s|$)')
+        if ($isPreview -eq $usePreview) {
+            Write-Ok ("{0} already running (reusing it)" -f $Label)
+            $script:Fresh = $false
+            return
+        }
+        Write-Warn2 ("{0}: restarting as {1} - it is running as {2}" -f $Label, `
+            $(if ($usePreview) { 'vite preview' } else { 'vite dev' }), `
+            $(if ($isPreview) { 'vite preview' } else { 'vite dev' }))
+        Stop-TrackedService -Name $Name
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline -and (Get-ListeningPid -Port $Port) -gt 0) {
+            Start-Sleep -Milliseconds 250
+        }
     }
     Assert-PortFree -Port $Port -ServiceName $Name | Out-Null
     Initialize-NodeDeps -Dir $Dir -Key ("{0}-lock" -f $Name) -AllowInstall:$AllowInstall | Out-Null
 
-    $launcher = Get-NodeLauncher -Dir $Dir -RelativeJs 'vite/bin/vite.js' -CliArgs @('--host', '0.0.0.0', '--port', "$Port")
+    $cliArgs = @('--host', '0.0.0.0', '--port', "$Port")
+    if ($usePreview) { $cliArgs = @('preview') + $cliArgs }
+    $launcher = Get-NodeLauncher -Dir $Dir -RelativeJs 'vite/bin/vite.js' -CliArgs $cliArgs
     if ($null -eq $launcher) {
         Write-Warn2 ("{0}: vite is not installed yet (no node_modules) - skipping this app" -f $Label)
         Write-Warn2 ("run `npm ci` in {0} then re-run start" -f $Dir)
@@ -2502,7 +2576,12 @@ try {
         $script:EffectiveMode = 'local'
     }
 
-    Write-Step ("mode      : {0}{1}" -f $script:EffectiveMode.ToUpper(), $(if ($Rebuild) { ' (rebuild)' } else { '' }))
+    Write-Step ("mode      : {0}{1}{2}" -f $script:EffectiveMode.ToUpper(), `
+        $(if ($Rebuild) { ' (rebuild)' } else { '' }), `
+        $(if ($Light) { ' -Light: static vite preview, no Expo, 1-thread backend' } else { '' }))
+    if ($Light -and $script:EffectiveMode -eq 'docker') {
+        Write-Warn2 '-Light only limits threads in local mode: the backend container keeps its default budget'
+    }
 
     # --- Step 1 ------------------------------------------------------------- #
     Assert-Prerequisites -InMode $script:EffectiveMode

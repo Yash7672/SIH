@@ -2,8 +2,11 @@
 
 Modules
 -------
-detector     : classical-CV plate region detection (no GPU/trained model)
+detector     : plate region detection (YOLOv8n .pt; opt-in ONNX YOLOv9 via
+               plate_detector, plus a classical-CV fallback)
 ocr_engine   : RapidOCR text reader with Indian-plate normalization
+plate_ocr    : optional plate-specialised ONNX recogniser (fast-plate-ocr, MIT)
+plate_detector: optional ONNX YOLOv9 plate detector (open-image-models, MIT)
 pipeline     : detect -> crop -> OCR -> normalized plate result
 
 Privacy

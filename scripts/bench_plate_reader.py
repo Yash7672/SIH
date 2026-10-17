@@ -126,11 +126,20 @@ def plate_crop(path: Path) -> Optional[Tuple[np.ndarray, int, int]]:
 
 
 def expected_plate(path: Path) -> Optional[str]:
-    """The plate a filename promises, if it promises one."""
+    """The plate a filename promises, if it promises one.
+
+    Two shapes exist on disk and both promise a plate: ``plate_1_DL8CBF4890``
+    (indexed) and ``plate_MH12JK4567`` (not). The unindexed form used to fall
+    through unscored, so one of the six generated fixtures was silently absent
+    from every rate this function feeds.
+    """
     stem = path.stem
-    if stem.startswith("plate_") and "_" in stem[6:]:
-        return stem.split("_", 2)[2].upper()
-    return None
+    if not stem.startswith("plate_"):
+        return None
+    rest = stem[6:]
+    if "_" in rest:
+        rest = rest.split("_", 1)[1]
+    return rest.upper() or None
 
 
 # --------------------------------------------------------------------------- #

@@ -2,6 +2,10 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
+// Base Leaflet CSS bundled from the `leaflet` npm dep so the map never depends
+// on the unpkg CDN being reachable (blocked CDN => blank/broken map). Must load
+// BEFORE the theme file, which only re-skins controls/popups laid out by it.
+import "leaflet/dist/leaflet.css";
 import "./leaflet-theme.css";
 import { ThemeProvider } from "./hooks/useTheme";
 import ErrorBoundary from "./components/ErrorBoundary";
