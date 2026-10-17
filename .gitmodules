@@ -1,0 +1,3 @@
+[submodule "plate_model_source"]
+	path = plate_model_source
+	url = https://github.com/lavanyashree2805/yolov8-license-plate-india.git

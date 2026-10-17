@@ -15,6 +15,13 @@ WORKDIR /app
 # `ai.detector.resolve_model_path()` looks for <root>/models/<MODEL_NAME>, which
 # is exactly where `backend/models` is copied to below.
 COPY backend/requirements.txt ./requirements.txt
+# CPU-only PyTorch first. This demo has no GPU, but the default PyPI wheels pull
+# in ~3 GB of nvidia-*/cudnn packages that are never used — that alone made the
+# image ~10 GB and every rebuild re-downloaded the lot. `ultralytics` (below)
+# then finds `torch` already satisfied and skips the CUDA set.
+RUN pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu \
+      torch torchvision
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/alembic.ini ./alembic.ini

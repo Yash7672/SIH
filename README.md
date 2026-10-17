@@ -76,9 +76,11 @@ npx expo start --host localhost
 python scripts/device_simulator.py
 ```
 
-> Mobile note: the app must run against the same Expo SDK 53 runtime Expo Go ships.
-> `npm install` pins `react@19.0.0` / `react-native@0.79.6`; mismatched React versions
-> crash inside React Native's Animated implementation.
+> Mobile note: the app must run against the same Expo SDK runtime Expo Go ships.
+> `npm install` pins `expo@^58` / `react@19.3.0` / `react-native@0.88.0-rc.3` (see
+> `mobile_app/package.json`, which is the source of truth); mismatched React
+> versions crash inside React Native's Animated implementation. The React Native
+> pin is a release candidate on purpose - it is the version Expo SDK 58 expects.
 
 ## Docker Compose
 

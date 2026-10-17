@@ -18,7 +18,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-rakshak}
     ports:
-      - "5432:5432"
+      # Published for host tooling only; the backend uses `postgres:5432` on the
+      # compose network. Override the host side when a NATIVE PostgreSQL (local
+      # mode) already owns 5432 - see .env.example.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -31,7 +34,9 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Published for host tooling only; override the host side when a NATIVE
+      # Redis (local mode) already owns 6379 - see .env.example.
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:

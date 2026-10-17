@@ -682,7 +682,11 @@ area uniformly pale.
 - **`backend/data/uploads/`**: `STORAGE_LOCAL_PATH` is the relative `./data/uploads`, so
   running pytest or uvicorn from `backend/` creates a second uploads tree that the root
   `.gitignore` rule never matched. Now ignored explicitly.
-- **`tree.txt`** at the repo root is a leftover scratch file from an earlier session; untracked.
+- **`tree.txt`** at the repo root was a leftover scratch file from an earlier
+  session. It and `commit-msg.txt` are now untracked and `.gitignore`d.
+- **`plate_model_source/`** is a git submodule
+  (`lavanyashree2805/yolov8-license-plate-india`); check it out with
+  `git submodule update --init plate_model_source` before rebuilding the road-scene fixture.
 - **`scripts/start.sh` is syntax-unverified**: no WSL on this machine, so `bash -n` cannot
   run. The `PYTHONPATH` fix it carries is mirrored from `start.ps1` and untested there.
 - **Live-scan latency: green boxes 80 ms p50 / 341 ms p95**, round trip 83 / 377 ms,

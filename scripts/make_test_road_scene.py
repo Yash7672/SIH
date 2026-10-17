@@ -9,10 +9,14 @@ in the repo (``data/generated/demo_road.mp4``) is a synthetic dark strip with a
 floating plate: YOLOv8n returns *no* COCO vehicle in it, so it can only ever
 exercise the plate path.
 
-So this script composites a licence-safe fixture out of two things already in the
-repo:
+So this script composites a licence-safe fixture out of two things:
 
-* the sample car photo under ``plate_model_source/data/sample_images/``, and
+* the sample car photo under ``plate_model_source/data/sample_images/`` - this
+  lives in the ``plate_model_source`` git submodule
+  (``lavanyashree2805/yolov8-license-plate-india``), so it must be checked out
+  first: ``git submodule update --init plate_model_source``. The *built* fixture
+  (``data/test_plates/road_scene.jpg``) is committed, so ``--check`` and every
+  consumer work without the submodule; only a rebuild needs the source photo.
 * a plate drawn by ``scripts/generate_plate_images.py`` - the project's own
   synthetic renderer, not a photograph of anybody's actual number plate.
 
@@ -84,6 +88,24 @@ FINAL_QUALITY = 92
 # fixture's native size.
 STREAM_WIDTH = 1280
 STREAM_QUALITY = 40
+
+
+def _require_base_photo() -> None:
+    """Fail early with an actionable message when the submodule is not checked out.
+
+    Without this the failure surfaces as a bare ``FileNotFoundError`` from
+    ``PIL.Image.open``, which says nothing about how to fix it.
+    """
+    if BASE_PHOTO.exists():
+        return
+    raise SystemExit(
+        f"FAIL: {BASE_PHOTO.relative_to(ROOT)} is missing.\n"
+        "It lives in the `plate_model_source` git submodule "
+        "(lavanyashree2805/yolov8-license-plate-india). Restore it with:\n"
+        "    git submodule update --init plate_model_source\n"
+        "The built fixture data/test_plates/road_scene.jpg is committed, so\n"
+        "`--check` still works without the submodule."
+    )
 
 
 def build_plate_image(tmp_dir: Path) -> Path:
@@ -194,6 +216,7 @@ def main() -> int:
             return 1
         image = Image.open(out_path).convert("RGB")
     else:
+        _require_base_photo()
         plate_path = build_plate_image(ROOT / "data" / "generated")
         image = composite(plate_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)

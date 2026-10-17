@@ -48,3 +48,9 @@ alembic/versions/__pycache__/
 .env.production
 .rakshak/
 logs/
+# Scratch files from earlier sessions that were tracked by mistake. The commit
+# message draft and the directory dump are both regenerable and nothing reads
+# them; kept out of the index so a fresh clone matches the working tree.
+commit-msg.txt
+tree.txt
+

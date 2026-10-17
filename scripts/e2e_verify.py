@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import random
+import subprocess
 import sys
 import time
 import urllib.error
@@ -75,6 +76,7 @@ def http(
     body: Any = None,
     raw: Optional[bytes] = None,
     content_type: str = "application/json",
+    timeout: int = 20,
 ) -> tuple[int, Any]:
     url = f"{base}{path}"
     headers: dict[str, str] = {}
@@ -89,7 +91,7 @@ def http(
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = resp.read().decode()
             try:
                 return resp.status, json.loads(payload)
@@ -103,6 +105,61 @@ def http(
             return exc.code, payload
     except Exception as exc:  # connection refused etc.
         return 0, {"detail": str(exc)}
+
+
+def _redis_snapshot() -> tuple[set[str], int, str]:
+    """The active-hotlist Redis set as the *backend* sees it.
+
+    The backend and this script do not always share a Redis. With the Docker
+    stack the backend talks to the ``redis`` service inside the compose network,
+    while a native Redis can still hold host port 6379 - so a plain localhost
+    connection reads the *wrong* instance and a perfectly healthy cache looks
+    empty. Order of preference:
+
+      1. ``RAKSHAK_E2E_REDIS_URL`` when set (point it at the backend's Redis);
+      2. the backend's Redis container via ``docker compose exec`` (Docker mode);
+      3. ``settings.REDIS_URL`` (local mode: backend and script share a host).
+
+    Returns ``(members, ttl_seconds, source)``.
+    """
+    key = "rakshak:hotlist:active_plates"
+
+    import redis as redis_lib
+
+    from app.core.config import settings  # type: ignore
+
+    def from_url(url: str) -> tuple[set[str], int]:
+        client = redis_lib.Redis.from_url(url, decode_responses=True, socket_timeout=3)
+        return set(client.smembers(key)), int(client.ttl(key))
+
+    override = os.getenv("RAKSHAK_E2E_REDIS_URL")
+    if override:
+        members, ttl = from_url(override)
+        return members, ttl, "RAKSHAK_E2E_REDIS_URL"
+
+    members, ttl = from_url(settings.REDIS_URL)
+    if members:
+        return members, ttl, "settings.REDIS_URL"
+
+    # Empty: if the backend is containerized its Redis is a different instance
+    # that the host cannot reach on the (shadowed) published port. Try it.
+    try:
+        members_out = subprocess.run(
+            ["docker", "compose", "exec", "-T", "redis", "redis-cli", "smembers", key],
+            capture_output=True, text=True, timeout=20,
+        )
+        ttl_out = subprocess.run(
+            ["docker", "compose", "exec", "-T", "redis", "redis-cli", "ttl", key],
+            capture_output=True, text=True, timeout=20,
+        )
+        if members_out.returncode == 0:
+            members = {line.strip() for line in members_out.stdout.splitlines() if line.strip()}
+            raw_ttl = ttl_out.stdout.strip() if ttl_out.returncode == 0 else ""
+            ttl = int(raw_ttl) if raw_ttl.lstrip("-").isdigit() else -1
+            return members, ttl, "docker compose exec redis"
+    except Exception:
+        pass
+    return members, ttl, "settings.REDIS_URL"
 
 
 def multipart(fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
@@ -309,14 +366,9 @@ def main() -> int:
 
     # ------------------------------------------------------- 6. redis cache layer
     try:
-        import redis as redis_lib
-
-        from app.core.config import settings  # type: ignore
-
-        client = redis_lib.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-        members = client.smembers("rakshak:hotlist:active_plates")
-        check("hotlist plate cached in redis", plate in members, f"cache size={len(members)}")
-        check("hotlist cache has a TTL", client.ttl("rakshak:hotlist:active_plates") > 0)
+        members, cache_ttl, source = _redis_snapshot()
+        check("hotlist plate cached in redis", plate in members, f"cache size={len(members)} via {source}")
+        check("hotlist cache has a TTL", cache_ttl > 0, f"ttl={cache_ttl}s via {source}")
     except Exception as exc:  # pragma: no cover - env dependent
         check("hotlist plate cached in redis", False, f"redis check failed: {exc}")
 
@@ -435,12 +487,8 @@ def main() -> int:
     status, recovered = http("PATCH", base, f"/api/v1/hotlist/{hotlist_id}", tokens["cop"], {"status": "RECOVERED"})
     check("hotlist recovery transition", status == 200 and recovered.get("status") == "RECOVERED")
     try:
-        import redis as redis_lib
-
-        from app.core.config import settings  # type: ignore
-
-        client = redis_lib.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-        check("recovered plate evicted from redis cache", plate not in client.smembers("rakshak:hotlist:active_plates"))
+        members, _ttl, source = _redis_snapshot()
+        check("recovered plate evicted from redis cache", plate not in members, f"via {source}")
     except Exception as exc:  # pragma: no cover
         check("recovered plate evicted from redis cache", False, str(exc))
 
@@ -466,7 +514,7 @@ def main() -> int:
         with open(plate_image, "rb") as fh:
             image_bytes = fh.read()
         body, ctype = multipart({}, {"image": ("plate.png", image_bytes, "image/png")})
-        status, scanned = http("POST", base, "/api/v1/scanner/scan", tokens["volunteer"], raw=body, content_type=ctype)
+        status, scanned = http("POST", base, "/api/v1/scanner/scan", tokens["volunteer"], raw=body, content_type=ctype, timeout=90)
         check("ANPR scanner endpoint runs OCR", status == 200, f"status={status} {scanned}")
         check("OCR returns a plate + confidence", bool(scanned.get("plate")) and scanned.get("confidence") is not None,
               f"read={scanned.get('plate')} conf={scanned.get('confidence')}")

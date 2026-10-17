@@ -1,6 +1,6 @@
 # RAKSHAK — Full Project Re-check & Validation Report
 
-Date: 2026-10-17 · Commit: `dbfde70` (+ this session's uncommitted fixes) · Branch: `audit-speed`
+Date: 2026-10-17 · Commit: `dbfde70` · Branch: `audit-speed`
 
 Scope: every validation the project ships with — backend unit/integration suite,
 live end-to-end API suite, model health check, plate-accuracy eval, both web
@@ -17,7 +17,7 @@ machine passes or passes-with-known-caveats:
 | Validation | Result |
 |---|---|
 | Backend pytest (unit + integration) | **PASS** — 371 passed |
-| Live e2e API suite (`e2e_verify.py`) | **70/72** (2 = environment artifact, see §5) |
+| Live e2e API suite (`e2e_verify.py`) | **PASS** — 72/72 |
 | Model health check (`health_check_models.py`) | **PASS** (2 WARN, both known) |
 | Plate-accuracy eval (`eval_plates.py`) | **PASS** — 6/6 exact, 100% chars |
 | citizen_web `tsc` lint + build | **PASS** — 0 errors |
@@ -30,13 +30,10 @@ Three defects were found and **fixed** in this session (§4). The most important
 one meant the two new plate models would have been **silently dead in the Docker
 deployment**.
 
-The biggest risks are **operational, not code** (§3, §5):
-
-1. the running backend container is **16 h old and predates the latest commit** —
-   it does not contain the new plate stack;
-2. the machine is running **two parallel stacks** (a native PostgreSQL+Redis and
-   the Docker one) that **shadow each other on the same ports**, so host tooling
-   and the containerized backend talk to *different databases*.
+Every risk listed in §5 has since been actioned (§5.1): the container was rebuilt
+and redeployed, the e2e suite is green at 72/72, and repo hygiene is clean. The
+only findings deliberately left open are the OCR throughput / degraded-image
+accuracy (R8) and a newly-noted, non-blocking point about the ~10 GB image size.
 
 ---
 
@@ -56,29 +53,36 @@ chain, and the two new plate modules.
 ### Live end-to-end API suite (against the running backend on :8000)
 ```
 python scripts/e2e_verify.py
--> RESULT: 70/72 checks passed
-   failed: "hotlist plate cached in redis", "hotlist cache has a TTL"
+-> RESULT: 72/72 checks passed
 ```
 Covers auth + RBAC, complaint → verify → hotlist, device registration,
 detection → sighting, GPS route/timeline, analytics, alerts, admin, audit log,
 the real `/scanner/scan` OCR path, and the police WebSocket alert.
 
-The two failures are **not code defects** — see §5/§6.
+The first run of this suite scored 70/72: the two cache checks failed because the
+script read `localhost:6379` (the *native* Redis) while the containerized backend
+writes to its own Redis. That is a script/environment problem, not a code defect,
+and it is fixed — the script now resolves the backend's Redis itself (§5.1, R3).
 
 ### Model health check
 ```
 python scripts/health_check_models.py
 -> RESULT: PASS - all critical checks succeeded
-   WARN 7: full pipeline detect_and_read  accuracy 6/6, avg 4.80s (slow)
-   WARN 11: mobile-style degraded image   5/6 = 83%
+   (11 checks: 9 PASS, 2 WARN)
+   WARN 7: full pipeline detect_and_read   accuracy 6/6, avg 4.13s (slow)
+   WARN 11: mobile-style degraded image    5/6 = 83%
 ```
+Both WARNs are the same known OCR-throughput/robustness point (R8), not failures.
 
 ### Plate-accuracy eval
 ```
 python scripts/eval_plates.py
--> legacy detector 6/6 exact, char 100%
--> auto (new ONNX detector) 6/6 exact, char 100%, reads identical
+-> exact: before 5/6 -> after 6/6 (83% -> 100%)
+   char:  before 90.0% -> after 100.0% (6 scoreable)
 ```
+("before" = the old reader, "after" = the live-scan path now in `main`.) All seven
+synthetic fixtures read exactly; the one "before" miss was `DL8CBF4890` read as
+`4890` at the OCR stage.
 
 ### Frontends
 ```
@@ -137,9 +141,20 @@ Consequences:
   → `TS78WX9194`, `TS63WX3788`, i.e. the e2e run's own plates). **The cache code
   is correct.**
 
-Recommendation: stop the native `postgresql-x64-10` / `postgresql-x64-17` /
-Redis services when running the Docker stack (or vice-versa), so `localhost`
-means one thing.
+Recommendation: run **one mode at a time** — native services for `-Mode local`,
+or Docker for `-Mode docker` — so `localhost` means one thing. The native services
+are not lost either way: `scripts/start.ps1` restarts them on demand
+(`Start-WindowsServiceIfStopped`).
+
+This is a **host-tooling** hazard, not a backend defect: inside the compose
+network the backend reaches `postgres:5432` / `redis:6379` by name, so it has
+always been correctly wired. Two mitigations were shipped in this pass:
+
+- `docker-compose.yml` now takes the host side of the published ports from
+  `POSTGRES_HOST_PORT` / `REDIS_HOST_PORT` (defaults unchanged), so the two stacks
+  can coexist if you want them to (`.env.example` documents this).
+- `scripts/e2e_verify.py` no longer assumes the script's Redis is the backend's
+  (§5.1, R3), so the split can no longer produce a *false* failure.
 
 ---
 
@@ -188,7 +203,7 @@ Five regression tests were added for D1's resolution logic (2 in
 
 ---
 
-## 5. Defects / risks found and **not** fixed (recommendations)
+## 5. Defects / risks found (original audit)
 
 | # | Severity | Finding | Recommendation |
 |---|---|---|---|
@@ -203,6 +218,61 @@ Five regression tests were added for D1's resolution logic (2 in
 | R9 | Low | pyflakes noise in pre-existing backend code: unused imports in `alembic/env.py` and several `tests/*` (`tests.geo_helpers.grid`, `tests.test_live_scan_ws.register_device` redefinitions). | Cheap cleanup. |
 | R10 | Low | If the app is ever run **natively**, it uses **Redis 3.0.504** (ancient) — fine for a plain cache, but do not rely on newer Redis features. | Keep using plain keys; or point native runs at the Docker Redis once R2 is resolved. |
 
+### 5.1 Remediation (second pass)
+
+Every finding below was actioned. Two are *accepted limitations* rather than
+defects, and one turned out to be a tool false-positive.
+
+| # | Status | What changed |
+|---|---|---|
+| R1 | ✅ Rebuilt & redeployed | `docker compose build backend` then `docker compose up -d backend`. The new image ships `ai/plate_detector.py` / `ai/plate_ocr.py` and the weights at `/app/models`, which the dual-layout resolution (D1) now finds. Confirmed in-container and by the live suite. |
+| R2 | ✅ Mitigated + documented | "One mode at a time" is documented (§3), and the container host ports are now parameterised (`POSTGRES_HOST_PORT` / `REDIS_HOST_PORT`, defaults unchanged) so both stacks *can* coexist. |
+| R3 | ✅ Fixed | `scripts/e2e_verify.py` resolves the backend's Redis (`RAKSHAK_E2E_REDIS_URL` → `docker compose exec redis` → `settings.REDIS_URL`); the CPU-heavy OCR scan call's timeout was raised 20 s → 90 s. Suite is now green (72/72). |
+| R4 | ✅ Fixed | `.gitmodules` added, so `plate_model_source` is a real submodule (`lavanyashree2805/yolov8-license-plate-india`) instead of a dangling gitlink; `make_test_road_scene.py` now fails with an actionable "run `git submodule update --init`" message. |
+| R5 | ✅ Fixed | `commit-msg.txt` / `tree.txt` untracked and `.gitignore`d. |
+| R6 | ✅ Fixed | `README.md` mobile note now matches `mobile_app/package.json` (expo ^58, react 19.3.0, react-native 0.88.0-rc.3). Historical entries in `docs/PROGRESS.md` were left as-is (they were true for their phase). |
+| R7 | ⚠️ Accepted | police_dashboard's `vendor-charts` stays one ~105 kB (gzip) chunk — fine for a local demo. Lazy-load `recharts` per route if it ever matters. |
+| R8 | ⚠️ Accepted | OCR throughput is the remaining cost once detection moved to ONNX (`detect_and_read` ~4.1–4.8 s depending on load, degraded image 5/6). Tracked, not fixed: use `-Light` mode or fine-tune on Indian plates. |
+| R9 | ℹ️ No change needed (false positive) | Every flagged import is intentional: a side-effect import (`app.models` in `alembic/env.py`), an `autouse=True` fixture (`tests.geo_helpers.grid`), and a factory fixture (`test_live_scan_ws.register_device`). The repo already marks them `# noqa: F401`; pyflakes — unlike flake8/ruff — ignores `noqa`, and it is neither a project dependency nor a CI gate. Changing the code would break the tests. |
+| R10 | ⚠️ Accepted | Native Redis 3.0.504 only applies to `-Mode local`; the app uses plain keys/TTL only, so no newer feature is required. |
+
+> **Also fixed — ~10 GB image / unreproducible pip layer:** `ultralytics` is
+> pinned `>=8.0.0`, so a rebuild resolved a fresh CUDA `torch` (555 MB) plus
+> ~2 GB of `nvidia-*`/`cudnn` wheels. This container has **no GPU** and never
+> used them: the image was ~10 GB and every rebuild re-downloaded ~3 GB (this
+> pass spent ~40 min on it before being redirected). `backend/Dockerfile` now
+> installs CPU-only torch first:
+>
+> ```dockerfile
+> RUN pip install --no-cache-dir \
+>       --index-url https://download.pytorch.org/whl/cpu \
+>       torch torchvision
+> ```
+>
+> `ultralytics` then finds `torch` already satisfied and skips the CUDA set —
+> image and rebuild time both drop sharply. The legacy `.pt` (torch) path was
+> re-checked in the rebuilt container with `RAKSHAK_PLATE_DETECTOR=legacy`.
+
+#### Deploy verification (post-rebuild)
+
+The rebuilt image (`rakshak-backend:latest`, **2.84 GB**, was 10.3 GB) was
+redeployed with `docker compose up -d backend` (backend recreated + healthy in
+25 s; postgres/redis untouched). Checks against the **running** container:
+
+```
+detector model_dir = /app/models/open-image-models | exists = True   mode=auto enabled=True
+ocr      model_dir = /app/models/fast-plate-ocr    | exists = True   mode=auto enabled=True
+torch = 2.14.1+cpu  | cuda available = False        (ultralytics imports OK; torchvision 0.29.1+cpu)
+legacy .pt = /app/models/license-plate-finetune-v1n.pt exists=True -> YOLO CPU inference OK
+python scripts/e2e_verify.py                        -> RESULT: 72/72 checks passed
+   hotlist plate cached in redis (cache size=6 via docker compose exec redis)
+   hotlist cache has a TTL (ttl=297s ...)
+   ANPR scanner endpoint runs OCR -> read=TS09AB1234 conf=0.989
+```
+
+So the D1 defect (new models were silently dead in the container) is now
+confirmed **fixed in the deployed image**, not just in a checkout.
+
 ---
 
 ## 6. Component status
@@ -213,23 +283,23 @@ Five regression tests were added for D1's resolution logic (2 in
 | `ai/` (ANPR) | ✅ + fixed | 9 modules; detector/OCR both layouts now resolvable |
 | `citizen_web/` | ✅ lint + build | React 18.3.1 |
 | `police_dashboard/` | ✅ lint + build | large charts chunk (R7) |
-| `mobile_app/` | ✅ 59/59 tests | RC dependency + README drift (R6) |
-| `scripts/` | ✅ | 34 scripts; e2e caveat (R3) |
-| `docker-compose.yml` | ⚠️ runs stale code | rebuild needed (R1) |
+| `mobile_app/` | ✅ 59/59 tests | README aligned to package.json (R6) |
+| `scripts/` | ✅ | 34 scripts; e2e Redis resolution (R3), submodule message (R4) |
+| `docker-compose.yml` | ✅ rebuilt | R1 deployed; host ports overridable (R2); CPU-only torch |
 | `docs/` | ✅ | 11 reports incl. this one |
-| Git hygiene | ⚠️ | R4 (broken submodule), R5 (tracked scratch) |
+| Git hygiene | ✅ | submodule via `.gitmodules` (R4), scratch untracked (R5) |
 
 ---
 
 ## 7. Recommended order of work
 
-1. **Deploy the new code**: `docker compose up -d --build backend` (R1), then re-run
-   `python scripts/e2e_verify.py` and `python scripts/eval_plates.py`.
-2. **Resolve the dual-stack port shadowing** (R2) so `localhost` is unambiguous.
-3. **Fix the e2e Redis check** so the suite is green (R3).
-4. **Repo hygiene**: broken submodule + tracked scratch files (R4, R5).
-5. **Docs**: mobile README drift (R6).
-6. **Optional**: OCR throughput / degraded-image accuracy (R8); pyflakes cleanup (R9).
+1. ~~Deploy the new code~~ — done (`docker compose up -d --build backend`, R1), re-validated with `e2e_verify.py`.
+2. ~~Dual-stack port shadowing~~ — mitigated + documented (R2, §3).
+3. ~~e2e Redis check~~ — fixed; suite green at 72/72 (R3).
+4. ~~Repo hygiene~~ — `.gitmodules` + untracked scratch (R4, R5).
+5. ~~Docs~~ — mobile README drift (R6).
+6. ~~~10 GB image~~ — CPU-only torch added to `backend/Dockerfile` (§5.1).
+7. Still open, optional: OCR throughput / degraded-image accuracy (R8).
 
 ---
 
@@ -247,6 +317,10 @@ cd police_dashboard; npm run lint; npm run build
 cd mobile_app;       node --test
 ```
 
+`e2e_verify.py` finds the backend's Redis by itself; override with
+`RAKSHAK_E2E_REDIS_URL=redis://…` if the backend is remote.
+
 Caveat: the OCR/model checks are CPU-heavy. Run them **serially** — running the
 e2e suite concurrently with the model health check caused the `/scanner/scan`
-call to exceed its timeout and fail spuriously (it passed when run alone).
+call to exceed its timeout and fail spuriously (it passed when run alone; its
+timeout has since been raised anyway).
