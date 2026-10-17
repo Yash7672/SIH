@@ -1,4 +1,4 @@
-﻿import { forwardRef, useId, type InputHTMLAttributes, type SelectHTMLAttributes, type ReactNode } from "react";
+import { forwardRef, useId, type InputHTMLAttributes, type SelectHTMLAttributes, type ReactNode } from "react";
 
 const CONTROL =
   "w-full rounded-lg border bg-surface-card px-3 text-sm text-surface-text placeholder:text-surface-subtle " +

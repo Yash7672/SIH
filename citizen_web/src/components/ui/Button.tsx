@@ -1,4 +1,4 @@
-﻿import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 
 type Variant = "primary" | "secondary" | "danger" | "ghost";

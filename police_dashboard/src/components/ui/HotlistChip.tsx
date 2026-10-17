@@ -1,4 +1,4 @@
-﻿import type { ReactNode } from "react";
+import type { ReactNode } from "react";
 
 /**
  * Hotlist lifecycle chips (ACTIVE / FIR_CONFIRMED / RECOVERED / CLOSED /
