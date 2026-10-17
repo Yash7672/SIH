@@ -13,7 +13,6 @@ import numpy as np
 try:
     from app.services.plate import is_valid_plate, normalize_plate
 except ImportError:  # allow `ai/` to run standalone without backend package on path
-    import os
     import sys
 
     sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))

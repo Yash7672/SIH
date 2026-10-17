@@ -66,7 +66,10 @@ import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:  # the OcrHit shape lives in ocr_engine; import only for typing
+    from ai.ocr_engine import OcrHit
 
 import cv2
 import numpy as np
@@ -94,8 +97,11 @@ MODELS: Dict[str, Tuple[str, str]] = {
 # Recommended default: the small CCT model, ~5 MB, best accuracy/size trade-off.
 DEFAULT_MODEL = "cct-s-v2-global"
 
-# Where the weights live. backend/models/ already holds the other two RAKSHAK
-# checkpoints and is tracked in git, so this follows the existing convention.
+# Where the weights live. Two layouts must both work: a repo checkout keeps them
+# in `backend/models/`, but the Docker image copies `backend/models` to
+# `/app/models` while `ai/` lands at `/app/ai` (see backend/Dockerfile), so the
+# directory is resolved rather than hard-coded. Mirrors
+# `ai.detector.resolve_model_path()`, which has the same two candidates.
 MODEL_DIR = Path(__file__).resolve().parents[1] / "backend" / "models" / "fast-plate-ocr"
 
 # How much this reader's vote counts against one RapidOCR variant. Below 1.0
@@ -131,9 +137,27 @@ def model_name() -> str:
     return value if value in MODELS else DEFAULT_MODEL
 
 
+def _model_dirs() -> List[Path]:
+    root = Path(__file__).resolve().parents[1]
+    return [
+        root / "backend" / "models" / "fast-plate-ocr",  # repo checkout
+        root / "models" / "fast-plate-ocr",              # Docker image layout
+    ]
+
+
 def model_dir() -> Path:
+    """The weights directory, preferring whichever layout exists on disk.
+
+    Never raises and never downloads: the caller treats a missing directory as
+    "reader unavailable" and falls back to RapidOCR.
+    """
     override = _env("RAKSHAK_PLATE_OCR_DIR")
-    return Path(override) if override else MODEL_DIR
+    if override:
+        return Path(override)
+    for candidate in _model_dirs():
+        if candidate.is_dir():
+            return candidate
+    return MODEL_DIR
 
 
 def vote_weight() -> float:

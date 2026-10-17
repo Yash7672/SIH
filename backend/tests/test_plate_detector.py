@@ -103,6 +103,31 @@ def test_is_enabled_follows_the_weights_in_auto_mode(monkeypatch):
     assert plate_detector.is_enabled() is False
 
 
+def test_model_dir_prefers_the_container_layout_when_the_repo_one_is_absent(monkeypatch, tmp_path):
+    # The Docker image copies backend/models -> /app/models and ai/ -> /app/ai,
+    # so `model_dir()` must find the flattened layout too, not just the repo one.
+    repo_dir = tmp_path / "backend" / "models" / "open-image-models"
+    flat_dir = tmp_path / "models" / "open-image-models"
+    flat_dir.mkdir(parents=True)
+    monkeypatch.setattr(plate_detector, "_model_dirs", lambda: [repo_dir, flat_dir])
+    assert plate_detector.model_dir() == flat_dir
+
+
+def test_model_dir_prefers_the_repo_layout_when_present(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "backend" / "models" / "open-image-models"
+    flat_dir = tmp_path / "models" / "open-image-models"
+    repo_dir.mkdir(parents=True)
+    flat_dir.mkdir(parents=True)
+    monkeypatch.setattr(plate_detector, "_model_dirs", lambda: [repo_dir, flat_dir])
+    assert plate_detector.model_dir() == repo_dir
+
+
+def test_model_dir_honours_an_override(monkeypatch, tmp_path):
+    override = tmp_path / "elsewhere"
+    monkeypatch.setenv("RAKSHAK_PLATE_DETECTOR_DIR", str(override))
+    assert plate_detector.model_dir() == override
+
+
 # --------------------------------------------------------------------------- #
 # Preprocessing
 # --------------------------------------------------------------------------- #

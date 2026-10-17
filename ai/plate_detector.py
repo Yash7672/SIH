@@ -80,8 +80,12 @@ MODELS: Dict[str, str] = {
 DEFAULT_SIZE = "256"
 DEFAULT_CONF = 0.25
 
-# Weight dir: backend/models/ already holds the other RAKSHAK checkpoints and is
-# tracked in git, so this follows the existing convention.
+# Weight dir. backend/models/ already holds the other RAKSHAK checkpoints and is
+# tracked in git, so this follows the existing convention. Two layouts must both
+# work: a repo checkout keeps `backend/models/`, but the Docker image copies
+# `backend/models` to `/app/models` while `ai/` lands at `/app/ai` (see
+# backend/Dockerfile). Resolved dynamically, mirroring
+# `ai.detector.resolve_model_path()`.
 MODEL_DIR = Path(__file__).resolve().parents[1] / "backend" / "models" / "open-image-models"
 
 
@@ -107,9 +111,27 @@ def size() -> str:
     return value if value in MODELS else DEFAULT_SIZE
 
 
+def _model_dirs() -> List[Path]:
+    root = Path(__file__).resolve().parents[1]
+    return [
+        root / "backend" / "models" / "open-image-models",  # repo checkout
+        root / "models" / "open-image-models",              # Docker image layout
+    ]
+
+
 def model_dir() -> Path:
+    """The weights directory, preferring whichever layout exists on disk.
+
+    Never raises and never downloads: the caller treats a missing directory as
+    "detector unavailable" and falls back to the YOLOv8n detector.
+    """
     override = _env("RAKSHAK_PLATE_DETECTOR_DIR")
-    return Path(override) if override else MODEL_DIR
+    if override:
+        return Path(override)
+    for candidate in _model_dirs():
+        if candidate.is_dir():
+            return candidate
+    return MODEL_DIR
 
 
 def conf_threshold() -> float:

@@ -177,6 +177,21 @@ def test_unknown_mode_falls_back_to_auto(monkeypatch):
     assert plate_ocr.mode() == "auto"
 
 
+def test_model_dir_prefers_the_container_layout_when_the_repo_one_is_absent(tmp_path: Path, monkeypatch):
+    # The Docker image copies backend/models -> /app/models and ai/ -> /app/ai,
+    # so `model_dir()` must find the flattened layout too.
+    repo_dir = tmp_path / "backend" / "models" / "fast-plate-ocr"
+    flat_dir = tmp_path / "models" / "fast-plate-ocr"
+    flat_dir.mkdir(parents=True)
+    monkeypatch.setattr(plate_ocr, "_model_dirs", lambda: [repo_dir, flat_dir])
+    assert plate_ocr.model_dir() == flat_dir
+
+
+def test_model_dir_honours_an_override(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("RAKSHAK_PLATE_OCR_DIR", str(tmp_path / "elsewhere"))
+    assert plate_ocr.model_dir() == tmp_path / "elsewhere"
+
+
 # --------------------------------------------------------------------------- #
 # Vote integration (live path)
 # --------------------------------------------------------------------------- #
