@@ -186,8 +186,9 @@ PLATE_IMGSZ = 640
 # to be worth the seconds of OCR it costs.
 MIN_PLATE_PX = 45
 # Plates read per frame. OCR is off the hot path, so this is a recall/coverage
-# choice, not a latency one.
-MAX_READS_PER_FRAME = 3
+# choice, not a latency one. Raised from 3 to 4 so a busy frame can keep the OCR
+# gate full from a single frame; the gate below is what actually bounds the work.
+MAX_READS_PER_FRAME = 4
 # Per track, never more than this many OCR attempts, and stop as soon as a read
 # is this confident. This is what keeps a car that sits in view for a minute from
 # occupying the OCR worker for a minute.
@@ -235,7 +236,12 @@ ocr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LiveOCR")
 # Everything else waits for a later frame, by which time the vehicle has very
 # often left view anyway, and a track that has already been read is not queued
 # twice (see ScanConnection.ocr_tracks).
-OCR_MAX_IN_FLIGHT = 2
+#
+# The worker itself is a single thread, so this number is the *queue depth*, not
+# the number of reads running at once: only one crop is ever on a core. Raised
+# from 2 to 3 so the worker is never idle waiting for the next frame to hand it
+# work on a crowded road; the memory it holds is one more plate crop.
+OCR_MAX_IN_FLIGHT = 3
 _ocr_inflight = 0
 _ocr_lock = threading.Lock()
 

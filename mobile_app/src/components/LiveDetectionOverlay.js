@@ -101,10 +101,10 @@ function LiveDetectionOverlay({ preview, mode = "cover" }) {
         if (a.fade) a.fade.stop();
       }
 
-      if (it.kind === "plate" && it.stolen) {
-        // A hot-list match has to be impossible to miss outdoors, so the plate
-        // box pulses until the track expires. Opacity only, for the same reason
-        // the movement uses a translate.
+      if (it.stolen) {
+        // A hot-list match has to be impossible to miss outdoors, so the box
+        // pulses until the track expires - the vehicle box and its plate box
+        // alike. Opacity only, for the same reason the movement uses a translate.
         if (!a.pulsing) {
           a.pulsing = true;
           a.pulse = Animated.loop(
@@ -215,14 +215,18 @@ const BoxLayer = memo(
         <View
           style={[
             styles.chip,
-            item.kind === "vehicle"
-              ? { backgroundColor: VEHICLE_CHIP, top: -CHIP_OFFSET }
-              : { backgroundColor: chipColorFor(item), top: item.chipBelow ? h + CHIP_OFFSET : -CHIP_OFFSET },
+            {
+              backgroundColor: item.chipFill || CHIP_FALLBACK,
+              top: item.kind === "vehicle" || !item.chipBelow ? -CHIP_OFFSET : h + CHIP_OFFSET,
+            },
           ]}
         >
           <Text
             numberOfLines={1}
-            style={[styles.chipText, item.kind === "plate" ? styles.plateChipText : null]}
+            style={[
+              styles.chipText,
+              item.kind === "plate" || item.state === "STOLEN" ? styles.chipTextOnDark : null,
+            ]}
           >
             {item.chip}
           </Text>
@@ -249,23 +253,11 @@ const BoxLayer = memo(
   }
 );
 
-const VEHICLE_CHIP = "#22C55E";
-// The plate chip's fill follows the verdict, not the other way round.
-//
-// It used to be one red for every plate, which put a red "STOLEN"-looking label
-// under every ordinary car - the same false alarm as the banner, one line down.
-// Amber for POSSIBLE, grey for UNREAD, plain blue otherwise. Only STOLEN is red.
-const PLATE_CHIP = {
-  STOLEN: "#FF1F1F",
-  POSSIBLE: "#F59E0B",
-  CLEAR: "#38BDF8",
-  UNREAD: "#9CA3AF",
-};
-
-function chipColorFor(item) {
-  if (item.kind !== "plate") return VEHICLE_CHIP;
-  return PLATE_CHIP[item.state] || PLATE_CHIP.CLEAR;
-}
+// The chip's fill is decided in `liveOverlayMath.selectItems` (verdict for a
+// plate, and the joined verdict for a vehicle) so the component stays a pure
+// painter. `chipFill` always has a value there; the fallback is only here so a
+// malformed item can never paint a chip with no background.
+const CHIP_FALLBACK = "#38BDF8";
 
 const CHIP_OFFSET = 15;
 
@@ -291,7 +283,8 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     letterSpacing: 0.3,
   },
-  plateChipText: {
+  // White on the dark fills (a red STOLEN chip, every plate text chip).
+  chipTextOnDark: {
     color: "#FFFFFF",
   },
 });

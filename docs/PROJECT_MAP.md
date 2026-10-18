@@ -231,12 +231,14 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
   `boxes` — offers its next frame ~120 ms later: roughly 1 frame in 10 was thrown
   away and the phone saw a stalled feed. Splitting them took the stream benchmark
   from 1.2 fps / 2 unanswered to 4.2 fps / 0 unanswered.
-- **OCR is capacity-gated** (`OCR_MAX_IN_FLIGHT = 2`, `OcrClaim`). OCR costs ~2 s per
+- **OCR is capacity-gated** (`OCR_MAX_IN_FLIGHT = 3` waiters, `OcrClaim`). OCR costs ~2 s per
   crop while a frame is ~200 ms, so an ungated stream grows the queue without limit
-  and every queued crop burns cores the green boxes need. A track already in the
+  and every queued crop burns cores the green boxes need. The OCR worker is a single
+  thread, so this is the *queue depth*, not concurrent reads; 3 keeps it from ever
+  waiting on the next frame to refill. A track already in the
   pipeline is skipped *without* spending one of its `MAX_READ_ATTEMPTS`, otherwise a
   track could be settled after three gated-out frames and never read at all.
-- **Read budget**: `MAX_READS_PER_FRAME = 3` crops per frame, `MIN_PLATE_PX = 45`,
+- **Read budget**: `MAX_READS_PER_FRAME = 4` crops per frame, `MIN_PLATE_PX = 45`,
   `MAX_READ_ATTEMPTS = 3` per track, stopping at `PLATE_CONF_DONE = 0.8`. Both the
   per-frame and the pixel minimum were tightened downward while nothing was reaching
   this code, which is how a frame with a third plate in view ended up silently unread.
@@ -276,10 +278,10 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
 | `src/services/liveCapture.js` | `LiveCaptureLoop` — one async loop, never two captures at once. Deps injected so the pacing logic is testable off-device. PART C: `captureOptions` + `zone` params, `setCaptureOptions`/`setZone` setters (never restart the loop), `_cropToZone()` for the phone-side read zone, `onZoneFrame` for overlay re-anchoring. |
 | `src/services/liveScan.js` | The socket. One instance, StrictMode-safe, re-auth on token refresh, seq-gated acks. |
 | `src/components/liveOverlayStore.js` | External store (`useSyncExternalStore`) holding the current boxes. |
-| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 44 unit tests, no React, no native. PART C: `zoneTransform` / `applyZone` / `updateZoneImage` let a committed read zone re-map server boxes into the zone's screen rectangle. |
-| `src/components/LiveDetectionOverlay.js` | Draws the rectangles. Reads the store directly. |
+| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 45 unit tests, no React, no native. PART C: `zoneTransform` / `applyZone` / `updateZoneImage` let a committed read zone re-map server boxes into the zone's screen rectangle. Joins each vehicle track with its plate track (same id) so the vehicle chip can read STOLEN / POSSIBLE / NOT STOLEN / SCANNING. |
+| `src/components/LiveDetectionOverlay.js` | Draws the rectangles and the chip above each box. Reads the store directly. |
 
-Four decisions that are load-bearing, and would be easy to undo by accident:
+The decisions that are load-bearing, and would be easy to undo by accident:
 
 - **The overlay is an external store, not React state.** `CameraView` renders the
   video; if every `boxes` message were `useState`, the whole screen would re-render
@@ -303,6 +305,14 @@ Four decisions that are load-bearing, and would be easy to undo by accident:
   On Android `pictureSize` also feeds the Preview `ResolutionSelector`
   (`ExpoCameraView.kt` builds one selector and hands it to both use cases), so a
   narrower capture would blur the preview as well — two reasons for the same floor.
+- **The chip over a vehicle box is the verdict, not the class name.** A vehicle and
+  its plate share the server's track id (positive ids only; orphan plates are
+  negative), so `selectItems` joins them and labels every vehicle box
+  STOLEN (red) / POSSIBLE (amber) / NOT STOLEN (green) / UNREAD when the read comes
+  back, and **SCANNING** (grey) until it does. A detected car whose plate has not
+  been read is deliberately *not* shown as NOT STOLEN: printing that would clear a
+  vehicle nobody actually looked at. The border follows the same verdict, so a
+  confirmed hot-list match is red box + red label, and a stolen track pulses.
 
 ### PART C — zoom, read zone, quality presets (fixed-camera aiming)
 

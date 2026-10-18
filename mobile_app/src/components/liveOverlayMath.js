@@ -35,13 +35,43 @@ export const STATE_COLORS = {
   CLEAR: PLATE_COLOR,
   UNREAD: "#9CA3AF",
 };
+
+// What the chip above a *vehicle* box says. One word per verdict state, using
+// the same vocabulary the dashboards use so a volunteer never has to learn a
+// private one.
+//
+// SCANNING is deliberately its own state. A car the detector has seen but not
+// yet read is not "NOT STOLEN" - printing that would clear a vehicle nobody has
+// actually looked at. Until the server returns a verdict, the chip says we are
+// still reading it.
+export const VERDICT_WORDS = {
+  STOLEN: "STOLEN",
+  POSSIBLE: "POSSIBLE",
+  CLEAR: "NOT STOLEN",
+  UNREAD: "UNREAD",
+  SCANNING: "SCANNING",
+};
+// The one state that is not a server verdict: a detected vehicle whose plate
+// read has not come back yet.
+export const SCANNING = "SCANNING";
+// Chip fill for a vehicle box. Green is the ordinary road, red is a confirmed
+// hot-list match, amber is "look again", grey is "not read yet".
+export const VEHICLE_CHIP_FILL = {
+  STOLEN: STATE_COLORS.STOLEN,
+  POSSIBLE: STATE_COLORS.POSSIBLE,
+  CLEAR: VEHICLE_COLOR,
+  UNREAD: STATE_COLORS.UNREAD,
+  [SCANNING]: STATE_COLORS.UNREAD,
+};
 export const VEHICLE_WIDTH = 3;
 export const PLATE_WIDTH = 3;
 // Box cap. A crowded junction can produce far more vehicles than are useful on
-// a phone screen; the nearest (largest) ones win. Plates are capped separately
-// and always kept, because a read plate is the whole point of the screen.
+// a phone screen; the nearest (largest) ones win. 20 is the "one box per car in
+// a busy frame" number the scanner is aimed at. Plates are capped separately and
+// always kept, because a read plate is the whole point of the screen - raised to
+// 12 so most of a busy frame's cars can still show the plate that was read.
 export const MAX_BOXES = 20;
-export const MAX_PLATE_BOXES = 8;
+export const MAX_PLATE_BOXES = 12;
 // How long a slide between two reported positions takes, and how far ahead of
 // the newest report the box is drawn. They are the same number on purpose: the
 // animation then arrives exactly as the predicted box does.
@@ -385,20 +415,37 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
     // like a bug, not like a car driving away.
     const rect = projectBox(rec.fading ? rec.box : predictBox(rec), project);
     if (!rect) return;
+    // The plate box for this vehicle carries the verdict, and the server keys it
+    // by the *same* track id (positive ids are shared; only orphan plates get
+    // negative ones). So the vehicle's label can be joined here without a second
+    // lookup on the wire.
+    //
+    // A vehicle with no plate box yet, or one whose verdict has not come back,
+    // is SCANNING rather than NOT STOLEN: a car we never read must never be
+    // painted as cleared.
+    const plate = state.plates.get(id);
+    const vState = plate && plate.state ? plate.state : SCANNING;
+    const word = VERDICT_WORDS[vState] || VERDICT_WORDS[SCANNING];
     vehicles.push({
       key: `v:${id}`,
       id,
       kind: "vehicle",
-      color: VEHICLE_COLOR,
+      // Border follows the verdict: green while ordinary or still reading, amber
+      // for a possible match, red for a confirmed hot-list hit.
+      color: vState === "STOLEN" ? STATE_COLORS.STOLEN
+        : vState === "POSSIBLE" ? STATE_COLORS.POSSIBLE
+        : VEHICLE_COLOR,
+      chipFill: VEHICLE_CHIP_FILL[vState] || VEHICLE_CHIP_FILL[SCANNING],
       borderWidth: VEHICLE_WIDTH,
       rect,
       area: area(rec.box),
       label: rec.label,
-      chip: rec.label,
+      chip: word,
       chipBelow: false,
       score: rec.score,
       fading: Boolean(rec.fading),
-      stolen: false,
+      state: vState,
+      stolen: vState === "STOLEN",
     });
   });
   // Largest first, then capped: on a busy road the nearest cars are the useful
@@ -418,6 +465,7 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
       id,
       kind: "plate",
       color: STATE_COLORS[state] || PLATE_COLOR,
+      chipFill: STATE_COLORS[state] || PLATE_COLOR,
       borderWidth: PLATE_WIDTH,
       rect,
       area: area(rec.box),

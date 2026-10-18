@@ -186,7 +186,38 @@ test("vehicles are green, and a plate's colour is its verdict, with the spec wid
   assert.notEqual(p.color, "#FF1F1F");
   assert.equal(p.borderWidth, 3);
   assert.equal(p.borderWidth, PLATE_WIDTH);
-  assert.equal(v.chip, "CAR 1", "the chip names the class and the track number");
+  // The vehicle chip now carries the verdict, not the class name. Until a read
+  // comes back it says so rather than claiming the car is not stolen.
+  assert.equal(v.chip, "SCANNING", "an unread car is never shown as cleared");
+  assert.equal(v.label, "CAR 1", "the class name is still on the item for the record");
+});
+
+test("a vehicle label follows its plate's verdict, and only STOLEN is red", () => {
+  const cases = [
+    { state: "STOLEN", chip: "STOLEN", fill: "#FF1F1F", border: "#FF1F1F" },
+    { state: "POSSIBLE", chip: "POSSIBLE", fill: "#F59E0B", border: "#F59E0B" },
+    { state: "CLEAR", chip: "NOT STOLEN", fill: VEHICLE_COLOR, border: VEHICLE_COLOR },
+    { state: "UNREAD", chip: "UNREAD", fill: "#9CA3AF", border: VEHICLE_COLOR },
+  ];
+  for (const c of cases) {
+    const state = createOverlayState();
+    seed(state, [{ track: 1, label: "CAR 1", box: [0.1, 0.1, 0.4, 0.6] }], [
+      { track: 1, conf: 0.4, box: [0.2, 0.3, 0.3, 0.38] },
+    ], 1000);
+    applyPlateText(state, {
+      track: 1,
+      text: "MH12JK4567",
+      norm: "MH12JK4567",
+      conf: 0.9,
+      valid: true,
+      verdict: { state: c.state, plate: "MH12JK4567", confidence: 0.9, reads: 1 },
+    }, 1050);
+    const v = selectItems(state, PREVIEW, "cover", 1200).find((i) => i.kind === "vehicle");
+    assert.equal(v.chip, c.chip, `${c.state}: the vehicle box is labelled with the verdict`);
+    assert.equal(v.chipFill, c.fill, `${c.state}: chip fill`);
+    assert.equal(v.color, c.border, `${c.state}: border colour`);
+    assert.equal(v.stolen, c.state === "STOLEN", `${c.state}: only STOLEN pulses`);
+  }
 });
 
 test("plate box colour follows the verdict, and only STOLEN is red", () => {
@@ -398,7 +429,8 @@ test("a track that changes class keeps its id and takes the new label", () => {
   seed(state, [{ track: 4, label: "CAR 1", box: [0.2, 0.2, 0.6, 0.6] }]);
   seed(state, [{ track: 4, label: "BUS 1", box: [0.2, 0.2, 0.6, 0.6] }]);
   assert.equal(state.vehicles.size, 1, "same car, not a new one");
-  assert.equal(selectItems(state, PREVIEW, "cover", 1200)[0].chip, "BUS 1");
+  assert.equal(selectItems(state, PREVIEW, "cover", 1200)[0].label, "BUS 1");
+  assert.equal(selectItems(state, PREVIEW, "cover", 1200)[0].chip, "SCANNING", "no read yet");
 });
 
 test("the box is drawn where the car will be when the slide finishes", () => {
