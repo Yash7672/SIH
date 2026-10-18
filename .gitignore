@@ -53,4 +53,5 @@ logs/
 # them; kept out of the index so a fresh clone matches the working tree.
 commit-msg.txt
 tree.txt
+plate_model_source/
 
