@@ -19,7 +19,7 @@ export function Card({
   return (
     <div
       className={[
-        "rounded-xl border border-surface-border bg-surface-card shadow-card",
+        "rise-in rounded-xl border border-surface-border bg-surface-card shadow-card",
         PADDING[padding],
         className,
       ].join(" ")}

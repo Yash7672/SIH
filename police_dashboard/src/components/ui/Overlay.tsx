@@ -65,7 +65,7 @@ export function Modal({
   const widths = { sm: "max-w-sm", md: "max-w-md", lg: "max-w-2xl" };
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-primary-900/50 p-4 backdrop-blur-sm sm:items-center">
+    <div className="fixed inset-0 z-50 flex animate-fade-in items-end justify-center bg-primary-900/50 p-4 backdrop-blur-sm sm:items-center">
       <button
         type="button"
         aria-label="Close dialog"
@@ -79,7 +79,7 @@ export function Modal({
         aria-modal="true"
         aria-label={title}
         className={[
-          "relative w-full animate-slide-up rounded-2xl bg-surface-card shadow-overlay outline-none",
+          "relative w-full animate-pop rounded-2xl bg-surface-card shadow-overlay outline-none",
           widths[size],
         ].join(" ")}
       >

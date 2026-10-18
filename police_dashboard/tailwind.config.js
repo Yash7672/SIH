@@ -148,6 +148,19 @@ export default {
           from: { opacity: "0", transform: "translateY(8px)" },
           to: { opacity: "1", transform: "translateY(0)" },
         },
+        // Dropdowns and popovers open downward, so they enter from above.
+        "slide-down": {
+          from: { opacity: "0", transform: "translateY(-6px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
+        pop: {
+          from: { opacity: "0", transform: "scale(0.96)" },
+          to: { opacity: "1", transform: "scale(1)" },
+        },
+        "pulse-soft": {
+          "0%, 100%": { opacity: "1" },
+          "50%": { opacity: "0.4" },
+        },
         shimmer: {
           "100%": { transform: "translateX(100%)" },
         },
@@ -155,6 +168,9 @@ export default {
       animation: {
         "fade-in": "fade-in 150ms ease-out",
         "slide-up": "slide-up 200ms ease-out",
+        "slide-down": "slide-down 160ms ease-out",
+        pop: "pop 200ms cubic-bezier(0.22, 1, 0.36, 1) backwards",
+        "pulse-soft": "pulse-soft 2.2s ease-in-out infinite",
         shimmer: "shimmer 1.6s infinite",
       },
     },

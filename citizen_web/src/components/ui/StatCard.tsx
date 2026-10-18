@@ -31,7 +31,7 @@ export function StatCard({
   const flat = hasTrend && trend === 0;
 
   return (
-    <div className="rounded-xl border border-surface-border bg-surface-card p-5 shadow-card">
+    <div className="rise-in hover-lift rounded-xl border border-surface-border bg-surface-card p-5 shadow-card">
       <div className="flex items-start justify-between gap-3">
         <p className="text-sm font-medium text-surface-muted">{label}</p>
         {icon ? (

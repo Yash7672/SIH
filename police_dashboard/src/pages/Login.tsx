@@ -49,7 +49,7 @@ export default function Login() {
       <div className="absolute right-4 top-4 z-10 sm:right-6 sm:top-6">
         <ThemeToggle />
       </div>
-      <div className="relative w-full max-w-md">
+      <div className="stagger-children relative w-full max-w-md">
         <div className="mb-6 flex flex-col items-center text-center">
           <Wordmark subtitle="Police console" />
           <h1 className="mt-5 text-2xl font-semibold tracking-tight text-surface-text">Police Console</h1>

@@ -50,7 +50,7 @@ export function TR({
 }: { children: ReactNode; className?: string } & React.HTMLAttributes<HTMLTableRowElement>) {
   return (
     <tr
-      className={["odd:row-zebra-odd even:row-zebra-even row-hover", className].join(" ")}
+      className={["odd:row-zebra-odd even:row-zebra-even row-hover transition-colors duration-150", className].join(" ")}
       {...rest}
     >
       {children}

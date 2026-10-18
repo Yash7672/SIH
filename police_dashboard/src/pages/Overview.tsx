@@ -114,7 +114,7 @@ export default function Overview({ alerts }: { alerts: AlertEvent[] }) {
 
       {error ? <ErrorState title="Dashboard unavailable" description={error} onRetry={load} /> : null}
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+      <div className="stagger-children grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
         {loading && !stats ? (
           Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-28 rounded-xl" />)
         ) : (

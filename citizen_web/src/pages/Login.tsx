@@ -40,7 +40,7 @@ export default function Login() {
         <ThemeToggle />
       </div>
 
-      <div className="w-full max-w-md">
+      <div className="stagger-children w-full max-w-md">
         <div className="mb-6 flex flex-col items-center text-center">
           <Wordmark />
           <h1 className="mt-5 text-2xl font-semibold tracking-tight text-surface-text">

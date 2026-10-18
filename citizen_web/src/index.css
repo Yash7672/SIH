@@ -2,6 +2,23 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Shared motion vocabulary. `.rise-in` / `.stagger-children` / `.page-transition`
+   below all key off this one curve and distance, so every surface in the
+   console and the portal moves with the same accent. Defined here rather than
+   in tailwind.config so the keyframes exist even if no `animate-rise` utility
+   is ever generated. The reduced-motion block at the bottom of the file
+   disables all of it. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* RAKSHAK global base styles. Byte-identical to police_dashboard/src/index.css
    (that app appends its Leaflet theme in a separate file, leaflet-theme.css).
 
@@ -465,6 +482,77 @@
     border-radius: 9999px;
     background-color: #27354f;
   }
+
+  /* ------------------------------------------------------------------ *
+   * Motion. Everything moves on the same 420ms curve: cards rise into
+   * place, a route change lifts the new page in under the sticky header,
+   * and small interactive surfaces lift on hover. Durations stay short
+   * and distances small so a busy dashboard never feels like it is
+   * loading. The reduced-motion block at the bottom switches all of it
+   * off, including the stagger delay below.
+   * ------------------------------------------------------------------ */
+
+  /* A single surface entering the page (cards, panels, banners). Fill mode is
+     `backwards`, not `both`: it holds the start state through any stagger delay
+     and releases the transform once done, so the finished element never becomes
+     a containing block for a fixed-position descendant. */
+  .rise-in {
+    animation: rise 420ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
+
+  /* A route change: the new page rises in instead of snapping over. */
+  .page-transition {
+    animation: rise 320ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
+
+  /* A grid or list whose children follow one another in. */
+  .stagger-children > * {
+    animation: rise 420ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
+
+  /* Hover lift for small interactive surfaces (stat cards, tiles). */
+  .hover-lift {
+    transition: transform 180ms ease, box-shadow 180ms ease;
+  }
+
+  .hover-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 16px -6px rgb(15 23 42 / 0.18), 0 2px 4px -2px rgb(15 23 42 / 0.1);
+  }
+}
+
+@layer utilities {
+  /* Cascade timing for .stagger-children. Past the tenth child the stagger is
+     dropped: a long list must already be on screen by the time the eye gets
+     there, not still arriving a second later. These longhands sit in the
+     utilities layer so they win over a child's own animation shorthand. */
+  .stagger-children > *:nth-child(2) {
+    animation-delay: 45ms;
+  }
+  .stagger-children > *:nth-child(3) {
+    animation-delay: 90ms;
+  }
+  .stagger-children > *:nth-child(4) {
+    animation-delay: 135ms;
+  }
+  .stagger-children > *:nth-child(5) {
+    animation-delay: 180ms;
+  }
+  .stagger-children > *:nth-child(6) {
+    animation-delay: 225ms;
+  }
+  .stagger-children > *:nth-child(7) {
+    animation-delay: 270ms;
+  }
+  .stagger-children > *:nth-child(8) {
+    animation-delay: 315ms;
+  }
+  .stagger-children > *:nth-child(9) {
+    animation-delay: 360ms;
+  }
+  .stagger-children > *:nth-child(10) {
+    animation-delay: 405ms;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -472,6 +560,7 @@
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;

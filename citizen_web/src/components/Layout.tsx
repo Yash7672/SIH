@@ -101,7 +101,7 @@ export default function Layout() {
                 {menuOpen ? (
                   <div
                     role="menu"
-                    className="absolute right-0 mt-2 w-60 animate-slide-up rounded-xl border border-surface-border bg-surface-card p-1.5 shadow-overlay"
+                    className="absolute right-0 mt-2 w-60 animate-slide-down rounded-xl border border-surface-border bg-surface-card p-1.5 shadow-overlay"
                   >
                     <div className="border-b border-surface-border px-3 py-2.5">
                       <p className="truncate text-sm font-medium text-surface-text">{user.name}</p>
@@ -167,7 +167,11 @@ export default function Layout() {
       </header>
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:py-8">
-        <Outlet />
+        {/* Keyed on the path so a route change replays the entrance instead of
+            the new page snapping into place. */}
+        <div key={location.pathname} className="page-transition">
+          <Outlet />
+        </div>
       </main>
 
       <footer className="border-t border-surface-border bg-surface-card">
