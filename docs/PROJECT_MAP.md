@@ -89,7 +89,7 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget), `ScanConnection` (in-flight slots, OCR claims, device, per-track verdicts, hires_pending/hires_active/last_hires_at) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `stream_camera.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `eval_ocr.py` (measured OCR accuracy → `data/eval/ocr_report.json`, read by `/analytics/ocr`), `stream_camera.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
 | `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |
@@ -124,6 +124,7 @@ Roles are enforced by `app/api/deps.py` (`require_cop`, `require_volunteer`, `re
 | POST | `/api/v1/devices/{id}/revoke` | ADMIN |
 | GET | `/api/v1/alerts` | COP, ADMIN |
 | GET | `/api/v1/analytics/{overview,detections,hotlist-matches,locations,traffic}` | COP, ADMIN |
+| GET | `/api/v1/analytics/ocr` | COP, ADMIN |
 | POST | `/api/v1/scanner/scan` | VOLUNTEER, COP |
 | GET | `/api/v1/geo/heat` | COP, ADMIN |
 
@@ -627,7 +628,7 @@ Lazy-loaded one-per-page in `src/App.tsx`, sidebar defined in `src/components/La
 | `/complaints` | Complaints | |
 | `/hotlist` | Hotlist | |
 | `/search`, `/vehicles/:plate` | Vehicle Search / Detail | Detail's `VehicleMap.tsx` untouched |
-| `/analytics` | Analytics | Recharts behind its own chunk |
+| `/analytics` | Analytics | Recharts behind its own chunk; lazy "OCR Model" tab (`src/pages/analytics/OcrModelTab.tsx`) shows the measured OCR report |
 | `/admin` | Admin | ADMIN only |
 
 `leaflet.heat@0.2.0` is pinned exact and is the only dependency added. It ships no types, so

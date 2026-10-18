@@ -229,6 +229,101 @@ export const HOTLIST_STATUS_COLORS: Record<string, string> = {
   EXPIRED: "chip-warning",
 };
 
+export interface OcrCharStat {
+  char: string;
+  precision: number;
+  recall: number;
+  f1: number;
+  support: number;
+}
+
+export interface OcrTopConfusion {
+  true: string;
+  pred: string;
+  count: number;
+  share: number;
+}
+
+export interface OcrSetMetrics {
+  name: string;
+  n: number;
+  exact_matches: number;
+  plate_accuracy: number | null;
+  ci_low: number | null;
+  ci_high: number | null;
+  character_accuracy: number | null;
+  cer: number | null;
+}
+
+/** GET /analytics/ocr - a measured OCR evaluation report (scripts/eval_ocr.py). */
+export interface OcrReport {
+  status: "ok";
+  target: {
+    value: number;
+    met_point: boolean;
+    met_proven: boolean;
+    headline_set: string;
+    flag: string | null;
+    accuracy: number | null;
+    ci_low: number | null;
+    ci_high: number | null;
+  };
+  kpis: {
+    plate_accuracy: number | null;
+    error_rate: number | null;
+    character_accuracy: number | null;
+    cer: number | null;
+    no_read_rate: number;
+    invalid_format_rate: number;
+    wrong_confident_rate: number;
+    wrong_confident_count: number;
+    right_but_uncertain_count?: number;
+    latency_p50_ms: number | null;
+    latency_p95_ms: number | null;
+    accuracy_at_conf_08: number | null;
+    coverage_at_conf_08: number;
+  };
+  sets: OcrSetMetrics[];
+  confusion: {
+    labels: string[];
+    counts: number[][];
+    normalized: number[][];
+    per_char: OcrCharStat[];
+    top: OcrTopConfusion[];
+  };
+  confidence_histogram: { bins: string[]; correct: number[]; wrong: number[] };
+  metadata: {
+    generated_at: string;
+    commit: string;
+    dataset: {
+      real_files: number;
+      synthetic_files: number;
+      skipped?: { file: string; reason: string }[];
+      training_manifest_excluded?: number;
+      char_dataset_note?: string;
+    };
+    char_verifier: boolean;
+    models?: { name: string; path: string; size_bytes: number }[];
+    versions?: Record<string, string>;
+    char_confidences_available?: boolean;
+    notes?: string[];
+  };
+}
+
+export interface OcrNoReport {
+  status: "no_report";
+  hint: string;
+}
+
+/**
+ * The latest OCR evaluation. Returns the no_report shape untouched so the tab
+ * can show the command; never triggers an evaluation on the server.
+ */
+export async function fetchOcrReport(): Promise<OcrReport | OcrNoReport> {
+  const r = await api.get<OcrReport | OcrNoReport>("/analytics/ocr");
+  return r.data;
+}
+
 export const COMPLAINT_STATUS_COLORS: Record<string, string> = {
   PENDING: "chip-warning",
   UNDER_REVIEW: "chip-info",

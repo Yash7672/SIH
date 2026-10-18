@@ -11,6 +11,9 @@ import { formatCoords, platePath, timeAgo } from "../lib/format";
 
 // Recharts is ~105 kB gzipped; it only loads once an officer opens Analytics.
 const DetectionsChart = lazy(() => import("../components/charts/DetectionsChart"));
+// The OCR Model tab is a separate lazy chunk, so its report UI never weighs
+// down the Analytics page an officer opens by default.
+const OcrModelTab = lazy(() => import("./analytics/OcrModelTab"));
 
 interface MatchRow {
   plate: string;
@@ -38,6 +41,7 @@ export default function Analytics() {
   const [locations, setLocations] = useState<LocationRow[]>([]);
   const [traffic, setTraffic] = useState<TrafficSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<"overview" | "ocr">("overview");
 
   useEffect(() => {
     let cancelled = false;
@@ -93,6 +97,37 @@ export default function Analytics() {
         subtitle="Detection throughput, the vehicles generating the most alerts, and the latest sighting pings."
       />
 
+      <div role="tablist" aria-label="Analytics sections" className="flex w-fit gap-1 rounded-xl bg-surface-sunken p-1">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "overview"}
+          onClick={() => setTab("overview")}
+          className={
+            tab === "overview"
+              ? "rounded-lg bg-surface-card px-4 py-2 text-sm font-medium text-surface-text shadow"
+              : "rounded-lg px-4 py-2 text-sm font-medium text-surface-muted hover:text-surface-text"
+          }
+        >
+          Overview
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "ocr"}
+          onClick={() => setTab("ocr")}
+          className={
+            tab === "ocr"
+              ? "rounded-lg bg-surface-card px-4 py-2 text-sm font-medium text-surface-text shadow"
+              : "rounded-lg px-4 py-2 text-sm font-medium text-surface-muted hover:text-surface-text"
+          }
+        >
+          OCR Model
+        </button>
+      </div>
+
+      {tab === "overview" ? (
+        <>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card padding="none" className="overflow-hidden">
           <div className="p-5 pb-0">
@@ -232,6 +267,12 @@ export default function Analytics() {
           </ul>
         )}
       </Card>
+        </>
+      ) : (
+        <Suspense fallback={<Skeleton className="h-96 rounded-xl" />}>
+          <OcrModelTab />
+        </Suspense>
+      )}
     </div>
   );
 }
