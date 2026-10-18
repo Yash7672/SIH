@@ -31,6 +31,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -45,11 +46,15 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from ai.pipeline import detect_and_read  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from app.services.plate_verdict import STOLEN, PlateRead, TrackVerdict  # noqa: E402
 from app.services.ocr_metrics import (  # noqa: E402
     CONFIDENT_THRESHOLD,
+    bootstrap_accuracy,
     character_totals,
     confidence_histogram,
     confusion_from_pairs,
+    decision_matrix,
+    kde_curve,
     levenshtein_distance,
     align_chars,
     percentile,
@@ -67,6 +72,12 @@ TARGET = 0.90
 # below that the combined number is shown with a flag instead of quietly
 # standing in for real-world accuracy.
 REAL_MIN_SAMPLES = 30
+
+# Fixed seeds and sizes for the two distribution plots and the decision matrix,
+# so the same inputs always produce the same report.
+DECISION_SEED = 20261018
+KDE_POINTS = 100
+BOOTSTRAP_ITERATIONS = 2000
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 # "DL1ZA9092.jpg" and "plate_3_MH12JK4567.png" both encode the plate in the name.
@@ -254,6 +265,76 @@ def summarize(samples: List[dict]) -> dict:
     }
 
 
+def in_memory_hotlist(expected_plates: List[str]) -> set:
+    """Half of the expected plates, picked with a fixed seed.
+
+    Deterministic (so the report is reproducible) and it leaves the other half
+    out, so a positive sample really is a listed plate and a negative sample
+    really is one that is not listed.
+    """
+    unique = sorted(set(expected_plates))
+    if not unique:
+        return set()
+    take = max(1, len(unique) // 2)
+    return set(random.Random(DECISION_SEED).sample(unique, take))
+
+
+def build_decision(samples: List[dict], hotlist: set) -> dict:
+    """Stolen vs Not-stolen, decided by the real verdict function, in memory.
+
+    The live ``TrackVerdict.evaluate`` decides each sample from one PlateRead
+    built from the same read the scanner feeds it. No verdict rule is changed
+    and nothing here touches the database or Redis: the hot-list is a plain
+    Python set. The offline read path exposes no per-character confidences, so
+    ``verified`` mirrors ``settings.CHAR_VERIFY`` (what the deployed scanner
+    does) and ``char_confs`` is left empty.
+    """
+    actual: List[bool] = []
+    predicted: List[bool] = []
+    for s in samples:
+        verdict = TrackVerdict(tid=0, now=0.0)
+        verdict.add(
+            PlateRead(
+                text=s["predicted"],
+                norm=s["predicted"],
+                conf=float(s["confidence"]),
+                at=0.0,
+                valid=bool(s["valid"]),
+                verified=bool(settings.CHAR_VERIFY),
+            )
+        )
+        actual.append(s["expected"] in hotlist)
+        predicted.append(verdict.evaluate(hotlist).state == STOLEN)
+    metrics = decision_matrix(actual, predicted)
+    metrics["hotlist_size"] = len(hotlist)
+    metrics["method"] = (
+        "TrackVerdict.evaluate, one PlateRead per sample, in-memory half-hotlist "
+        f"(fixed seed {DECISION_SEED}); glyph verifier "
+        f"{'on' if settings.CHAR_VERIFY else 'off'}; char_confs unavailable offline"
+    )
+    return metrics
+
+
+def build_distributions(samples: List[dict]) -> dict:
+    """Correct/wrong confidence densities and the bootstrap accuracy curve."""
+    correct = [float(s["confidence"]) for s in samples if s["exact"]]
+    wrong = [float(s["confidence"]) for s in samples if not s["exact"]]
+    grid, correct_curve = kde_curve(correct, points=KDE_POINTS)
+    _, wrong_curve = kde_curve(wrong, points=KDE_POINTS)
+    return {
+        "grid": grid,
+        "correct": correct_curve,
+        "wrong": wrong_curve,
+        "correct_mean": (sum(correct) / len(correct)) if correct else None,
+        "wrong_mean": (sum(wrong) / len(wrong)) if wrong else None,
+        "correct_n": len(correct),
+        "wrong_n": len(wrong),
+        "bootstrap": bootstrap_accuracy(
+            [s["exact"] for s in samples], iterations=BOOTSTRAP_ITERATIONS, seed=DECISION_SEED
+        ),
+    }
+
+
 def atomic_write_json(path: Path, payload: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -328,6 +409,12 @@ def main() -> int:
     target_met_point = accuracy >= TARGET
     target_met_proven = (head["ci_low"] or 0.0) >= TARGET
 
+    # Decision matrix over every scored sample, and the two distribution curves
+    # over the headline set (same rows as the confusion matrix and histogram).
+    hotlist = in_memory_hotlist([s["expected"] for s in samples])
+    decision = build_decision(samples, hotlist)
+    distributions = build_distributions(head_rows)
+
     file_list_hash = hashlib.sha256(
         "\n".join(sorted(f"{s}:{p.name}" for s, p, _ in kept)).encode("utf-8")
     ).hexdigest()
@@ -357,6 +444,8 @@ def main() -> int:
         "confidence_histogram": confidence_histogram(
             [s["confidence"] for s in head_rows], [s["exact"] for s in head_rows]
         ),
+        "decision": decision,
+        "distributions": distributions,
         "metadata": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "commit": git_commit(),
@@ -377,6 +466,9 @@ def main() -> int:
             "notes": [
                 f"confidence histogram / confusion / KPIs are computed on the headline set ({headline})",
                 f"wrong-confident threshold: confidence >= {CONFIDENT_THRESHOLD}",
+                decision["method"],
+                "distributions: Gaussian KDE (Silverman bandwidth) on "
+                f"{KDE_POINTS} grid points; bootstrap {BOOTSTRAP_ITERATIONS} resamples, seed {DECISION_SEED}",
             ],
         },
     }
@@ -423,6 +515,15 @@ def main() -> int:
     print(f"target {TARGET:.0%}: {'met' if target_met_point else 'NOT met'} by point estimate, "
           f"{proven} (Wilson lower bound {head['ci_low'] * 100:.1f}%)")
     print(f"wrong-but-confident (conf >= {CONFIDENT_THRESHOLD}): {head['wrong_confident_count']}")
+    print(f"decision (stolen vs not, {decision['n']} samples, hot-list {decision['hotlist_size']}): "
+          f"TP {decision['tp']} FP {decision['fp']} FN {decision['fn']} TN {decision['tn']} | "
+          f"precision {pct(decision['precision']).strip()} recall {pct(decision['recall']).strip()} "
+          f"F1 {pct(decision['f1']).strip()} false-alert {pct(decision['false_alert_rate']).strip()}")
+    boot = distributions["bootstrap"]
+    if boot["mean"] is not None:
+        print(f"bootstrap accuracy mean {pct(boot['mean']).strip()} "
+              f"95% [{pct(boot['ci_low']).strip()}, {pct(boot['ci_high']).strip()}] "
+              f"over {boot['iterations']} resamples")
     top5 = report["confusion"]["top"][:5]
     if top5:
         print("top confusions: " + ", ".join(

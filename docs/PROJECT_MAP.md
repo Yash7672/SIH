@@ -89,7 +89,7 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget), `ScanConnection` (in-flight slots, OCR claims, device, per-track verdicts, hires_pending/hires_active/last_hires_at) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `eval_ocr.py` (measured OCR accuracy → `data/eval/ocr_report.json`, read by `/analytics/ocr`), `stream_camera.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `eval_ocr.py` (measured OCR accuracy → `data/eval/ocr_report.json`, read by `/analytics/ocr`; also writes the Stolen-vs-Not-stolen decision matrix on an in-memory half-hotlist, the confidence KDEs and a 2,000-resample bootstrap accuracy curve), `stream_camera.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
 | `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |
@@ -516,6 +516,7 @@ PC on the network.
 | `test_stolen_chain.py` | hot-list detect → STOLEN verdict → `/ws/police` alert on every read (row still 60 s-throttled) → sighting row, end to end |
 | `test_live_scan_hires.py` | hi-res on-demand: the one-off capture keeps its pixels, marking, budget interplay |
 | `test_stream_source.py` | stream sources: repo-root-anchored defaults, kind validation, lat/lng parsing, latest-frame-wins, reconnect backoff |
+| `test_ocr_metrics.py` | hand-computed OCR maths (plate accuracy, CER, character confusion, Wilson interval, insertion/deletion alignment), the binary decision matrix (precision/recall/F1/false-alert), the KDE and bootstrap helpers, and the `/analytics/ocr` contract (200 / no_report / 401 / 403) |
 
 Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
@@ -639,7 +640,7 @@ Lazy-loaded one-per-page in `src/App.tsx`, sidebar defined in `src/components/La
 | `/complaints` | Complaints | |
 | `/hotlist` | Hotlist | |
 | `/search`, `/vehicles/:plate` | Vehicle Search / Detail | Detail's `VehicleMap.tsx` untouched |
-| `/analytics` | Analytics | Recharts behind its own chunk; lazy "OCR Model" tab (`src/pages/analytics/OcrModelTab.tsx`) shows the measured OCR report: accuracy-vs-error-rate and confidence charts, errors-by-type (substitution/deletion/insertion), weakest characters, and the character confusion matrix |
+| `/analytics` | Analytics | Recharts behind its own chunk; lazy "OCR Model" tab (`src/pages/analytics/OcrModelTab.tsx`) shows the measured OCR report: a plate-level Stolen/Not-stolen decision confusion matrix (heatmap + colour bar), KPI cards (accuracy, error rate, precision, recall, F1), confidence density curves (correct vs wrong) with a bootstrap accuracy distribution, accuracy-vs-error-rate by dataset, errors-by-type, weakest characters, and the character confusion matrix |
 | `/admin` | Admin | ADMIN only |
 
 `leaflet.heat@0.2.0` is pinned exact and is the only dependency added. It ships no types, so

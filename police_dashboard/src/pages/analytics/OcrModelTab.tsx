@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import {
+  Area,
+  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
@@ -286,6 +289,287 @@ function WeakestCharacters({ perChar }: { perChar: OcrReport["confusion"]["per_c
   );
 }
 
+/** X-axis tick as a whole percent, for the 0..1 distributions. */
+function percentTick(v: number): string {
+  return `${Math.round(v * 100)}%`;
+}
+
+/** Vertical colour bar (heatmap legend) with the max at the top and 0 at the base. */
+function ColourBar({ max, label, strong }: { max: number; label: string; strong: string }) {
+  return (
+    <div className="flex items-stretch gap-2" aria-hidden>
+      <div className="flex flex-col justify-between py-1 text-[10px] text-surface-muted">
+        <span>{max}</span>
+        <span>0</span>
+      </div>
+      <div
+        className="h-44 w-3 rounded-full"
+        style={{ background: `linear-gradient(to top, rgb(var(--solid) / 0.08), ${strong})` }}
+      />
+      <span className="self-center text-[10px] text-surface-muted [writing-mode:vertical-rl]">
+        {label}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 2x2 decision heatmap: rows are what the vehicle actually was, columns what the
+ * system decided. Count and share are printed in every cell; intensity follows
+ * the count. The FP cell is the false alert and is called out below.
+ */
+function DecisionMatrix({ decision }: { decision: OcrReport["decision"] }) {
+  const { tp, fp, fn, tn } = decision;
+  const n = decision.n || 0;
+  const max = Math.max(1, tp, fp, fn, tn);
+  const cols = ["Stolen", "Not stolen"];
+  const rows = [
+    { label: "Stolen", cells: [{ tag: "TP", v: tp, ok: true }, { tag: "FN", v: fn, ok: false }] },
+    { label: "Not stolen", cells: [{ tag: "FP", v: fp, ok: false }, { tag: "TN", v: tn, ok: true }] },
+  ];
+
+  function cellStyle(v: number): CSSProperties {
+    const alpha = (0.08 + 0.62 * (v / max)).toFixed(2);
+    return { background: `rgb(var(--solid) / ${alpha})` };
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-4">
+        <div className="grid flex-1 gap-1.5" style={{ gridTemplateColumns: "92px repeat(2, minmax(70px, 1fr))" }}>
+          <span aria-hidden />
+          {cols.map((c) => (
+            <span key={c} className="pb-1 text-center text-[11px] font-medium uppercase tracking-[0.06em] text-surface-muted">
+              {c}
+            </span>
+          ))}
+          {rows.map((row) => (
+            <Fragment key={row.label}>
+              <span className="flex items-center justify-end pr-2 text-right text-[11px] font-medium uppercase tracking-[0.06em] text-surface-muted">
+                {row.label}
+              </span>
+              {row.cells.map((cell) => (
+                <div
+                  key={`${row.label}-${cell.tag}`}
+                  className="flex h-20 flex-col items-center justify-center rounded-lg border border-surface-border/60"
+                  style={cellStyle(cell.v)}
+                  title={`${cell.tag}: ${cell.v} of ${n} (${n ? ((cell.v / n) * 100).toFixed(0) : 0}%)`}
+                >
+                  <span className="text-2xl font-semibold text-surface-text">{cell.v}</span>
+                  <span className="text-[11px] text-surface-muted">
+                    {n ? `${((cell.v / n) * 100).toFixed(0)}%` : "—"}
+                  </span>
+                  <span className={["mt-0.5 text-[10px] font-semibold", cell.ok ? "text-success" : "text-danger"].join(" ")}>
+                    {cell.tag}
+                  </span>
+                </div>
+              ))}
+            </Fragment>
+          ))}
+          <span aria-hidden />
+          <span aria-hidden />
+          <span className="text-center text-[10px] text-surface-muted">Prediction</span>
+        </div>
+        <ColourBar max={max} label="count" strong="rgb(var(--solid))" />
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <MetricPill label="Precision" value={pct(decision.precision)} hint="TP / (TP+FP)" />
+        <MetricPill label="Recall" value={pct(decision.recall)} hint="TP / (TP+FN)" />
+        <MetricPill label="F1" value={pct(decision.f1)} hint="harmonic mean" />
+        <MetricPill
+          label="False alerts"
+          value={pct(decision.false_alert_rate)}
+          hint="FP / (FP+TN)"
+          tone={decision.false_alert_rate ? "danger" : "neutral"}
+        />
+      </div>
+      <p className="text-[10px] text-surface-muted">
+        False alert = a Not-stolen vehicle shown as Stolen (the FP cell). Rows are what the vehicle
+        really was; columns are what the system decided. {decision.hotlist_size} of the expected
+        plates sat on the in-memory hot-list. {decision.method}
+      </p>
+    </div>
+  );
+}
+
+function MetricPill({
+  label,
+  value,
+  hint,
+  tone = "neutral",
+}: {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: "neutral" | "danger" | "success";
+}) {
+  const toneClass =
+    tone === "danger" ? "text-danger" : tone === "success" ? "text-success" : "text-surface-text";
+  return (
+    <div className="rounded-lg border border-surface-border px-3 py-2">
+      <p className="text-[10px] uppercase tracking-[0.1em] text-surface-muted">{label}</p>
+      <p className={`mt-0.5 text-lg font-semibold ${toneClass}`}>{value}</p>
+      <p className="text-[10px] text-surface-muted">{hint}</p>
+    </div>
+  );
+}
+
+/** Overlapping confidence densities: correct reads (green) vs wrong reads (amber). */
+function ConfidenceDensity({ distributions }: { distributions: OcrReport["distributions"] }) {
+  const { ready } = useTheme();
+  const tooltipStyle = useTooltipStyle();
+  const data = useMemo(
+    () =>
+      distributions.grid.map((x, i) => ({
+        x,
+        correct: distributions.correct[i] ?? 0,
+        wrong: distributions.wrong[i] ?? 0,
+      })),
+    [distributions]
+  );
+  const hasData = distributions.correct_n + distributions.wrong_n > 0;
+  if (!ready) return <div className="h-72 p-4" />;
+  if (!hasData) {
+    return <p className="p-4 text-sm text-surface-muted">No reads to build a density from.</p>;
+  }
+  return (
+    <div className="h-72 p-4">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{ top: 8, right: 16, left: -22, bottom: 0 }}>
+          <defs>
+            <linearGradient id="kde-correct" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--success)" stopOpacity={0.45} />
+              <stop offset="100%" stopColor="var(--success)" stopOpacity={0.02} />
+            </linearGradient>
+            <linearGradient id="kde-wrong" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--warning)" stopOpacity={0.45} />
+              <stop offset="100%" stopColor="var(--warning)" stopOpacity={0.02} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
+          <XAxis
+            dataKey="x"
+            type="number"
+            domain={[0, 1]}
+            ticks={[0, 0.2, 0.4, 0.6, 0.8, 1]}
+            tickFormatter={percentTick}
+            tick={{ fill: "var(--chart-axis)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: "var(--chart-grid)" }}
+          />
+          <YAxis hide domain={[0, "auto"]} />
+          <Tooltip
+            contentStyle={tooltipStyle}
+            labelFormatter={(v) => `confidence ${percentTick(Number(v))}`}
+            formatter={(value: number, name: string) => [value.toFixed(3), name]}
+          />
+          {distributions.correct_mean != null ? (
+            <ReferenceLine x={distributions.correct_mean} stroke="var(--success)" strokeDasharray="5 4" />
+          ) : null}
+          {distributions.wrong_mean != null ? (
+            <ReferenceLine x={distributions.wrong_mean} stroke="var(--warning)" strokeDasharray="5 4" />
+          ) : null}
+          <Area
+            type="monotone"
+            dataKey="correct"
+            name="Correct reads"
+            stroke="var(--success)"
+            strokeWidth={2}
+            fill="url(#kde-correct)"
+          />
+          <Area
+            type="monotone"
+            dataKey="wrong"
+            name="Wrong reads"
+            stroke="var(--warning)"
+            strokeWidth={2}
+            fill="url(#kde-wrong)"
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+      <p className="mt-1 flex flex-wrap gap-x-4 text-[10px] text-surface-muted">
+        <span className="inline-flex items-center gap-1">
+          <span className="h-2 w-2 rounded-sm bg-success" aria-hidden /> correct ({distributions.correct_n}, mean{" "}
+          {pct(distributions.correct_mean)})
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="h-2 w-2 rounded-sm bg-warning" aria-hidden /> wrong ({distributions.wrong_n}, mean{" "}
+          {pct(distributions.wrong_mean)})
+        </span>
+      </p>
+    </div>
+  );
+}
+
+/** Bootstrap distribution of the plate accuracy, with the 95% interval shaded. */
+function BootstrapCurve({ distributions, target }: { distributions: OcrReport["distributions"]; target: OcrReport["target"] }) {
+  const { ready } = useTheme();
+  const tooltipStyle = useTooltipStyle();
+  const boot = distributions.bootstrap;
+  const data = useMemo(
+    () => boot.grid.map((x, i) => ({ x, density: boot.density[i] ?? 0 })),
+    [boot]
+  );
+  if (!ready) return <div className="h-72 p-4" />;
+  if (boot.mean == null || data.length === 0) {
+    return <p className="p-4 text-sm text-surface-muted">Not enough samples to bootstrap an interval.</p>;
+  }
+  return (
+    <div className="h-72 p-4">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{ top: 8, right: 16, left: -22, bottom: 0 }}>
+          <defs>
+            <linearGradient id="boot-area" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--solid)" stopOpacity={0.5} />
+              <stop offset="100%" stopColor="var(--solid)" stopOpacity={0.03} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
+          <XAxis
+            dataKey="x"
+            type="number"
+            domain={[0, 1]}
+            ticks={[0, 0.2, 0.4, 0.6, 0.8, 1]}
+            tickFormatter={percentTick}
+            tick={{ fill: "var(--chart-axis)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: "var(--chart-grid)" }}
+          />
+          <YAxis hide domain={[0, "auto"]} />
+          {boot.ci_low != null && boot.ci_high != null ? (
+            <ReferenceArea x1={boot.ci_low} x2={boot.ci_high} fill="var(--solid)" fillOpacity={0.12} />
+          ) : null}
+          <Tooltip
+            contentStyle={tooltipStyle}
+            labelFormatter={(v) => `accuracy ${percentTick(Number(v))}`}
+            formatter={(value: number) => [value.toFixed(3), "density"]}
+          />
+          <ReferenceLine
+            x={target.value}
+            stroke="var(--warning)"
+            strokeDasharray="6 4"
+            label={{ value: `${(target.value * 100).toFixed(0)}% target`, position: "insideTopRight", fill: "var(--surface-muted)", fontSize: 10 }}
+          />
+          <ReferenceLine x={boot.mean} stroke="var(--surface-muted)" strokeDasharray="2 3" />
+          <Area
+            type="monotone"
+            dataKey="density"
+            name="Bootstrap accuracy"
+            stroke="var(--solid)"
+            strokeWidth={2}
+            fill="url(#boot-area)"
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+      <p className="mt-1 text-[10px] text-surface-muted">
+        {boot.iterations} bootstrap resamples · mean {pct(boot.mean)} · shaded 95% interval{" "}
+        {pct(boot.ci_low)} to {pct(boot.ci_high)}.
+      </p>
+    </div>
+  );
+}
+
 function ConfidenceHistogram({ histogram }: { histogram: OcrReport["confidence_histogram"] }) {
   const { ready } = useTheme();
   const tooltipStyle = useTooltipStyle();
@@ -408,7 +692,8 @@ function ConfusionMatrix({ confusion }: { confusion: OcrReport["confusion"] }) {
           No character errors in this evaluation set.
         </p>
       ) : (
-        <div className="overflow-x-auto">
+        <div className="flex items-stretch gap-4">
+          <div className="overflow-x-auto">
           <div
             className="min-w-max"
             role="grid"
@@ -459,6 +744,10 @@ function ConfusionMatrix({ confusion }: { confusion: OcrReport["confusion"] }) {
                 })}
               </div>
             ))}
+          </div>
+          </div>
+          <div className="hidden shrink-0 sm:block">
+            <ColourBar max={maxOff} label="errors" strong="rgb(var(--danger))" />
           </div>
         </div>
       )}
@@ -631,7 +920,8 @@ export default function OcrModelTab() {
     );
   }
 
-  const { target, kpis, sets, confusion, confidence_histogram: histogram, metadata } = report;
+  const { target, kpis, sets, confusion, confidence_histogram: histogram, decision, distributions, metadata } =
+    report;
   const realSet = sets.find((s) => s.name === "real");
   const syntheticSet = sets.find((s) => s.name === "synthetic");
   const meets = target.met_point;
@@ -678,7 +968,7 @@ export default function OcrModelTab() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-5">
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
         <StatCard
           label="Plate accuracy"
           value={pct(target.accuracy)}
@@ -686,6 +976,9 @@ export default function OcrModelTab() {
           tone={meets ? "success" : "danger"}
         />
         <StatCard label="Error rate" value={pct(kpis.error_rate)} hint="1 − accuracy" tone="danger" />
+        <StatCard label="Precision" value={pct(decision.precision)} hint="stolen vs not, TP/(TP+FP)" />
+        <StatCard label="Recall" value={pct(decision.recall)} hint="stolen vs not, TP/(TP+FN)" />
+        <StatCard label="F1" value={pct(decision.f1)} hint="harmonic mean of P and R" />
         <StatCard
           label="Character accuracy"
           value={pct(kpis.character_accuracy)}
@@ -697,6 +990,33 @@ export default function OcrModelTab() {
           hint="real / synthetic"
         />
         <StatCard label="Latency p50" value={ms(kpis.latency_p50_ms)} hint={`p95 ${ms(kpis.latency_p95_ms)}`} tone="neutral" />
+      </div>
+
+      <Card>
+        <CardHeader
+          title="Decision confusion matrix — Stolen vs Not stolen"
+          subtitle="The real verdict function on an in-memory hot-list built from half of the expected plates (fixed seed). Nothing here touches the database."
+        />
+        <div className="mt-4">
+          <DecisionMatrix decision={decision} />
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <Card>
+          <CardHeader
+            title="Confidence distribution"
+            subtitle="Overlapping densities of the read confidence for correct reads (green) vs wrong reads (amber), with their means marked."
+          />
+          <ConfidenceDensity distributions={distributions} />
+        </Card>
+        <Card>
+          <CardHeader
+            title="Accuracy estimate"
+            subtitle="Bootstrap distribution of the plate accuracy; the shaded band is the 95% interval, the dashed line is the 90% target."
+          />
+          <BootstrapCurve distributions={distributions} target={target} />
+        </Card>
       </div>
 
       {kpis.wrong_confident_count > 0 ? (

@@ -292,6 +292,40 @@ export interface OcrReport {
     top: OcrTopConfusion[];
   };
   confidence_histogram: { bins: string[]; correct: number[]; wrong: number[] };
+  /** Stolen / Not-stolen decision counts on an in-memory half-hotlist. */
+  decision: {
+    tp: number;
+    fp: number;
+    fn: number;
+    tn: number;
+    n: number;
+    accuracy: number | null;
+    error_rate: number | null;
+    precision: number | null;
+    recall: number | null;
+    f1: number | null;
+    false_alert_rate: number | null;
+    hotlist_size: number;
+    method: string;
+  };
+  /** Overlapping confidence densities plus the bootstrap accuracy curve. */
+  distributions: {
+    grid: number[];
+    correct: number[];
+    wrong: number[];
+    correct_mean: number | null;
+    wrong_mean: number | null;
+    correct_n: number;
+    wrong_n: number;
+    bootstrap: {
+      grid: number[];
+      density: number[];
+      mean: number | null;
+      ci_low: number | null;
+      ci_high: number | null;
+      iterations: number;
+    };
+  };
   metadata: {
     generated_at: string;
     commit: string;

@@ -14,10 +14,16 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict
+
+try:  # numpy ships with the OCR runtime; the KDE below is its only use here.
+    import numpy as _np
+except Exception:  # pragma: no cover - exercised only without numpy
+    _np = None
 
 try:  # rapidfuzz is installed; fall back to the DP below if it ever is not.
     from rapidfuzz.distance import Levenshtein as _RfLevenshtein
@@ -220,6 +226,127 @@ def confidence_histogram(
     return {"bins": labels, "correct": correct_counts, "wrong": wrong_counts}
 
 
+def kde_curve(
+    values: Sequence[float],
+    points: int = 100,
+    lo: float = 0.0,
+    hi: float = 1.0,
+) -> Tuple[List[float], List[float]]:
+    """Gaussian KDE of ``values`` on a fixed grid, returned as (grid, density).
+
+    Bandwidth from Silverman's rule. An empty input gives a flat zero curve
+    rather than an error: a set with no wrong reads simply has no wrong-read
+    curve, and the chart must not invent one.
+    """
+    grid = [lo + (hi - lo) * i / (points - 1) for i in range(points)]
+    vals = [float(v) for v in values]
+    if not vals:
+        return grid, [0.0] * points
+    if _np is None:  # pragma: no cover - numpy is present in the runtime
+        # Fallback: a normalised histogram dropped onto the same grid.
+        dens = [0.0] * points
+        span = (hi - lo) or 1.0
+        for v in vals:
+            idx = min(points - 1, max(0, int((v - lo) / span * points)))
+            dens[idx] += 1.0 / len(vals)
+        return grid, dens
+    arr = _np.asarray(vals, dtype=float)
+    std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+    bw = 1.06 * std * arr.size ** (-0.2) if std > 0 else 0.0
+    if bw <= 0:
+        bw = (hi - lo) / points  # all values identical: a narrow spike
+    g = _np.asarray(grid, dtype=float)
+    diff = (g[:, None] - arr[None, :]) / bw
+    dens = _np.exp(-0.5 * diff ** 2).sum(axis=1) / (arr.size * bw * math.sqrt(2 * math.pi))
+    return grid, [float(x) for x in dens]
+
+
+def bootstrap_accuracy(
+    correct: Sequence[bool],
+    iterations: int = 2000,
+    seed: int = 20261018,
+    points: int = 100,
+) -> Dict:
+    """Bootstrap the plate accuracy: resample with replacement from a fixed seed.
+
+    Returns the resample-accuracy distribution as a 100-point KDE plus its mean
+    and 2.5/97.5 percentiles. The interval is read off the sorted resamples, not
+    off the smoothed curve, so it stays an honest percentile interval.
+    """
+    flags = [bool(c) for c in correct]
+    n = len(flags)
+    if n == 0:
+        grid, dens = kde_curve([], points=points)
+        return {
+            "grid": grid,
+            "density": dens,
+            "mean": None,
+            "ci_low": None,
+            "ci_high": None,
+            "iterations": 0,
+        }
+    accs: List[float] = []
+    if _np is None:  # pragma: no cover - numpy is present in the runtime
+        rng = random.Random(seed)
+        for _ in range(iterations):
+            hits = sum(flags[rng.randrange(n)] for _ in range(n))
+            accs.append(hits / n)
+    else:
+        rng = _np.random.default_rng(seed)
+        arr = _np.asarray(flags, dtype=float)
+        for _ in range(iterations):
+            idx = rng.integers(0, n, size=n)
+            accs.append(float(arr[idx].mean()))
+    grid, dens = kde_curve(accs, points=points)
+    return {
+        "grid": grid,
+        "density": dens,
+        "mean": sum(accs) / len(accs),
+        "ci_low": percentile(accs, 0.025),
+        "ci_high": percentile(accs, 0.975),
+        "iterations": iterations,
+    }
+
+
+def decision_matrix(actual: Sequence[bool], predicted: Sequence[bool]) -> Dict:
+    """Binary Stolen / Not-stolen counts and the metrics derived from them.
+
+    ``actual`` is "the expected plate really is on the hot-list";
+    ``predicted`` is "the system returned a STOLEN verdict". A false positive
+    (a false alert) is the operationally dangerous cell and is reported on its
+    own as ``false_alert_rate`` = FP / (FP + TN).
+    """
+    tp = fp = fn = tn = 0
+    for a, p in zip(actual, predicted):
+        if a and p:
+            tp += 1
+        elif not a and p:
+            fp += 1
+        elif a and not p:
+            fn += 1
+        else:
+            tn += 1
+    total = tp + fp + fn + tn
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    accuracy = (tp + tn) / total if total else 0.0
+    negatives = fp + tn
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "n": total,
+        "accuracy": accuracy,
+        "error_rate": (1.0 - accuracy) if total else 0.0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_alert_rate": fp / negatives if negatives else 0.0,
+    }
+
+
 # --------------------------------------------------------------------------------------
 # Report schema - one shape shared by the writer (scripts/eval_ocr.py), the endpoint and
 # the dashboard. Extra fields are tolerated so an older backend can serve a newer report.
@@ -356,6 +483,54 @@ class Histogram(BaseModel):
     wrong: List[int] = []
 
 
+class DecisionBlock(BaseModel):
+    """Stolen / Not-stolen decision counts on an in-memory half-hotlist."""
+
+    model_config = ConfigDict(extra="allow")
+
+    tp: int = 0
+    fp: int = 0
+    fn: int = 0
+    tn: int = 0
+    n: int = 0
+    accuracy: Optional[float] = None
+    error_rate: Optional[float] = None
+    precision: Optional[float] = None
+    recall: Optional[float] = None
+    f1: Optional[float] = None
+    false_alert_rate: Optional[float] = None
+    hotlist_size: int = 0
+    method: str = ""
+
+
+class DensityCurve(BaseModel):
+    """A KDE curve, or a bootstrap of the accuracy, on a fixed grid."""
+
+    model_config = ConfigDict(extra="allow")
+
+    grid: List[float] = []
+    density: List[float] = []
+    mean: Optional[float] = None
+    ci_low: Optional[float] = None
+    ci_high: Optional[float] = None
+    iterations: int = 0
+
+
+class Distributions(BaseModel):
+    """Overlapping confidence densities and the bootstrap accuracy curve."""
+
+    model_config = ConfigDict(extra="allow")
+
+    grid: List[float] = []
+    correct: List[float] = []
+    wrong: List[float] = []
+    correct_mean: Optional[float] = None
+    wrong_mean: Optional[float] = None
+    correct_n: int = 0
+    wrong_n: int = 0
+    bootstrap: DensityCurve = DensityCurve()
+
+
 class OcrReport(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -365,6 +540,8 @@ class OcrReport(BaseModel):
     sets: List[SetMetrics] = []
     confusion: Confusion = Confusion()
     confidence_histogram: Histogram = Histogram()
+    decision: DecisionBlock = DecisionBlock()
+    distributions: Distributions = Distributions()
     metadata: Metadata = Metadata()
 
 

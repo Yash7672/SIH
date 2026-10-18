@@ -21,8 +21,11 @@ from app.services.ocr_metrics import (
     MISSING,
     _REPORT_CACHE,
     align_chars,
+    bootstrap_accuracy,
     character_totals,
     confusion_from_pairs,
+    decision_matrix,
+    kde_curve,
     levenshtein_distance,
     wilson_interval,
 )
@@ -109,6 +112,70 @@ def test_wilson_interval_known_values():
     assert wilson_interval(0, 4) == pytest.approx((0.0, 0.48990), abs=1e-4)
 
 
+# --------------------------------------------- decision / distributions ---
+
+
+def test_decision_matrix_hand_computed():
+    # actual:  T T F F F
+    # predict: T F T F F  -> TP 1, FN 1, FP 1, TN 2
+    m = decision_matrix([True, True, False, False, False], [True, False, True, False, False])
+    assert (m["tp"], m["fp"], m["fn"], m["tn"]) == (1, 1, 1, 2)
+    assert m["accuracy"] == pytest.approx(3 / 5)
+    assert m["error_rate"] == pytest.approx(2 / 5)
+    assert m["precision"] == pytest.approx(1 / 2)
+    assert m["recall"] == pytest.approx(1 / 2)
+    assert m["f1"] == pytest.approx(1 / 2)
+    # False-alert rate is FP over the actual negatives: 1 / (1 + 2).
+    assert m["false_alert_rate"] == pytest.approx(1 / 3)
+
+
+def test_decision_matrix_all_correct_and_all_wrong():
+    perfect = decision_matrix([True, False], [True, False])
+    assert (perfect["tp"], perfect["fp"], perfect["fn"], perfect["tn"]) == (1, 0, 0, 1)
+    assert perfect["accuracy"] == 1.0
+    assert perfect["precision"] == 1.0 and perfect["recall"] == 1.0 and perfect["f1"] == 1.0
+
+    # No positive predicted at all: precision/recall/F1 are defined as 0, not NaN.
+    no_positive = decision_matrix([True, False], [False, False])
+    assert no_positive["f1"] == 0.0 and no_positive["recall"] == 0.0
+
+    empty = decision_matrix([], [])
+    assert empty["n"] == 0 and empty["accuracy"] == 0.0
+
+
+def test_kde_curve_shape_and_mass():
+    grid, dens = kde_curve([0.9, 0.92, 0.95], points=100)
+    assert len(grid) == 100 and len(dens) == 100
+    assert grid[0] == 0.0 and grid[-1] == 1.0
+    assert all(d >= 0 for d in dens)
+    # A KDE integrates to 1; approximate the integral on the grid.
+    step = (grid[-1] - grid[0]) / (len(grid) - 1)
+    assert sum(dens) * step == pytest.approx(1.0, abs=0.03)
+    # The peak sits near the tight cluster, not in the corners.
+    assert 0.85 < grid[dens.index(max(dens))] < 1.0
+
+
+def test_kde_curve_empty_is_flat():
+    grid, dens = kde_curve([])
+    assert len(grid) == 100
+    assert all(d == 0.0 for d in dens)
+
+
+def test_bootstrap_accuracy_deterministic_and_brackets():
+    flags = [True, True, True, True, True, False]
+    a = bootstrap_accuracy(flags, iterations=2000, seed=7)
+    b = bootstrap_accuracy(flags, iterations=2000, seed=7)
+    assert a["mean"] == b["mean"]  # fixed seed -> reproducible
+    assert a["iterations"] == 2000
+    # Mean of resample means sits on the sample accuracy, 5/6.
+    assert a["mean"] == pytest.approx(5 / 6, abs=0.02)
+    assert a["ci_low"] <= a["mean"] <= a["ci_high"]
+    assert a["ci_low"] < 1.0
+
+    sure = bootstrap_accuracy([True, True, True])
+    assert sure["mean"] == 1.0 and sure["ci_low"] == 1.0
+
+
 # --------------------------------------------------------------- endpoint ---
 
 
@@ -165,6 +232,35 @@ def test_endpoint_serves_report(client, demo_tokens, report_path):
     r2 = client.get("/api/v1/analytics/ocr", headers=auth(demo_tokens["admin"]))
     assert r2.status_code == 200
     assert r2.json()["metadata"]["commit"] == "def5678"
+
+
+def test_endpoint_serves_decision_and_distributions(client, demo_tokens, report_path):
+    from tests.conftest import auth
+
+    _write_report(
+        report_path,
+        decision={
+            "tp": 3, "fp": 1, "fn": 0, "tn": 4, "n": 8, "accuracy": 0.875,
+            "error_rate": 0.125, "precision": 0.75, "recall": 1.0, "f1": 6 / 7,
+            "false_alert_rate": 0.2, "hotlist_size": 4, "method": "TrackVerdict.evaluate",
+        },
+        distributions={
+            "grid": [0.0, 0.5, 1.0],
+            "correct": [0.1, 0.2, 0.3],
+            "wrong": [0.0, 0.0, 0.0],
+            "correct_n": 3,
+            "wrong_n": 0,
+            "bootstrap": {"grid": [0.0, 1.0], "density": [0.0, 1.0], "mean": 0.9,
+                          "ci_low": 0.6, "ci_high": 1.0, "iterations": 2000},
+        },
+    )
+    r = client.get("/api/v1/analytics/ocr", headers=auth(demo_tokens["cop"]))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["decision"]["tp"] == 3
+    assert body["decision"]["false_alert_rate"] == 0.2
+    assert body["distributions"]["bootstrap"]["iterations"] == 2000
+    assert body["distributions"]["wrong"] == [0.0, 0.0, 0.0]
 
 
 def test_endpoint_no_report(client, demo_tokens, report_path):
