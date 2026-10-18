@@ -115,14 +115,14 @@ export default function Layout({
 
   const sidebarWidth = collapsed ? "lg:w-[68px]" : "lg:w-60";
   const linkBase =
-    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors";
+    "group flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200";
 
   function navLinkClass(isActive: boolean) {
     return [
       linkBase,
       isActive
         ? "bg-solid text-white shadow-sm"
-        : "text-dark-600 hover:bg-dark-700 hover:text-white",
+        : "text-dark-600 hover:translate-x-0.5 hover:bg-dark-700 hover:text-white",
     ].join(" ");
   }
 
@@ -180,7 +180,7 @@ export default function Layout({
                     onClick={() => setDrawerOpen(false)}
                     className={({ isActive }) => navLinkClass(isActive)}
                   >
-                    <Icon className="h-[18px] w-[18px] shrink-0" aria-hidden />
+                    <Icon className="h-[18px] w-[18px] shrink-0 transition-transform duration-200 group-hover:scale-110" aria-hidden />
                     <span className={collapsed ? "lg:hidden" : ""}>{n.label}</span>
                     {count > 0 ? (
                       <span

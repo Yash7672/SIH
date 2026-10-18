@@ -111,7 +111,7 @@ export default function Dashboard() {
             }
           />
         ) : (
-          <ul className="mt-4 divide-y divide-surface-border">
+          <ul className="stagger-children mt-4 divide-y divide-surface-border">
             {complaints.slice(0, 5).map((c) => (
               <li key={c.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4 transition-colors hover:bg-surface-bg">
                 <div className="min-w-0">

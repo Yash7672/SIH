@@ -193,7 +193,7 @@ export default function Maps() {
             }
           />
         ) : (
-          <div className="h-[560px] w-full">
+          <div className="fade-soft h-[560px] w-full">
             <MapContainer center={DEFAULT_CENTER} zoom={12} style={{ height: "100%", width: "100%" }}>
               <TileLayer
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'

@@ -58,10 +58,10 @@ export default function Layout() {
 
   const linkClass = ({ isActive }: { isActive: boolean }) =>
     [
-      "inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+      "inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200",
       isActive
         ? "bg-primary-50 text-primary-700"
-        : "text-surface-muted hover:bg-surface-raised hover:text-surface-text",
+        : "text-surface-muted hover:-translate-y-0.5 hover:bg-surface-raised hover:text-surface-text",
     ].join(" ");
 
   return (

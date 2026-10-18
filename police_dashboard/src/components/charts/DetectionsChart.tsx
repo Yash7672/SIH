@@ -88,6 +88,8 @@ export default function DetectionsChart({ data }: { data: HourBucket[] }) {
             fill="var(--solid)"
             radius={[6, 6, 0, 0]}
             maxBarSize={36}
+            animationDuration={620}
+            animationEasing="ease-out"
           />
         </BarChart>
       </ResponsiveContainer>

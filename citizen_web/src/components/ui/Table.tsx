@@ -40,7 +40,7 @@ export function TH({
 }
 
 export function TBody({ children }: { children: ReactNode }) {
-  return <tbody className="divide-y divide-surface-border">{children}</tbody>;
+  return <tbody className="stagger-children divide-y divide-surface-border">{children}</tbody>;
 }
 
 export function TR({

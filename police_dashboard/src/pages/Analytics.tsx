@@ -123,6 +123,10 @@ export default function Analytics() {
         </button>
       </div>
 
+      {/* Keyed on the tab so switching re-plays the entrance instead of the
+          panel swapping in place; the same rise covers the lazy OCR chunk
+          arriving under its Suspense fallback. */}
+      <div key={tab} className="rise-in space-y-6">
       {tab === "overview" ? (
         <>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -216,7 +220,7 @@ export default function Analytics() {
               description="Vehicles generate a ranking once their sightings have been recorded."
             />
           ) : (
-            <ol className="mt-4 divide-y divide-surface-border">
+            <ol className="stagger-children mt-4 divide-y divide-surface-border">
               {matches.slice(0, 8).map((m, i) => (
                 <li key={m.plate} className="flex items-center justify-between gap-3 px-5 py-3">
                   <div className="flex min-w-0 items-center gap-3">
@@ -251,7 +255,7 @@ export default function Analytics() {
             description="Locations appear once a registered scanner uploads a sighting."
           />
         ) : (
-          <ul className="scrollbar-thin mt-4 max-h-80 divide-y divide-surface-border overflow-y-auto">
+          <ul className="stagger-children scrollbar-thin mt-4 max-h-80 divide-y divide-surface-border overflow-y-auto">
             {locations.map((l, i) => (
               <li key={`${l.time}-${i}`} className="flex items-center justify-between gap-3 px-5 py-2.5">
                 <span className="inline-flex items-center gap-1.5 font-mono text-xs text-surface-text">
@@ -270,6 +274,7 @@ export default function Analytics() {
           <OcrModelTab />
         </Suspense>
       )}
+      </div>
     </div>
   );
 }

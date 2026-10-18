@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { TrendingDown, TrendingUp } from "lucide-react";
+import { useCountUp } from "../../hooks/useCountUp";
 
 const TONES = {
   primary: "chip-primary",
@@ -30,17 +31,30 @@ export function StatCard({
   const up = hasTrend && trend! > 0;
   const flat = hasTrend && trend === 0;
 
+  // Only a statistic the card owns is counted up. A value the caller has
+  // already formatted (a string like "82.4" or "—") is rendered untouched.
+  const numeric = typeof value === "number" && Number.isFinite(value) ? value : null;
+  const counted = useCountUp(numeric);
+  const shown = counted === null ? value : counted;
+
   return (
-    <div className="rise-in hover-lift rounded-xl border border-surface-border bg-surface-card p-5 shadow-card">
+    <div className="group rise-in hover-lift rounded-xl border border-surface-border bg-surface-card p-5 shadow-card">
       <div className="flex items-start justify-between gap-3">
         <p className="text-sm font-medium text-surface-muted">{label}</p>
         {icon ? (
-          <span className={["shrink-0 rounded-lg p-2", TONES[tone]].join(" ")} aria-hidden>
+          <span
+            className={[
+              "shrink-0 rounded-lg p-2 transition-transform duration-200 group-hover:scale-110",
+              TONES[tone],
+            ].join(" ")}
+            aria-hidden
+          >
             {icon}
           </span>
         ) : null}
       </div>
-      <p className="mt-3 text-3xl font-semibold tracking-tight text-surface-text">{value}</p>
+      {/* `tabular-nums` keeps the digits from shifting while the value counts. */}
+      <p className="mt-3 text-3xl font-semibold tabular-nums tracking-tight text-surface-text">{shown}</p>
       <div className="mt-2 flex items-center gap-2 text-xs">
         {hasTrend && !flat ? (
           <span

@@ -137,7 +137,7 @@ export default function ComplaintDetail() {
         <div className="p-5 pb-0">
           <CardHeader title="Status timeline" subtitle="Each step is recorded by the verifying officer." />
         </div>
-        <ol className="mt-5 space-y-0 px-5 pb-5">
+        <ol className="stagger-children mt-5 space-y-0 px-5 pb-5">
           {flow.steps.map((step, i) => {
             const done = i < reached;
             const current = i === flow.steps.length - 1;

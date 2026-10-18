@@ -191,7 +191,7 @@ export default function Overview({ alerts }: { alerts: AlertEvent[] }) {
               description="When a volunteer scanner reads a hot-listed plate, it appears here within a second."
             />
           ) : (
-            <ul className="mt-4 divide-y divide-surface-border">
+            <ul className="stagger-children mt-4 divide-y divide-surface-border">
               {recentShown.map((a, i) => (
                 <RecentAlertRow key={a.sighting_id || i} alert={a} />
               ))}
@@ -224,7 +224,7 @@ export default function Overview({ alerts }: { alerts: AlertEvent[] }) {
               description="No vehicles are on active watch. Verified complaints appear here automatically."
             />
           ) : (
-            <ul className="mt-4 divide-y divide-surface-border">
+            <ul className="stagger-children mt-4 divide-y divide-surface-border">
               {active.map((h) => (
                 <HotlistRow key={h.id} entry={h} />
               ))}

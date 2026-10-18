@@ -35,6 +35,10 @@ const PILL_IDLE = "rounded-md px-3 py-1.5 text-xs font-medium text-surface-muted
 /** The "missing or extra" bucket the metric maths folds deletions/insertions into. */
 const MISSING_LABEL = "\u2205";
 
+/** Shared entrance timing for every plot: quicker than the Recharts 1500 ms
+ *  default, so a chart settles in step with the card that carries it. */
+const CHART_ANIM = { animationDuration: 620, animationEasing: "ease-out" } as const;
+
 function pct(value: number | null | undefined, digits = 1): string {
   return value == null ? "—" : `${(value * 100).toFixed(digits)}%`;
 }
@@ -149,8 +153,8 @@ function AccuracyVsError({ sets, target }: { sets: OcrSetMetrics[]; target: OcrR
               fontSize: 10,
             }}
           />
-          <Bar dataKey="accuracy" name="Plate accuracy" fill="var(--success)" radius={[6, 6, 0, 0]} maxBarSize={40} />
-          <Bar dataKey="error" name="Error rate" fill="var(--danger)" radius={[6, 6, 0, 0]} maxBarSize={40} />
+          <Bar dataKey="accuracy" name="Plate accuracy" fill="var(--success)" radius={[6, 6, 0, 0]} maxBarSize={40} {...CHART_ANIM} />
+          <Bar dataKey="error" name="Error rate" fill="var(--danger)" radius={[6, 6, 0, 0]} maxBarSize={40} {...CHART_ANIM} />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -220,7 +224,7 @@ function ErrorComposition({ confusion }: { confusion: OcrReport["confusion"] }) 
               item?.payload?.hint ?? "Errors",
             ]}
           />
-          <Bar dataKey="count" fill="var(--danger)" radius={[0, 6, 6, 0]} maxBarSize={36} />
+          <Bar dataKey="count" fill="var(--danger)" radius={[0, 6, 6, 0]} maxBarSize={36} {...CHART_ANIM} />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -282,7 +286,7 @@ function WeakestCharacters({ perChar }: { perChar: OcrReport["confusion"]["per_c
             strokeDasharray="6 4"
             label={{ value: "90%", position: "top", fill: "var(--surface-muted)", fontSize: 10 }}
           />
-          <Bar dataKey="accuracy" fill="var(--solid)" radius={[0, 6, 6, 0]} maxBarSize={18} />
+          <Bar dataKey="accuracy" fill="var(--solid)" radius={[0, 6, 6, 0]} maxBarSize={18} {...CHART_ANIM} />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -477,6 +481,7 @@ function ConfidenceDensity({ distributions }: { distributions: OcrReport["distri
             stroke="var(--success)"
             strokeWidth={2}
             fill="url(#kde-correct)"
+            {...CHART_ANIM}
           />
           <Area
             type="monotone"
@@ -485,6 +490,7 @@ function ConfidenceDensity({ distributions }: { distributions: OcrReport["distri
             stroke="var(--warning)"
             strokeWidth={2}
             fill="url(#kde-wrong)"
+            {...CHART_ANIM}
           />
         </AreaChart>
       </ResponsiveContainer>
@@ -559,6 +565,7 @@ function BootstrapCurve({ distributions, target }: { distributions: OcrReport["d
             stroke="var(--solid)"
             strokeWidth={2}
             fill="url(#boot-area)"
+            {...CHART_ANIM}
           />
         </AreaChart>
       </ResponsiveContainer>
@@ -602,8 +609,8 @@ function ConfidenceHistogram({ histogram }: { histogram: OcrReport["confidence_h
             axisLine={false}
           />
           <Tooltip cursor={{ fill: "var(--row-hover)" }} contentStyle={tooltipStyle} />
-          <Bar dataKey="correct" name="Correct" stackId="a" fill="var(--success)" />
-          <Bar dataKey="wrong" name="Wrong or no read" stackId="a" fill="var(--danger)" radius={[6, 6, 0, 0]} />
+          <Bar dataKey="correct" name="Correct" stackId="a" fill="var(--success)" {...CHART_ANIM} />
+          <Bar dataKey="wrong" name="Wrong or no read" stackId="a" fill="var(--danger)" radius={[6, 6, 0, 0]} {...CHART_ANIM} />
         </BarChart>
       </ResponsiveContainer>
     </div>

@@ -19,6 +19,18 @@
   }
 }
 
+/* Opacity-only partner to `rise`, for surfaces a third-party library measures
+   while it mounts (the Leaflet map containers): moving one of those mid-measure
+   would shift the map under its own controls, so it fades instead of rising. */
+@keyframes soft-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* RAKSHAK global base styles. Byte-identical to police_dashboard/src/index.css
    (that app appends its Leaflet theme in a separate file, leaflet-theme.css).
 
@@ -503,6 +515,12 @@
   /* A route change: the new page rises in instead of snapping over. */
   .page-transition {
     animation: rise 320ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
+
+  /* Opacity-only entrance for map surfaces, which must keep their measured
+     geometry while they mount (see @keyframes soft-in above). */
+  .fade-soft {
+    animation: soft-in 480ms ease-out backwards;
   }
 
   /* A grid or list whose children follow one another in. */

@@ -40,7 +40,7 @@ export default function VehicleMap({ plate, points }: { plate: string; points: M
   const center = latLngs.length > 0 ? latLngs[latLngs.length - 1] : FALLBACK_CENTER;
 
   return (
-    <div className="h-[420px] w-full">
+    <div className="fade-soft h-[420px] w-full">
       <MapContainer center={center} zoom={12} style={{ height: "100%", width: "100%" }}>
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'

@@ -203,7 +203,7 @@ export default function VehicleDetail() {
                 No sightings recorded for this vehicle yet.
               </p>
             ) : (
-              <ol className="scrollbar-thin mt-4 max-h-[420px] divide-y divide-surface-border overflow-y-auto">
+              <ol className="stagger-children scrollbar-thin mt-4 max-h-[420px] divide-y divide-surface-border overflow-y-auto">
                 {[...timeline].reverse().map((t, i) => {
                   const n = timeline.length - i;
                   return (
