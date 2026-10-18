@@ -320,18 +320,22 @@ def test_a_reported_plate_is_flagged_within_three_seconds_and_alerted_once(
     assert _count_sightings(REPORTED) == before + 1
 
 
-def test_more_frames_after_the_verdict_do_not_alert_again(
+def test_every_read_of_a_parked_stolen_car_alerts_again_but_files_one_row(
     client, demo_tokens, register_device, one_car, alerts, monkeypatch
 ):
-    """A parked stolen car must not page the police eight times a second.
+    """A parked stolen car must alert on every read - and file one row.
 
-    The 60 s cooldown in `record_detection` is the backstop; the verdict's own
-    "already STOLEN" gate is the first line. This checks the first line.
+    Every detection at or above ``ALERT_MIN_CONFIDENCE`` wakes the dashboards:
+    the first read (POSSIBLE, flagged `needs_review`), and every read after the
+    verdict turns STOLEN. What the 60 s cooldown still throttles is the *row*:
+    one sighting per plate+device per minute, so the timeline and heat layer
+    stay clean while the portal hears the car every time it is seen.
 
     The read is deliberately a *marginal* 0.79: below `PLATE_CONF_DONE`, so the
-    track never settles and keeps being re-read for its full three attempts. That
-    is the only way to observe three verdicts on one parked car - a confident read
-    settles the track after one, which is correct but makes the test vacuous.
+    track never settles and keeps being re-read for its full three attempts.
+    That is the only way to observe several verdicts on one parked car - a
+    confident read settles the track after one, which is correct but makes the
+    test vacuous.
     """
     complaint = _complaint(client, demo_tokens["citizen"], CITIZEN_TEXT)
     _verify(client, demo_tokens["cop"], complaint["id"])
@@ -341,9 +345,10 @@ def test_more_frames_after_the_verdict_do_not_alert_again(
         ls, "run_ocr", _stub_read(REPORTED, 0.79, char_confs=[0.99] * 10)
     )
     device_id = register_device("RepeatCam")
+    before = _count_sightings(REPORTED)
 
     # Collected from the start rather than drained per frame, because the
-    # assertion is about frames *after* the alert - and draining would have
+    # assertion is about reads *after* the alert - and draining would have
     # thrown exactly those away.
     with client.websocket_connect("/api/v1/ws/scan") as ws:
         _auth(ws, demo_tokens["volunteer"], device_id)
@@ -355,23 +360,33 @@ def test_more_frames_after_the_verdict_do_not_alert_again(
         seen = [m for m in _collect(ws, 6.0) if m.get("type") == "plate"]
 
     assert len(seen) >= 2, f"only {len(seen)} plate messages across five frames"
-    # One review alert (the first 0.79 read is above the review floor) and one
-    # confirmed STOLEN alert - and then silence. The throttle that matters is
-    # that neither may repeat, not that only one may exist.
-    assert len(alerts) == 2, f"{len(alerts)} alerts across five frames of one parked car"
-    assert alerts[0][1]["needs_review"] is True
-    assert alerts[1][1]["needs_review"] is False
+    # One alert per read: the first 0.79 read is above the review floor and is
+    # flagged `needs_review`; every read after the verdict is STOLEN alerts
+    # without the flag. Repeats carry no sighting_id because no new row was
+    # written for them.
+    assert len(alerts) == len(seen), (
+        f"{len(alerts)} alerts for {len(seen)} reads of one parked car"
+    )
+    assert alerts[0][1]["needs_review"] is True, "the first read must say 'verify'"
+    assert all(p["needs_review"] is False for _, p in alerts[1:]), (
+        "a corroborated read must not still say 'merely verify'"
+    )
+    for _event, payload in alerts:
+        assert payload["plate"] == REPORTED
     states = [m["verdict"]["state"] for m in seen]
     # The first read is not corroborated, so it is POSSIBLE; from the second
     # onwards the phone keeps being told the car is stolen. The banner must not
-    # vanish just because the alert was already sent, and the state must not fall
-    # back on the strength of "we already told someone".
+    # vanish, and the state must not fall back on the strength of "we already
+    # told someone".
     assert states[-1] == "STOLEN", states
     assert "STOLEN" in states[1:], states
-    # Only the two frames that actually woke the portal may claim an alert was
-    # filed: the first read (review) and the corroborating one (confirmed).
+    # Every read that woke the portal claims it did.
     flagged = [m for m in seen if m["police_alerted"]]
-    assert len(flagged) == 2, f"{len(flagged)} frames claim to have filed an alert"
+    assert len(flagged) == len(seen), (
+        f"{len(flagged)} of {len(seen)} reads claim to have filed an alert"
+    )
+    # The row is still throttled: evidence, not one row per frame.
+    assert _count_sightings(REPORTED) == before + 1, "the 60 s cooldown let rows through"
 
 
 def test_a_camera_with_no_device_says_it_cannot_alert_and_does_not_claim_to(

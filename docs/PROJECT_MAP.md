@@ -89,7 +89,7 @@ only** (Process scope, restored in a `finally`). `backend/pytest.ini` does the s
 | `backend/app/ws/scan_manager.py` | Per-connection live-scan state: `VehicleTracker` (IoU tracking, per-class chip numbering, plate read budget), `ScanConnection` (in-flight slots, OCR claims, device, per-track verdicts, hires_pending/hires_active/last_hires_at) | `VehicleTracker`, `ScanConnection` |
 | `backend/alembic/versions/` | Migrations | `0001_initial`, `0002_perf_indexes` |
 | `ai/` | Model wrappers (repo-root package) | `detector.py`, `ocr_engine.py`, `pipeline.py` |
-| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `stream_camera.py` |
+| `scripts/` | Launchers, seeds, diagnostics | `start.ps1`, `seed_demo.py`, `live_scan_test.py`, `chain_check.py`, `heat_check.py`, `speed_check.py`, `speed_notes.py`, `probe_leg_contention.py`, `render_live_view.py`, `make_test_road_scene.py`, `bench_plate_reader.py`, `benchmark_ocr.py`, `eval_plates.py`, `eval_ocr.py` (measured OCR accuracy → `data/eval/ocr_report.json`, read by `/analytics/ocr`; also writes the Stolen-vs-Not-stolen decision matrix on an in-memory half-hotlist, the confidence KDEs and a 2,000-resample bootstrap accuracy curve), `stream_camera.py` |
 | `citizen_web/` | Citizen SPA | `src/pages/`, `src/services/api.ts` |
 | `police_dashboard/` | Police SPA | `src/pages/`, `src/components/map/VehicleMap.tsx`, `src/leaflet-theme.css` |
 | `mobile_app/` | Expo app | `src/screens/ScannerScreen.js`, `src/services/liveScan.js`, `src/services/liveCapture.js`, `src/components/LiveDetectionOverlay.js` |
@@ -124,6 +124,7 @@ Roles are enforced by `app/api/deps.py` (`require_cop`, `require_volunteer`, `re
 | POST | `/api/v1/devices/{id}/revoke` | ADMIN |
 | GET | `/api/v1/alerts` | COP, ADMIN |
 | GET | `/api/v1/analytics/{overview,detections,hotlist-matches,locations,traffic}` | COP, ADMIN |
+| GET | `/api/v1/analytics/ocr` | COP, ADMIN |
 | POST | `/api/v1/scanner/scan` | VOLUNTEER, COP |
 | GET | `/api/v1/geo/heat` | COP, ADMIN |
 
@@ -143,6 +144,17 @@ alert with only coordinates is not actionable at night. Both broadcast sites sen
 paths into the dashboard's feed look identical. `AlertEvent` in
 `police_dashboard/src/services/api.ts` types the new fields as optional, since rows
 written before this change do not carry them.
+
+Both sites fire on **every** detection of a listed plate at or above
+`ALERT_MIN_CONFIDENCE` (0.60), not once per cooldown: a cop watching the portal has
+to see the car while it is still in view. The 60 s `DETECTION_COOLDOWN_SECONDS`
+still throttles the *sighting row* (one per plate+device per minute), so a repeat
+alert carries `sighting_id: null` and a fresh timestamp — which is what the
+dashboard keys on to render it as a new event instead of a replay. Below the floor
+nothing pages the portal; the plate row (evidence for the timeline and heat layer)
+is still written when a hot-list match occurred. Reads per vehicle track are
+bounded (`MAX_READ_ATTEMPTS`, settle at `PLATE_CONF_DONE`), so "every detection"
+cannot turn into per-frame spam.
 
 `SightingOut` exposes `plate` and `camera` as **derived** properties on the model
 (`Sighting.plate`, `Sighting.camera`), not columns. There is deliberately no `plate`
@@ -490,7 +502,7 @@ PC on the network.
 | `test_health.py` | healthz |
 | `test_plate.py` | plate normalisation, state-code whitelist |
 | `test_privacy.py` | 415 on video/multipart, no imagery columns on `sightings`, `/ws/scan` auth gate |
-| `test_sightings.py` | hot-list match, cooldown suppression, last-seen update, police WS alert |
+| `test_sightings.py` | hot-list match, row cooldown suppression, repeat-detection re-alert, below-floor silence, last-seen update, police WS alert |
 | `test_geo.py` | `/geo/heat` RBAC, bbox / window / class validation, hour-bucket window trap |
 | `test_heat_layers.py` | per-frame density, min-frames threshold, time decay, no-attribution |
 | `test_traffic_grid.py` | cell maths, GPS-fix rejection, batching, failed-flush retention, retention sweep |
@@ -501,9 +513,10 @@ PC on the network.
 | `test_char_verifier.py` | per-character verifier vs consensus-only fallback (verdict rules) |
 | `test_plate_reader.py` | plate-reader variants + per-char confidence path |
 | `test_plate_verdict.py` | verdict state machine: CLEAR / POSSIBLE / STOLEN, corroboration window, hot-list gating |
-| `test_stolen_chain.py` | hot-list detect → STOLEN verdict → `/ws/police` alert → sighting row, end to end |
+| `test_stolen_chain.py` | hot-list detect → STOLEN verdict → `/ws/police` alert on every read (row still 60 s-throttled) → sighting row, end to end |
 | `test_live_scan_hires.py` | hi-res on-demand: the one-off capture keeps its pixels, marking, budget interplay |
 | `test_stream_source.py` | stream sources: repo-root-anchored defaults, kind validation, lat/lng parsing, latest-frame-wins, reconnect backoff |
+| `test_ocr_metrics.py` | hand-computed OCR maths (plate accuracy, CER, character confusion, Wilson interval, insertion/deletion alignment), the binary decision matrix (precision/recall/F1/false-alert), the KDE and bootstrap helpers, and the `/analytics/ocr` contract (200 / no_report / 401 / 403) |
 
 Shared grid fixtures live in `geo_helpers.py` (not a test module).
 
@@ -627,7 +640,7 @@ Lazy-loaded one-per-page in `src/App.tsx`, sidebar defined in `src/components/La
 | `/complaints` | Complaints | |
 | `/hotlist` | Hotlist | |
 | `/search`, `/vehicles/:plate` | Vehicle Search / Detail | Detail's `VehicleMap.tsx` untouched |
-| `/analytics` | Analytics | Recharts behind its own chunk |
+| `/analytics` | Analytics | Recharts behind its own chunk; lazy "OCR Model" tab (`src/pages/analytics/OcrModelTab.tsx`) shows the measured OCR report: a plate-level Stolen/Not-stolen decision confusion matrix (heatmap + colour bar), KPI cards (accuracy, error rate, precision, recall, F1), confidence density curves (correct vs wrong) with a bootstrap accuracy distribution, accuracy-vs-error-rate by dataset, errors-by-type, weakest characters, and the character confusion matrix |
 | `/admin` | Admin | ADMIN only |
 
 `leaflet.heat@0.2.0` is pinned exact and is the only dependency added. It ships no types, so

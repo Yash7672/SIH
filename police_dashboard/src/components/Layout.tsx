@@ -75,7 +75,13 @@ export default function Layout({
   const [banner, setBanner] = useState<AlertEvent | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  const latestId = alerts[0]?.sighting_id ?? null;
+  // Keyed on the newest alert, including repeats that carry no sighting row
+  // (`sighting_id` is null when the 60 s row cooldown suppresses a duplicate).
+  // Without the timestamp fallback those repeats would never re-pop the banner,
+  // and the point of alerting every detection is that a cop sees it every time.
+  const latestId = alerts[0]
+    ? `${alerts[0].sighting_id ?? alerts[0].plate}-${alerts[0].timestamp}`
+    : null;
 
   useEffect(() => {
     if (!latestId) return;

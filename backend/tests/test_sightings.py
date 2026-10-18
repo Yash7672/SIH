@@ -103,6 +103,72 @@ def test_repeat_detection_is_cooldown_suppressed(client, demo_tokens):
     assert len(mine) == 1, f"cooldown let {len(mine)} sightings through for one plate/device"
 
 
+def test_repeat_detection_still_alerts_the_dashboard(client, demo_tokens, monkeypatch):
+    """Every detection wakes the portal; only the *row* is cooldown-throttled.
+
+    The 60 s cooldown exists so one pass of a camera does not write a sighting
+    per frame. The alert is a different concern: a cop watching the dashboard
+    has to see the stolen car while it is still in view, not only the first
+    time. So the repeat broadcasts - with `sighting_id: None`, because there is
+    no new row to point at - and the cooldown keeps persisting one row.
+    """
+    import app.api.v1.sightings as sightings_module
+
+    broadcasts = []
+
+    async def _fake_broadcast(event, payload):
+        broadcasts.append((event, payload))
+
+    monkeypatch.setattr(sightings_module.alert_manager, "broadcast", _fake_broadcast)
+
+    make_hotlist(client, demo_tokens)
+    dev = register_device(client, demo_tokens)
+    body = sighting_body("TS09AB1234", dev)
+
+    first = client.post("/api/v1/sightings", headers=auth(demo_tokens["volunteer"]), json=body)
+    assert first.status_code == 200, first.text
+    # Inside the cooldown: no second row, but the second alert must go out.
+    second = client.post("/api/v1/sightings", headers=auth(demo_tokens["volunteer"]), json=body)
+    assert second.status_code == 202, second.text
+
+    assert len(broadcasts) == 2, f"{len(broadcasts)} alerts for two detections"
+    for event, payload in broadcasts:
+        assert event == "hotlist_detection", event
+        assert payload["plate"] == "TS09AB1234"
+        assert payload["confidence"] == pytest.approx(0.95)
+    assert broadcasts[0][1]["sighting_id"] is not None, "the first alert anchors the row"
+    assert broadcasts[1][1]["sighting_id"] is None, "the repeat has no new row to point at"
+
+    rows = client.get("/api/v1/sightings", headers=auth(demo_tokens["cop"])).json()
+    mine = [s for s in rows if s.get("device_id") == dev]
+    assert len(mine) == 1, f"the repeat alert wrote {len(mine)} rows, not one"
+
+
+def test_below_sixty_percent_detection_does_not_alert(client, demo_tokens, monkeypatch):
+    """Below the confidence floor nothing pages the portal.
+
+    The row is still written - it is evidence for the route and heat layer -
+    but the cop's dashboard stays quiet: a sub-60% read is not worth a unit.
+    """
+    import app.api.v1.sightings as sightings_module
+
+    broadcasts = []
+
+    async def _fake_broadcast(event, payload):
+        broadcasts.append((event, payload))
+
+    monkeypatch.setattr(sightings_module.alert_manager, "broadcast", _fake_broadcast)
+
+    make_hotlist(client, demo_tokens)
+    dev = register_device(client, demo_tokens)
+    body = sighting_body("TS09AB1234", dev, conf=0.42)
+
+    r = client.post("/api/v1/sightings", headers=auth(demo_tokens["volunteer"]), json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["hotlist_id"], "the sighting row must still exist for the timeline"
+    assert broadcasts == [], "a 42% read paged the police dashboard"
+
+
 def test_hotlist_detection_updates_last_seen(client, demo_tokens):
     """A fresh sighting must move the hot-list entry's last-seen marker.
 

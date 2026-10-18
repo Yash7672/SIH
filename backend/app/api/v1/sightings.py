@@ -12,6 +12,7 @@ from app.db.session import get_db
 from app.models import Device, Hotlist, Sighting, User
 from app.schemas.entities import SightingCreate, SightingOut
 from app.services.plate import normalize_plate
+from app.services.hotlist_service import HotlistService
 from app.services.sighting_service import SightingService
 from app.ws.manager import alert_manager
 
@@ -59,16 +60,57 @@ async def create_sighting(
         raise HTTPException(status_code=422, detail=str(exc))
 
     if sighting is None:
-        # Not hotlisted or throttled — no sighting, no alert, nothing persisted.
-        # 202: the detection was accepted and deliberately discarded.
+        # Not hotlisted, or throttled by the 60 s cooldown. If the plate is
+        # still on the list it was a throttled repeat, and a repeat still
+        # alerts: a cop watching the portal must see the car while it is still
+        # there, not only the first time. No new row is written.
+        entry = HotlistService(db).get_active_by_plate(norm.normalized)
+    else:
+        entry = db.get(Hotlist, sighting.hotlist_id)
+
+    above_floor = (payload.confidence or 0.0) >= settings.ALERT_MIN_CONFIDENCE
+    # The HTTP path has no verdict pipeline behind it, so a read under the live
+    # scanner's corroborated bar is flagged for the "verify before intercepting"
+    # styling. With the floor below, only reads at or above ALERT_MIN_CONFIDENCE
+    # broadcast at all, so in practice this is False - the flag stays computed
+    # here so the rule lives in one place if the floor ever moves.
+    needs_review = (payload.confidence or 0.0) < settings.ALERT_MIN_CONFIDENCE
+
+    if sighting is None:
+        if entry is not None and above_floor:
+            # Throttled repeat: broadcast-only, so the dashboard sees it again
+            # without a second row. `sighting_id: None` is the same shape the
+            # live scanner's review alert uses for a detection with no row.
+            await alert_manager.broadcast(
+                "hotlist_detection",
+                {
+                    "sighting_id": None,
+                    "plate": norm.normalized,
+                    "latitude": payload.latitude,
+                    "longitude": payload.longitude,
+                    "timestamp": payload.timestamp.isoformat(),
+                    "confidence": payload.confidence,
+                    "hotlist_id": str(entry.id),
+                    "camera": device.device_name or device.device_type or "unknown",
+                    "device_id": str(device.id),
+                    "last_seen_at": entry.last_seen_at.isoformat() if entry.last_seen_at else None,
+                    "needs_review": needs_review,
+                },
+            )
+        # 202: no row was written - the plate is unlisted, or the cooldown is
+        # running. The detection was accepted and deliberately not persisted.
         return Response(
             content='{"accepted": false, "detail": "accepted_no_match"}',
             status_code=status.HTTP_202_ACCEPTED,
             media_type="application/json",
         )
 
+    # Below the floor nothing pages the portal; the plate row - evidence for
+    # the timeline and heat layer - is still written above.
+    if not above_floor:
+        return sighting
+
     # Build alert payload and push to police dashboards via WebSocket
-    hotlist_entry = db.get(Hotlist, sighting.hotlist_id)
     alert_payload = {
         "sighting_id": str(sighting.id),
         "plate": norm.normalized,
@@ -81,11 +123,8 @@ async def create_sighting(
         # alert feed look identical to whatever consumes it.
         "camera": device.device_name or device.device_type or "unknown",
         "device_id": str(device.id),
-        "last_seen_at": hotlist_entry.last_seen_at.isoformat() if hotlist_entry and hotlist_entry.last_seen_at else None,
-        # The HTTP path has no verdict pipeline behind it, so anything under
-        # the live scanner's corroborated bar is flagged for the same
-        # "verify before intercepting" styling on the dashboard.
-        "needs_review": (payload.confidence or 0.0) < settings.ALERT_MIN_CONFIDENCE,
+        "last_seen_at": entry.last_seen_at.isoformat() if entry and entry.last_seen_at else None,
+        "needs_review": needs_review,
     }
     await alert_manager.broadcast("hotlist_detection", alert_payload)
     logger.info("Hotlist match broadcast: plate_len=%d", len(norm.normalized))

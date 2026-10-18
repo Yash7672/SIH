@@ -87,7 +87,7 @@ try:  # noqa: E402
     from ai import char_grammar, char_segment, char_verifier
 except Exception:  # noqa: E402, BLE001 - optional: reported as "unverified"
     char_grammar = char_segment = char_verifier = None  # type: ignore[assignment]
-from app.services.plate import normalize_plate, plate_key  # noqa: E402
+from app.services.plate import normalize_plate  # noqa: E402
 from app.services.plate_reader import (  # noqa: E402
     debug_crops_enabled,
     plate_box_plausible,
@@ -881,15 +881,21 @@ async def _check_hotlist_and_record(
     conf: float,
     needs_review: bool = False,
 ) -> bool:
-    """Return True when this detection actually filed a police alert.
+    """Return True when this detection broadcast a police alert.
 
-    The value is a claim about *this frame*, so it is False unless an alert was
-    really broadcast. The `stolen` banner on the phone is separate and comes from
-    the verdict; a camera that reads a listed car is told that plainly either way.
+    Every qualifying detection alerts - not the first one per minute. The 60 s
+    cooldown in `record_detection` still decides how many *rows* are filed (one
+    per plate+device per minute, so the timeline and heat layer are not spammed),
+    but the dashboards are woken on every read: a cop watching the portal needs
+    to see the car while it is still there, and a suppressed repeat is a
+    detection the system decided to throw away.
 
-    `record_detection` enforces the 60 s cooldown and returns None both for "not
-    hotlisted" and "cooldown active"; only a real sighting is worth waking the
-    dashboards for.
+    A repeat inside the cooldown broadcasts with `sighting_id: None` - there is
+    no new row to point at - and a fresh timestamp, which is what lets the
+    dashboard treat it as a new event instead of a replay.
+
+    The `stolen` banner on the phone is separate and comes from the verdict; a
+    camera that reads a listed car is told that plainly either way.
     """
     hotlist = HotlistService(db)
     stolen = hotlist.is_plate_hotlisted(plate)
@@ -915,23 +921,25 @@ async def _check_hotlist_and_record(
     except ValueError:
         # record_detection rejects impossible coordinates; drop the frame.
         return False
-    if sighting is None:
-        # None means either "the 60 s cooldown is running" - an alert for this
-        # car already went out - or "the list no longer holds it", which the
-        # stale-cache correction just discovered. Only the first is an alert.
-        return hotlist.get_active_by_plate(plate) is not None
 
     entry = hotlist.get_active_by_plate(plate)
+    if sighting is None and entry is None:
+        # Not on the list at all - or the stale-cache correction just removed
+        # it. Nothing to alert about.
+        return False
+
     await alert_manager.broadcast(
         "hotlist_detection",
         {
-            "sighting_id": str(sighting.id),
+            "sighting_id": str(sighting.id) if sighting else None,
             "plate": plate,
-            "latitude": sighting.latitude,
-            "longitude": sighting.longitude,
-            "timestamp": sighting.detected_at.isoformat(),
-            "confidence": sighting.confidence,
-            "hotlist_id": str(sighting.hotlist_id),
+            "latitude": sighting.latitude if sighting else lat,
+            "longitude": sighting.longitude if sighting else lng,
+            "timestamp": (
+                sighting.detected_at if sighting else datetime.now(timezone.utc)
+            ).isoformat(),
+            "confidence": sighting.confidence if sighting else conf,
+            "hotlist_id": str(sighting.hotlist_id) if sighting else str(entry.id),
             # Which camera saw it. A cop deciding whether to roll needs to know
             # whether this is the junction camera or a volunteer's phone, and an
             # alert with only coordinates is not actionable at night.
@@ -966,8 +974,9 @@ async def _broadcast_review_alert(
     the 60 s sighting cooldown. That matters because the *second*, corroborated
     read arrives seconds later wanting the STOLEN alert - if the review alert
     had consumed the cooldown, the confirmed alert would be silently swallowed
-    and the dashboard would never hear the upgrade. Its own Redis cooldown is
-    the only throttle, and losing it costs a duplicate nudge, never a lost one.
+    and the dashboard would never hear the upgrade. Every qualifying read
+    broadcasts; a repeat nudge costs a dashboard row, a lost one costs a cop
+    noticing nothing.
     """
     if lat is None or lng is None:
         # Not actionable on a map without a position, same as the STOLEN path.
@@ -976,11 +985,6 @@ async def _broadcast_review_alert(
         # No device means no camera to name and nothing attributable - the
         # same reason the STOLEN path refuses. A review alert an officer
         # cannot trace to a source is worse than no alert.
-        return False
-    if not cache_service.cooldown(
-        f"review_alert:{plate_key(plate)}:{device.id if device else 'anon'}",
-        settings.DETECTION_COOLDOWN_SECONDS,
-    ):
         return False
 
     entry = HotlistService(db).get_active_by_plate(plate)
@@ -1378,21 +1382,19 @@ async def ws_live_scan(websocket: WebSocket):
                                 amb=tuple(result.get("ambiguous") or ()),
                             )
                         )
-                        # A STOLEN verdict on the previous read must not be
-                        # re-alerted every frame while the car is still in view;
-                        # the sighting cooldown in `record_detection` is the
-                        # backstop, and this is the first gate.
-                        already = verdict.state is STOLEN
-                        vd = verdict.evaluate(
-                            _active_hotlist_plates(), cooldown_ok=not already
-                        )
+                        # Every qualifying read alerts. The verdict stays STOLEN
+                        # for the rest of the track (the phone banner must not
+                        # flicker), and each read at or above the 60% floor
+                        # wakes the dashboards again - a repeat inside the 60 s
+                        # row cooldown just broadcasts without a new row.
+                        vd = verdict.evaluate(_active_hotlist_plates())
                         verdict.state = vd.state
 
                         if not orphan:
                             track.plate_stolen = vd.state == STOLEN
 
                         alerted = False
-                        if vd.state == STOLEN and not already:
+                        if vd.state == STOLEN and vd.confidence >= settings.ALERT_MIN_CONFIDENCE:
                             db = SessionLocal()
                             try:
                                 alerted = await _check_hotlist_and_record(
