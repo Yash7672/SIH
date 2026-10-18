@@ -145,16 +145,21 @@ paths into the dashboard's feed look identical. `AlertEvent` in
 `police_dashboard/src/services/api.ts` types the new fields as optional, since rows
 written before this change do not carry them.
 
-Both sites fire on **every** detection of a listed plate at or above
-`ALERT_MIN_CONFIDENCE` (0.60), not once per cooldown: a cop watching the portal has
-to see the car while it is still in view. The 60 s `DETECTION_COOLDOWN_SECONDS`
-still throttles the *sighting row* (one per plate+device per minute), so a repeat
-alert carries `sighting_id: null` and a fresh timestamp — which is what the
-dashboard keys on to render it as a new event instead of a replay. Below the floor
-nothing pages the portal; the plate row (evidence for the timeline and heat layer)
-is still written when a hot-list match occurred. Reads per vehicle track are
-bounded (`MAX_READ_ATTEMPTS`, settle at `PLATE_CONF_DONE`), so "every detection"
-cannot turn into per-frame spam.
+The live-scan path (`live_scan.py:_check_hotlist_and_record`) pages on **every
+corroborated STOLEN read**, not once per cooldown, and it does **not** consult
+`ALERT_MIN_CONFIDENCE` (0.60) for that: the verdict already demanded two agreeing
+reads inside the consensus window, or one decisive verified read, and that
+corroboration is the evidence — the cluster confidence only reports how tidy the
+crop was, so two agreeing 0.5 reads page exactly like one 0.99. A `POSSIBLE` exact
+match still needs the 0.60 floor to reach the portal, and it arrives flagged
+`needs_review` ("verify this", not "roll on this"). The 60 s
+`DETECTION_COOLDOWN_SECONDS` throttles the *sighting row* (one per plate+device per
+minute), so a repeat alert carries `sighting_id: null` and a fresh timestamp —
+which is what the dashboard keys on to render it as a new event instead of a
+replay. Reads per vehicle track are bounded (`MAX_READ_ATTEMPTS`, settle at
+`PLATE_CONF_DONE`), so "every detection" cannot turn into per-frame spam. The
+separate REST `POST /sightings` path (`sightings.py`) still uses the 0.60 floor for
+its review flag.
 
 `SightingOut` exposes `plate` and `camera` as **derived** properties on the model
 (`Sighting.plate`, `Sighting.camera`), not columns. There is deliberately no `plate`

@@ -389,6 +389,52 @@ def test_every_read_of_a_parked_stolen_car_alerts_again_but_files_one_row(
     assert _count_sightings(REPORTED) == before + 1, "the 60 s cooldown let rows through"
 
 
+def test_a_weak_but_corroborated_stolen_still_pages(
+    client, demo_tokens, register_device, one_car, alerts, monkeypatch
+):
+    """Two weak reads that agree are proof; the alert floor must not veto them.
+
+    The cluster confidence of a corroborated STOLEN is the best read's score, not
+    the evidence. Two 0.50 reads of the same listed plate inside the consensus
+    window agree, so the verdict is STOLEN - and the car is not less stolen
+    because the crop was dim. Gating the page on ``ALERT_MIN_CONFIDENCE`` (0.60)
+    dropped exactly these confirmations; the verdict's own corroboration bar is
+    what has to hold, and it does.
+    """
+    plate = "DL09ZZ4321"
+    complaint = _complaint(client, demo_tokens["citizen"], plate)
+    _verify(client, demo_tokens["cop"], complaint["id"])
+    monkeypatch.setattr(ls, "run_ocr", _stub_read(plate, 0.50, char_confs=[0.99] * 10))
+    device_id = register_device("DimCam")
+    before = _count_sightings(plate)
+
+    with client.websocket_connect("/api/v1/ws/scan") as ws:
+        _auth(ws, demo_tokens["volunteer"], device_id)
+        for seq in range(1, 7):
+            ws.send_json(_frame(seq))
+            # Under the 15 fps limiter, or the frame is dropped before the plate
+            # pass ever sees it.
+            time.sleep(0.08)
+        seen = [m for m in _collect(ws, 6.0) if m.get("type") == "plate"]
+
+    stolen = [m for m in seen if m["verdict"]["state"] == "STOLEN"]
+    assert stolen, f"no STOLEN verdict; states were {[m['verdict']['state'] for m in seen]}"
+    for msg in stolen:
+        assert msg["verdict"]["confidence"] < 0.60, (
+            "this test only means something while the confidence is under the floor"
+        )
+        assert msg["police_alerted"] is True, (
+            "a corroborated STOLEN under the floor must still page the portal"
+        )
+    assert len(alerts) == len(stolen), f"{len(alerts)} alerts for {len(stolen)} STOLEN reads"
+    for _event, payload in alerts:
+        assert payload["plate"] == plate
+        assert payload["needs_review"] is False, (
+            "a corroborated match is not 'merely verify', however quiet the read"
+        )
+    assert _count_sightings(plate) == before + 1, "the cooldown must still throttle rows"
+
+
 def test_a_camera_with_no_device_says_it_cannot_alert_and_does_not_claim_to(
     client, demo_tokens, register_device, one_car, alerts, monkeypatch
 ):

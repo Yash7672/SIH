@@ -1400,7 +1400,16 @@ async def ws_live_scan(websocket: WebSocket):
                             track.plate_stolen = vd.state == STOLEN
 
                         alerted = False
-                        if vd.state == STOLEN and vd.confidence >= settings.ALERT_MIN_CONFIDENCE:
+                        if vd.state == STOLEN:
+                            # A *corroborated* STOLEN pages regardless of the
+                            # cluster confidence. Corroboration is two reads that
+                            # agree inside the consensus window, or one decisive
+                            # verified read; `vd.confidence` then only says how
+                            # tidy the crop was, and two agreeing 0.5 reads are
+                            # the same evidence as one 0.99. Gating here on
+                            # ALERT_MIN_CONFIDENCE dropped exactly the
+                            # weak-frame confirmation the verdict was built to
+                            # make, so the alert no longer consults it.
                             db = SessionLocal()
                             try:
                                 alerted = await _check_hotlist_and_record(
