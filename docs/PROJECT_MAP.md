@@ -436,6 +436,7 @@ A density grid for the police dashboard. Two layers behind one response shape.
 | --- | --- |
 | `layer` | `traffic` (default) or `stolen` |
 | `from`, `to` | ISO timestamps. Default: the last 15 minutes. Max span 7 days. |
+| `all_time` | `true` = the whole stored history (back to the epoch), ignoring `from`/`to`. The escape hatch from the 7-day cap, used by the dashboard's "All time" button. |
 | `vehicle_class` | `two_wheeler` \| `car` \| `bus` \| `truck`. Traffic layer only. |
 | `bbox` | `south,west,north,east`. |
 
@@ -450,6 +451,12 @@ Returns `{cells: [{lat, lng, w, n}], max, min, generated_at}`.
   bright as a junction with 200.
 - Redis-cached for 10 s; a cache outage degrades to a direct read, never a failure.
 - RBAC is the point: 401 with no token, 403 for CITIZEN and VOLUNTEER.
+- **"All time" is a different request, not a bigger number.** The dashboard offers a Window
+  control (15 min → 7 days, then **All time**); the fixed ones send `from`/`to` and the last
+  sends `all_time=true`. The server starts that window at the epoch and ignores `from`/`to`
+  rather than merging them, so a stale client cannot widen-to-all and then silently narrow it
+  back to six hours. It is the only request that scans the whole table — deliberately opt-in,
+  still COP/ADMIN, still hour-bucketed, still capped by `MAX_CELLS` and cached.
 
 ### `traffic_cells`
 One row per (cell, UTC hour, real-or-synthetic).

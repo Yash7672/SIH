@@ -101,6 +101,27 @@ def main() -> int:
         f"{total} cells in a 1 h window",
     )
 
+    print("\n  -- all time --")
+    # The same request that is refused as a fixed window must be served once it
+    # is asked for by name: "All time" is a different question, not a bigger
+    # number, and it must not become a way around the role check either.
+    wide = {**window, "layer": "traffic", "from": _iso(now - 8 * 86400), "to": _iso(now + 60)}
+    r = requests.get(
+        f"{API_V1}/geo/heat", headers=auth(cop), params={**wide, "all_time": "true"}, timeout=60
+    )
+    check(
+        "all_time reaches past the cap a fixed window is refused for",
+        r.status_code == 200 and "cells" in r.json(),
+        f"HTTP {r.status_code} {r.text[:70]}",
+    )
+    r = requests.get(
+        f"{API_V1}/geo/heat",
+        headers=auth(citizen),
+        params={**wide, "all_time": "true"},
+        timeout=20,
+    )
+    check("all_time is still police-only", r.status_code == 403, f"HTTP {r.status_code}")
+
     print("\n  -- the 10 s cache --")
     # Timings would be noise here: the query is two cells wide, so a cache hit
     # and a miss differ by less than the request overhead. `generated_at` is

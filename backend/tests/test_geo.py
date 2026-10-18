@@ -107,6 +107,37 @@ def test_window_wider_than_seven_days_is_rejected(client, demo_tokens):
     assert r.status_code == 422
 
 
+def test_all_time_reaches_past_the_seven_day_cap(client, demo_tokens):
+    """The point of the flag: the map can be read for the whole history, not
+    just the week a fixed window is allowed to ask for."""
+    put_cell(17.44, 78.48, hours_ago=0, car=100)
+    put_cell(17.61, 78.47, hours_ago=24 * 30, car=800)
+    r = client.get(
+        "/api/v1/geo/heat?all_time=true", headers=auth(demo_tokens["cop"])
+    )
+    assert r.status_code == 200, r.text
+    assert sorted(c["lat"] for c in r.json()["cells"]) == [17.44, 17.61]
+
+
+def test_all_time_does_not_combine_with_a_narrowing_window(client, demo_tokens):
+    """A stale client must not be able to turn "all time" into a window that
+    silently drops the older half of the history."""
+    put_cell(17.44, 78.48, hours_ago=1, car=100)
+    put_cell(17.61, 78.48, hours_ago=24 * 30, car=100)
+    now = datetime.now(timezone.utc)
+    r = client.get(
+        "/api/v1/geo/heat",
+        params={
+            "all_time": "true",
+            "from": (now - timedelta(hours=6)).isoformat(),
+            "to": now.isoformat(),
+        },
+        headers=auth(demo_tokens["cop"]),
+    )
+    assert r.status_code == 200, r.text
+    assert sorted(c["lat"] for c in r.json()["cells"]) == [17.44, 17.61]
+
+
 def test_cells_outside_the_window_are_excluded(client, demo_tokens):
     put_cell(17.44, 78.48, hours_ago=1, car=500)
     put_cell(17.50, 78.50, hours_ago=48, car=999)

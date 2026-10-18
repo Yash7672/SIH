@@ -1,8 +1,17 @@
 import type { HeatLayerName, HeatVehicleClass } from "../../services/api";
 
 /**
- * The window list. The server caps a window at 7 days, so nothing longer is
- * offered here rather than being offered and then rejected with a 422.
+ * The sentinel for "everything stored". It is not a number of minutes: the
+ * server caps a fixed window at 7 days, so a bigger number would just be
+ * rejected with a 422. "All time" is a different request (`all_time=true`),
+ * which the server resolves to the whole history.
+ */
+export const ALL_TIME = 0;
+
+/**
+ * The window list. Nothing beyond 7 days is offered as a *window*, because the
+ * server rejects it - so "All time" is asked for by name instead of being
+ * faked with a number the server would refuse.
  */
 const WINDOWS = [
   { label: "15 min", minutes: 15 },
@@ -10,6 +19,7 @@ const WINDOWS = [
   { label: "6 hours", minutes: 360 },
   { label: "24 hours", minutes: 1440 },
   { label: "7 days", minutes: 10080 },
+  { label: "All time", minutes: ALL_TIME },
 ] as const;
 
 const CLASSES: Array<{ label: string; value: HeatVehicleClass | "" }> = [

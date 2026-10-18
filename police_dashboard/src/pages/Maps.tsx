@@ -4,7 +4,7 @@ import { Layers, RefreshCw, TrafficCone } from "lucide-react";
 import { api } from "../services/api";
 import type { HeatLayerName, HeatResponse, HeatVehicleClass } from "../services/api";
 import HeatLayer from "../components/map/HeatLayer";
-import HeatFilters from "../components/map/HeatFilters";
+import HeatFilters, { ALL_TIME } from "../components/map/HeatFilters";
 import { CellTable, HeatLegend } from "../components/map/HeatChrome";
 import { Card, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -51,12 +51,20 @@ export default function Maps() {
     setError(null);
     try {
       const to = new Date();
-      const from = new Date(to.getTime() - minutes * 60_000);
+      // "All time" is not a wider window - the server caps a window at 7 days
+      // and would 422 anything longer. It is asked for by name, and the server
+      // resolves it to the whole stored history.
+      const window =
+        minutes === ALL_TIME
+          ? { all_time: true }
+          : {
+              from: new Date(to.getTime() - minutes * 60_000).toISOString(),
+              to: to.toISOString(),
+            };
       const { data: body } = await api.get<HeatResponse>("/geo/heat", {
         params: {
           layer,
-          from: from.toISOString(),
-          to: to.toISOString(),
+          ...window,
           ...(vehicleClass ? { vehicle_class: vehicleClass } : {}),
         },
       });

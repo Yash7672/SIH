@@ -37,6 +37,10 @@ MAX_RANGE_DAYS = 7
 MAX_CELLS = 5000
 CACHE_TTL_SECONDS = 10
 VALID_LAYERS = ("traffic", "stolen")
+# The lower bound for "all time". Not a wider window but the absence of one: the
+# whole stored history. Nothing can predate the epoch, so this needs no date kept
+# in sync with the data - and no number the dashboard has to guess and be wrong.
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _parse_bbox(raw: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
@@ -60,16 +64,26 @@ def _parse_bbox(raw: Optional[str]) -> Optional[Tuple[float, float, float, float
 
 
 def _parse_window(
-    from_: Optional[datetime], to: Optional[datetime]
+    from_: Optional[datetime], to: Optional[datetime], all_time: bool = False
 ) -> Tuple[datetime, datetime]:
-    """Default to the last 15 minutes so the endpoint is useful with no params."""
+    """Default to the last 15 minutes so the endpoint is useful with no params.
+
+    ``all_time`` is not a wider window but the absence of one: it reaches back to
+    the epoch, covering everything ever stored. ``from``/``to`` are ignored rather
+    than combined with it, so a stale client cannot silently narrow the history it
+    asked for into something that looks complete and is not. This is the one
+    request that scans the whole table, which is why it is an explicit flag
+    (COP/ADMIN only, hour-bucketed, capped by ``MAX_CELLS``, cached like the rest).
+    """
     now = datetime.now(timezone.utc)
     end = to or now
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if all_time:
+        return EPOCH, end.astimezone(timezone.utc)
     start = from_ or (end - timedelta(minutes=15))
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
     if start >= end:
         raise HTTPException(422, "from must be earlier than to")
     if (end - start) > timedelta(days=MAX_RANGE_DAYS):
@@ -94,6 +108,7 @@ def heat(
     layer: str = Query("traffic", pattern="^(traffic|stolen)$"),
     from_: Optional[datetime] = Query(None, alias="from"),
     to: Optional[datetime] = Query(None),
+    all_time: bool = Query(False),
     vehicle_class: Optional[str] = Query(None),
     bbox: Optional[str] = Query(None),
     _: User = Depends(require_cop),
@@ -101,11 +116,14 @@ def heat(
 ):
     """Heat cells for the requested layer and window.
 
+    ``all_time=true`` asks for the whole stored history (see `_parse_window`);
+    every other request is a fixed window, capped at `MAX_RANGE_DAYS`.
+
     COP and ADMIN only: a density map is an operational picture of where cars
     are, which is not something a citizen or a volunteer account should be able
     to read. No token gives 401 from `require_cop` before this runs.
     """
-    start, end = _parse_window(from_, to)
+    start, end = _parse_window(from_, to, all_time)
     box = _parse_bbox(bbox)
 
     if vehicle_class is not None and vehicle_class not in HEAT_CLASSES:
