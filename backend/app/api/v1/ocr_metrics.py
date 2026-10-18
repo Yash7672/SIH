@@ -14,15 +14,35 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
 
 from app.api.deps import require_cop
-from app.core.config import REPO_ROOT
+from app.core.config import BACKEND_DIR, REPO_ROOT
 from app.models import User
 from app.services.ocr_metrics import OcrNoReport, OcrReport, load_report
 
 router = APIRouter()
 
-# Repo-root anchored (same reasoning as STREAM_SOURCES_PATH): uvicorn and pytest
-# start in backend/, so a relative path would look in the wrong tree.
-REPORT_PATH: Path = REPO_ROOT / "data" / "eval" / "ocr_report.json"
+
+def _default_report_path() -> Path:
+    """The eval report, in whichever tree layout is running.
+
+    Locally ``REPO_ROOT`` is the git root and the writer's output lands there.
+    Inside the Docker image the package is copied to ``/app/app``, so
+    ``REPO_ROOT`` becomes ``/`` while the mounted data directory is ``/app/data``
+    - the repo-root guess then pointed at ``/data/eval/...`` and the tab always
+    read "no report". Anchor on the first candidate whose *directory* exists, so
+    the report is picked up whether or not it has been generated yet.
+    """
+    candidates = (
+        REPO_ROOT / "data" / "eval" / "ocr_report.json",
+        BACKEND_DIR / "data" / "eval" / "ocr_report.json",
+        Path("/app/data/eval/ocr_report.json"),
+    )
+    for candidate in candidates:
+        if candidate.parent.is_dir():
+            return candidate
+    return candidates[0]
+
+
+REPORT_PATH: Path = _default_report_path()
 
 
 @router.get(
