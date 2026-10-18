@@ -23,12 +23,14 @@ import {
   MIN_PREDICT_DT,
   PLATE_COLOR,
   PLATE_WIDTH,
+  VEHICLE_CHIP_FILL,
   VEHICLE_COLOR,
   VEHICLE_WIDTH,
   applyBoxes,
   applyPlateText,
   applyPlates,
   applyZone,
+  classWord,
   clearState,
   computeTransform,
   createOverlayState,
@@ -186,18 +188,21 @@ test("vehicles are green, and a plate's colour is its verdict, with the spec wid
   assert.notEqual(p.color, "#FF1F1F");
   assert.equal(p.borderWidth, 3);
   assert.equal(p.borderWidth, PLATE_WIDTH);
-  // The vehicle chip now carries the verdict, not the class name. Until a read
-  // comes back it says so rather than claiming the car is not stolen.
-  assert.equal(v.chip, "SCANNING", "an unread car is never shown as cleared");
-  assert.equal(v.label, "CAR 1", "the class name is still on the item for the record");
+  // The vehicle chip names the vehicle, so a busy frame reads "CAR / BIKE /
+  // CAR" at a glance. The verdict is carried by the chip's colour until a read
+  // lands, so an unread car is visible as "still grey" without ever claiming it
+  // is not stolen.
+  assert.equal(v.chip, "CAR", "the chip names the class, not the verdict");
+  assert.equal(v.chipFill, VEHICLE_CHIP_FILL.SCANNING, "grey until the read comes back");
+  assert.equal(v.label, "CAR 1", "the tracker's numbered label is still on the item");
 });
 
-test("a vehicle label follows its plate's verdict, and only STOLEN is red", () => {
+test("a vehicle chip names the class, and spells out a verdict that needs action", () => {
   const cases = [
-    { state: "STOLEN", chip: "STOLEN", fill: "#FF1F1F", border: "#FF1F1F" },
-    { state: "POSSIBLE", chip: "POSSIBLE", fill: "#F59E0B", border: "#F59E0B" },
-    { state: "CLEAR", chip: "NOT STOLEN", fill: VEHICLE_COLOR, border: VEHICLE_COLOR },
-    { state: "UNREAD", chip: "UNREAD", fill: "#9CA3AF", border: VEHICLE_COLOR },
+    { state: "STOLEN", chip: "CAR STOLEN", fill: "#FF1F1F", border: "#FF1F1F" },
+    { state: "POSSIBLE", chip: "CAR POSSIBLE", fill: "#F59E0B", border: "#F59E0B" },
+    { state: "CLEAR", chip: "CAR", fill: VEHICLE_COLOR, border: VEHICLE_COLOR },
+    { state: "UNREAD", chip: "CAR", fill: "#9CA3AF", border: VEHICLE_COLOR },
   ];
   for (const c of cases) {
     const state = createOverlayState();
@@ -213,7 +218,7 @@ test("a vehicle label follows its plate's verdict, and only STOLEN is red", () =
       verdict: { state: c.state, plate: "MH12JK4567", confidence: 0.9, reads: 1 },
     }, 1050);
     const v = selectItems(state, PREVIEW, "cover", 1200).find((i) => i.kind === "vehicle");
-    assert.equal(v.chip, c.chip, `${c.state}: the vehicle box is labelled with the verdict`);
+    assert.equal(v.chip, c.chip, `${c.state}: the vehicle chip reads class + verdict`);
     assert.equal(v.chipFill, c.fill, `${c.state}: chip fill`);
     assert.equal(v.color, c.border, `${c.state}: border colour`);
     assert.equal(v.stolen, c.state === "STOLEN", `${c.state}: only STOLEN pulses`);
@@ -430,7 +435,34 @@ test("a track that changes class keeps its id and takes the new label", () => {
   seed(state, [{ track: 4, label: "BUS 1", box: [0.2, 0.2, 0.6, 0.6] }]);
   assert.equal(state.vehicles.size, 1, "same car, not a new one");
   assert.equal(selectItems(state, PREVIEW, "cover", 1200)[0].label, "BUS 1");
-  assert.equal(selectItems(state, PREVIEW, "cover", 1200)[0].chip, "SCANNING", "no read yet");
+  assert.equal(selectItems(state, PREVIEW, "cover", 1200)[0].chip, "BUS", "the new class is on the chip");
+});
+
+test("a vehicle chip is the class word: CAR / BIKE / BUS / TRUCK, never the number", () => {
+  const state = createOverlayState();
+  seed(state, [
+    { track: 1, label: "CAR 1", cls: 2, box: [0.02, 0.02, 0.12, 0.12] },
+    { track: 2, label: "BIKE 1", cls: 3, box: [0.20, 0.02, 0.30, 0.12] },
+    { track: 3, label: "BUS 1", cls: 5, box: [0.40, 0.02, 0.50, 0.12] },
+    { track: 4, label: "TRUCK 1", cls: 7, box: [0.60, 0.02, 0.70, 0.12] },
+  ]);
+  const byId = new Map(selectItems(state, PREVIEW, "cover", 1000).map((i) => [i.id, i.chip]));
+  assert.equal(byId.get("1"), "CAR");
+  assert.equal(byId.get("2"), "BIKE");
+  assert.equal(byId.get("3"), "BUS");
+  assert.equal(byId.get("4"), "TRUCK");
+});
+
+test("the class word falls back to the id table, then to a generic, never a guess", () => {
+  // The label is the tracker's, so it wins over the id.
+  assert.equal(classWord("CAR 12", 3), "CAR");
+  // An orphan plate has no label; the class id is all there is.
+  assert.equal(classWord(null, 3), "BIKE");
+  assert.equal(classWord(null, 2), "CAR");
+  // A class outside the table (a swapped checkpoint) must not be invented.
+  assert.equal(classWord(null, 99), "VEHICLE");
+  assert.equal(classWord(null, null), "VEHICLE");
+  assert.equal(classWord("", undefined), "VEHICLE");
 });
 
 test("the box is drawn where the car will be when the slide finishes", () => {

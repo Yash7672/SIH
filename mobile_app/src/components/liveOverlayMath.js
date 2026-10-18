@@ -36,14 +36,16 @@ export const STATE_COLORS = {
   UNREAD: "#9CA3AF",
 };
 
-// What the chip above a *vehicle* box says. One word per verdict state, using
-// the same vocabulary the dashboards use so a volunteer never has to learn a
-// private one.
+// The verdict vocabulary, using the same words the dashboards use so a volunteer
+// never has to learn a private one. A vehicle chip leads with its *class* (see
+// `classWord`), so only the verdicts that need acting on - STOLEN and POSSIBLE -
+// are spelled out after the class; the ordinary case is just "CAR".
 //
 // SCANNING is deliberately its own state. A car the detector has seen but not
 // yet read is not "NOT STOLEN" - printing that would clear a vehicle nobody has
-// actually looked at. Until the server returns a verdict, the chip says we are
-// still reading it.
+// actually looked at. Until the server returns a verdict the chip stays grey
+// (see `VEHICLE_CHIP_FILL`), so "still reading" is visible without a word that
+// would push the class name off a narrow box.
 export const VERDICT_WORDS = {
   STOLEN: "STOLEN",
   POSSIBLE: "POSSIBLE",
@@ -54,6 +56,47 @@ export const VERDICT_WORDS = {
 // The one state that is not a server verdict: a detected vehicle whose plate
 // read has not come back yet.
 export const SCANNING = "SCANNING";
+
+// Detector class id -> the word a vehicle chip leads with, mirroring the
+// server's CLASS_LABELS (`backend/app/ws/scan_manager.py`). The id table is only
+// a fallback: the tracker already sends `label` ("CAR 1"), and a class the two
+// sides spell differently would be a bug, so the label wins when it is present.
+export const CLASS_IDS = {
+  2: "CAR",
+  3: "BIKE",
+  5: "BUS",
+  7: "TRUCK",
+};
+const CLASS_NAMES = {
+  car: "CAR",
+  motorcycle: "BIKE",
+  bus: "BUS",
+  truck: "TRUCK",
+};
+// An orphan plate - a plate-shaped detection with no vehicle around it - arrives
+// with `label: null`. Something was detected but its class is genuinely unknown,
+// so the chip says so rather than guessing "CAR".
+export const UNKNOWN_CLASS = "VEHICLE";
+
+/**
+ * The class word for a vehicle chip: "CAR" over a car, "BIKE" over a bike.
+ *
+ * The server's label ("CAR 1") already starts with the class and every tracked
+ * vehicle has one, so it is the source of truth; the class id and the detector's
+ * own class name are fallbacks for a message that arrives without it.
+ */
+export function classWord(label, cls) {
+  const fromLabel = String(label ?? "").replace(/\s*\d+$/, "").trim();
+  if (fromLabel) return fromLabel.toUpperCase();
+  if (typeof cls === "number") return CLASS_IDS[cls] || UNKNOWN_CLASS;
+  if (typeof cls === "string") {
+    const name = cls.trim().toLowerCase();
+    if (CLASS_NAMES[name]) return CLASS_NAMES[name];
+    if (name) return name.toUpperCase();
+  }
+  return UNKNOWN_CLASS;
+}
+
 // Chip fill for a vehicle box. Green is the ordinary road, red is a confirmed
 // hot-list match, amber is "look again", grey is "not read yet".
 export const VEHICLE_CHIP_FILL = {
@@ -425,7 +468,15 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
     // painted as cleared.
     const plate = state.plates.get(id);
     const vState = plate && plate.state ? plate.state : SCANNING;
-    const word = VERDICT_WORDS[vState] || VERDICT_WORDS[SCANNING];
+    // The chip names the vehicle - "CAR" over a car, "BIKE" over a bike - so a
+    // busy frame can be read at a glance. The verdict is carried by the chip/box
+    // colour, and the two states that need acting on also spell it out, so the
+    // ordinary case stays short instead of a wall of "NOT STOLEN".
+    const cls = classWord(rec.label, rec.cls);
+    const chip =
+      vState === "STOLEN" || vState === "POSSIBLE"
+        ? `${cls} ${VERDICT_WORDS[vState]}`
+        : cls;
     vehicles.push({
       key: `v:${id}`,
       id,
@@ -440,7 +491,7 @@ export function selectItems(state, preview, mode = "cover", now = 0) {
       rect,
       area: area(rec.box),
       label: rec.label,
-      chip: word,
+      chip,
       chipBelow: false,
       score: rec.score,
       fading: Boolean(rec.fading),

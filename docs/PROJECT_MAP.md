@@ -283,7 +283,7 @@ Protocol — **three** replies per frame, not one, and the split is the whole de
 | `src/services/liveCapture.js` | `LiveCaptureLoop` — one async loop, never two captures at once. Deps injected so the pacing logic is testable off-device. PART C: `captureOptions` + `zone` params, `setCaptureOptions`/`setZone` setters (never restart the loop), `_cropToZone()` for the phone-side read zone, `onZoneFrame` for overlay re-anchoring. |
 | `src/services/liveScan.js` | The socket. One instance, StrictMode-safe, re-auth on token refresh, seq-gated acks. |
 | `src/components/liveOverlayStore.js` | External store (`useSyncExternalStore`) holding the current boxes. |
-| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 45 unit tests, no React, no native. PART C: `zoneTransform` / `applyZone` / `updateZoneImage` let a committed read zone re-map server boxes into the zone's screen rectangle. Joins each vehicle track with its plate track (same id) so the vehicle chip can read STOLEN / POSSIBLE / NOT STOLEN / SCANNING. |
+| `src/components/liveOverlayMath.js` | Pure normalised→screen projection. 47 unit tests, no React, no native. PART C: `zoneTransform` / `applyZone` / `updateZoneImage` let a committed read zone re-map server boxes into the zone's screen rectangle. Joins each vehicle track with its plate track (same id) so the vehicle chip can lead with the class (CAR / BIKE / BUS / TRUCK) and add the verdict (STOLEN / POSSIBLE) once the read lands. |
 | `src/components/LiveDetectionOverlay.js` | Draws the rectangles and the chip above each box. Reads the store directly. |
 
 The decisions that are load-bearing, and would be easy to undo by accident:
@@ -310,14 +310,21 @@ The decisions that are load-bearing, and would be easy to undo by accident:
   On Android `pictureSize` also feeds the Preview `ResolutionSelector`
   (`ExpoCameraView.kt` builds one selector and hands it to both use cases), so a
   narrower capture would blur the preview as well — two reasons for the same floor.
-- **The chip over a vehicle box is the verdict, not the class name.** A vehicle and
-  its plate share the server's track id (positive ids only; orphan plates are
-  negative), so `selectItems` joins them and labels every vehicle box
-  STOLEN (red) / POSSIBLE (amber) / NOT STOLEN (green) / UNREAD when the read comes
-  back, and **SCANNING** (grey) until it does. A detected car whose plate has not
-  been read is deliberately *not* shown as NOT STOLEN: printing that would clear a
-  vehicle nobody actually looked at. The border follows the same verdict, so a
+- **The chip over a vehicle box names the vehicle; the colour carries the verdict.**
+  The chip leads with the detector's own class word - **CAR / BIKE / BUS / TRUCK**,
+  so a frame with several vehicles can be read at a glance - and the verdict is
+  carried by the chip and box colour: green (ordinary), amber (POSSIBLE), red
+  (STOLEN), grey while the plate has not been read yet. A vehicle and its plate
+  share the server's track id (positive ids only; orphan plates are negative), so
+  `selectItems` joins them; the states that need acting on are also spelled out,
+  "CAR STOLEN" / "CAR POSSIBLE", while the ordinary case stays just "CAR". A
+  detected car whose plate has not been read is deliberately *not* shown as
+  cleared: its chip stays grey and never says NOT STOLEN, because that would clear
+  a vehicle nobody actually looked at. The border follows the same verdict, so a
   confirmed hot-list match is red box + red label, and a stolen track pulses.
+  The class word comes from the tracker's `label` ("CAR 1"), with the class id
+  table as a fallback; an orphan plate with no label reads **VEHICLE** rather
+  than guessing a car.
 
 ### PART C — zoom, read zone, quality presets (fixed-camera aiming)
 
