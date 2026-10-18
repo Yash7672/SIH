@@ -145,6 +145,17 @@ paths into the dashboard's feed look identical. `AlertEvent` in
 `police_dashboard/src/services/api.ts` types the new fields as optional, since rows
 written before this change do not carry them.
 
+Both sites fire on **every** detection of a listed plate at or above
+`ALERT_MIN_CONFIDENCE` (0.60), not once per cooldown: a cop watching the portal has
+to see the car while it is still in view. The 60 s `DETECTION_COOLDOWN_SECONDS`
+still throttles the *sighting row* (one per plate+device per minute), so a repeat
+alert carries `sighting_id: null` and a fresh timestamp — which is what the
+dashboard keys on to render it as a new event instead of a replay. Below the floor
+nothing pages the portal; the plate row (evidence for the timeline and heat layer)
+is still written when a hot-list match occurred. Reads per vehicle track are
+bounded (`MAX_READ_ATTEMPTS`, settle at `PLATE_CONF_DONE`), so "every detection"
+cannot turn into per-frame spam.
+
 `SightingOut` exposes `plate` and `camera` as **derived** properties on the model
 (`Sighting.plate`, `Sighting.camera`), not columns. There is deliberately no `plate`
 column on `sightings` — the plate belongs to the hot-list entry and duplicating it
@@ -491,7 +502,7 @@ PC on the network.
 | `test_health.py` | healthz |
 | `test_plate.py` | plate normalisation, state-code whitelist |
 | `test_privacy.py` | 415 on video/multipart, no imagery columns on `sightings`, `/ws/scan` auth gate |
-| `test_sightings.py` | hot-list match, cooldown suppression, last-seen update, police WS alert |
+| `test_sightings.py` | hot-list match, row cooldown suppression, repeat-detection re-alert, below-floor silence, last-seen update, police WS alert |
 | `test_geo.py` | `/geo/heat` RBAC, bbox / window / class validation, hour-bucket window trap |
 | `test_heat_layers.py` | per-frame density, min-frames threshold, time decay, no-attribution |
 | `test_traffic_grid.py` | cell maths, GPS-fix rejection, batching, failed-flush retention, retention sweep |
@@ -502,7 +513,7 @@ PC on the network.
 | `test_char_verifier.py` | per-character verifier vs consensus-only fallback (verdict rules) |
 | `test_plate_reader.py` | plate-reader variants + per-char confidence path |
 | `test_plate_verdict.py` | verdict state machine: CLEAR / POSSIBLE / STOLEN, corroboration window, hot-list gating |
-| `test_stolen_chain.py` | hot-list detect → STOLEN verdict → `/ws/police` alert → sighting row, end to end |
+| `test_stolen_chain.py` | hot-list detect → STOLEN verdict → `/ws/police` alert on every read (row still 60 s-throttled) → sighting row, end to end |
 | `test_live_scan_hires.py` | hi-res on-demand: the one-off capture keeps its pixels, marking, budget interplay |
 | `test_stream_source.py` | stream sources: repo-root-anchored defaults, kind validation, lat/lng parsing, latest-frame-wins, reconnect backoff |
 
