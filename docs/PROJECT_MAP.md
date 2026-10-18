@@ -639,7 +639,7 @@ Lazy-loaded one-per-page in `src/App.tsx`, sidebar defined in `src/components/La
 | `/complaints` | Complaints | |
 | `/hotlist` | Hotlist | |
 | `/search`, `/vehicles/:plate` | Vehicle Search / Detail | Detail's `VehicleMap.tsx` untouched |
-| `/analytics` | Analytics | Recharts behind its own chunk; lazy "OCR Model" tab (`src/pages/analytics/OcrModelTab.tsx`) shows the measured OCR report |
+| `/analytics` | Analytics | Recharts behind its own chunk; lazy "OCR Model" tab (`src/pages/analytics/OcrModelTab.tsx`) shows the measured OCR report: accuracy-vs-error-rate and confidence charts, errors-by-type (substitution/deletion/insertion), weakest characters, and the character confusion matrix |
 | `/admin` | Admin | ADMIN only |
 
 `leaflet.heat@0.2.0` is pinned exact and is the only dependency added. It ships no types, so

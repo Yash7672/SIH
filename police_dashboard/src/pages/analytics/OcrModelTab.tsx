@@ -9,6 +9,7 @@ import {
   Tooltip,
   XAxis,
   YAxis,
+  type TooltipProps,
 } from "recharts";
 import { AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { fetchOcrReport, type OcrNoReport, type OcrReport, type OcrSetMetrics } from "../../services/api";
@@ -27,6 +28,9 @@ import { useTheme } from "../../hooks/useTheme";
 
 const PILL_ACTIVE = "rounded-md bg-surface-card px-3 py-1.5 text-xs font-medium text-surface-text shadow";
 const PILL_IDLE = "rounded-md px-3 py-1.5 text-xs font-medium text-surface-muted hover:text-surface-text";
+
+/** The "missing or extra" bucket the metric maths folds deletions/insertions into. */
+const MISSING_LABEL = "\u2205";
 
 function pct(value: number | null | undefined, digits = 1): string {
   return value == null ? "—" : `${(value * 100).toFixed(digits)}%`;
@@ -60,19 +64,58 @@ function useTooltipStyle() {
   );
 }
 
-function AccuracyBySet({ sets }: { sets: OcrSetMetrics[] }) {
+/**
+ * Per-dataset plate accuracy and its complement, the error rate: one green
+ * series that must clear 90%, one red series that must stay under 10%. Sets
+ * with no samples are dropped - a 0-height bar there would be a lie, not a
+ * measurement.
+ */
+function AccuracyVsError({ sets, target }: { sets: OcrSetMetrics[]; target: OcrReport["target"] }) {
   const { ready } = useTheme();
   const tooltipStyle = useTooltipStyle();
   const data = useMemo(
     () =>
-      sets.map((s) => ({
-        name: s.name,
-        accuracy: s.plate_accuracy == null ? 0 : s.plate_accuracy * 100,
-        n: s.n,
-      })),
+      sets
+        .filter((s) => s.n > 0 && s.plate_accuracy != null)
+        .map((s) => {
+          const accuracy = (s.plate_accuracy as number) * 100;
+          return {
+            name: s.name,
+            accuracy,
+            error: Math.max(0, 100 - accuracy),
+            n: s.n,
+          };
+        }),
     [sets]
   );
+  const targetPct = target.value * 100;
+  const tooltip = useMemo(
+    () =>
+      ({ active, payload, label }: TooltipProps<number, string>) =>
+        !active || !payload?.length ? null : (
+          <div style={tooltipStyle} className="px-3 py-2">
+            <p className="mb-1 text-xs font-medium capitalize">{label}</p>
+            {payload
+              .filter((p) => p.dataKey === "accuracy" || p.dataKey === "error")
+              .map((p) => (
+                <p key={p.dataKey} className="text-xs">
+                  <span style={{ color: p.color, fontWeight: 600 }}>
+                    {p.dataKey === "accuracy" ? "Accuracy" : "Error rate"}
+                  </span>{" "}
+                  {p.value == null ? "—" : `${(p.value as number).toFixed(1)}%`}
+                </p>
+              ))}
+            <p className="mt-1 text-[10px] opacity-70">n = {payload[0].payload?.n ?? 0}</p>
+          </div>
+        ),
+    [tooltipStyle]
+  );
   if (!ready) return <div className="h-72 p-4" />;
+  if (data.length === 0) {
+    return (
+      <p className="h-72 p-4 text-sm text-surface-muted">No evaluation set had any samples.</p>
+    );
+  }
   return (
     <div className="h-72 p-4">
       <ResponsiveContainer width="100%" height="100%">
@@ -91,19 +134,152 @@ function AccuracyBySet({ sets }: { sets: OcrSetMetrics[] }) {
             tickLine={false}
             axisLine={false}
           />
-          <Tooltip cursor={{ fill: "var(--row-hover)" }} contentStyle={tooltipStyle} />
+          <Tooltip cursor={{ fill: "var(--row-hover)" }} content={tooltip} />
           <ReferenceLine
-            y={90}
+            y={targetPct}
             stroke="var(--warning)"
             strokeDasharray="6 4"
             label={{
-              value: "90% target",
+              value: `${targetPct}% target`,
               position: "insideTopRight",
               fill: "var(--surface-muted)",
               fontSize: 10,
             }}
           />
-          <Bar dataKey="accuracy" name="Plate accuracy" fill="var(--solid)" radius={[6, 6, 0, 0]} maxBarSize={64} />
+          <Bar dataKey="accuracy" name="Plate accuracy" fill="var(--success)" radius={[6, 6, 0, 0]} maxBarSize={40} />
+          <Bar dataKey="error" name="Error rate" fill="var(--danger)" radius={[6, 6, 0, 0]} maxBarSize={40} />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+/** Substitutions vs deletions vs insertions, read straight off the matrix. */
+function ErrorComposition({ confusion }: { confusion: OcrReport["confusion"] }) {
+  const { ready } = useTheme();
+  const tooltipStyle = useTooltipStyle();
+  const data = useMemo(() => {
+    const missing = confusion.labels.indexOf(MISSING_LABEL);
+    let substitutions = 0;
+    let deletions = 0;
+    let insertions = 0;
+    confusion.counts.forEach((row, i) => {
+      row.forEach((count, j) => {
+        if (!count) return;
+        if (i === missing && j === missing) return;
+        if (i === missing) insertions += count;
+        else if (j === missing) deletions += count;
+        else if (i !== j) substitutions += count;
+      });
+    });
+    return [
+      { name: "Substitution", count: substitutions, hint: "wrong character read" },
+      { name: "Deletion", count: deletions, hint: "character missed" },
+      { name: "Insertion", count: insertions, hint: "character invented" },
+    ];
+  }, [confusion]);
+  const total = data.reduce((a, b) => a + b.count, 0);
+  if (!ready) return <div className="h-72 p-4" />;
+  if (total === 0) {
+    return (
+      <div className="flex h-72 flex-col items-center justify-center gap-1 p-4 text-center">
+        <CheckCircle2 className="h-6 w-6 text-success" aria-hidden />
+        <p className="text-sm text-surface-text">No character errors to break down.</p>
+        <p className="text-xs text-surface-muted">Every aligned character matched.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="h-72 p-4">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} layout="vertical" margin={{ top: 8, right: 24, left: 8, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" horizontal={false} />
+          <XAxis
+            type="number"
+            allowDecimals={false}
+            tick={{ fill: "var(--chart-axis)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: "var(--chart-grid)" }}
+          />
+          <YAxis
+            type="category"
+            dataKey="name"
+            width={90}
+            tick={{ fill: "var(--chart-axis)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={false}
+          />
+          <Tooltip
+            cursor={{ fill: "var(--row-hover)" }}
+            contentStyle={tooltipStyle}
+            formatter={(value: number, _name, item) => [
+              `${value} (${((value / total) * 100).toFixed(0)}% of errors)`,
+              item?.payload?.hint ?? "Errors",
+            ]}
+          />
+          <Bar dataKey="count" fill="var(--danger)" radius={[0, 6, 6, 0]} maxBarSize={36} />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+/** Per-character accuracy (recall), worst first, so weak glyphs stand out. */
+function WeakestCharacters({ perChar }: { perChar: OcrReport["confusion"]["per_char"] }) {
+  const { ready } = useTheme();
+  const tooltipStyle = useTooltipStyle();
+  const data = useMemo(
+    () =>
+      perChar
+        .filter((c) => c.support > 0)
+        .map((c) => ({ char: c.char, accuracy: c.recall * 100, support: c.support }))
+        .sort((a, b) => a.accuracy - b.accuracy || b.support - a.support)
+        .slice(0, 14),
+    [perChar]
+  );
+  const height = Math.max(240, data.length * 26 + 40);
+  if (!ready) return <div className="h-72 p-4" />;
+  if (data.length === 0) {
+    return <p className="p-4 text-sm text-surface-muted">No character had any labelled support.</p>;
+  }
+  return (
+    <div className="p-4" style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} layout="vertical" margin={{ top: 4, right: 40, left: 4, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" horizontal={false} />
+          <XAxis
+            type="number"
+            domain={[0, 100]}
+            unit="%"
+            tick={{ fill: "var(--chart-axis)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: "var(--chart-grid)" }}
+          />
+          <YAxis
+            type="category"
+            dataKey="char"
+            width={40}
+            tick={{ fill: "var(--chart-axis)", fontSize: 12, fontFamily: "monospace" }}
+            tickLine={false}
+            axisLine={false}
+          />
+          <Tooltip
+            cursor={{ fill: "var(--row-hover)" }}
+            contentStyle={tooltipStyle}
+            formatter={(value: number, _name, item) => [
+              item?.payload?.support
+                ? `${value.toFixed(1)}% on ${item.payload.support} sample${item.payload.support === 1 ? "" : "s"}`
+                : "—",
+              "Character accuracy",
+            ]}
+          />
+          <ReferenceLine
+            x={90}
+            stroke="var(--warning)"
+            strokeDasharray="6 4"
+            label={{ value: "90%", position: "top", fill: "var(--surface-muted)", fontSize: 10 }}
+          />
+          <Bar dataKey="accuracy" fill="var(--solid)" radius={[0, 6, 6, 0]} maxBarSize={18} />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -542,10 +718,10 @@ export default function OcrModelTab() {
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader
-            title="Accuracy by dataset"
-            subtitle={`Exact plate matches, dashed line is the 90% target. Real n=${realSet?.n ?? 0}, synthetic n=${syntheticSet?.n ?? 0}.`}
+            title="Plate accuracy vs error rate by dataset"
+            subtitle={`Exact plate matches (green) and 1 − accuracy (red); dashed line is the ${(target.value * 100).toFixed(0)}% target. Real n=${realSet?.n ?? 0}, synthetic n=${syntheticSet?.n ?? 0}.`}
           />
-          <AccuracyBySet sets={sets} />
+          <AccuracyVsError sets={sets} target={target} />
         </Card>
         <Card>
           <CardHeader
@@ -561,6 +737,23 @@ export default function OcrModelTab() {
               <span className="h-2 w-2 rounded-sm bg-danger" aria-hidden /> wrong or no read
             </span>
           </p>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <Card>
+          <CardHeader
+            title="Character errors by type"
+            subtitle="Substitutions, deletions and insertions, taken from the Levenshtein alignment."
+          />
+          <ErrorComposition confusion={confusion} />
+        </Card>
+        <Card>
+          <CardHeader
+            title="Weakest characters"
+            subtitle="Per-character accuracy (recall), worst first; dashed line is the 90% target."
+          />
+          <WeakestCharacters perChar={confusion.per_char} />
         </Card>
       </div>
 
