@@ -6,14 +6,15 @@ Run from the repo root with the backend up (start.bat):
     python scripts/stream_camera.py --source demo_road
     python scripts/stream_camera.py --source phone_ip_camera ^
         --username volunteer@example.com --password "Volunteer@123"
-    python scripts/stream_camera.py --spec "{\"kind\":\"video\",\"path\":\"data/generated/demo_road.mp4\",\"loop\":true}"
+    python scripts/stream_camera.py --source "{\"kind\":\"video\",\"path\":\"data/generated/demo_road.mp4\",\"loop\":true}"
 
 What it does, in order
 ----------------------
 1. Resolves the source (registered name in config/stream_sources.json, or an
    inline JSON spec) and opens it -> prints SOURCE CONFIRMED with resolution.
-2. Logs in (or takes --token) and opens ws://<api>/api/v1/ws/scan, sending the
-   same {type: auth} first message the phone sends -> prints
+2. Registers the camera as a device (unless --device-id is given), then logs
+   in (or takes --token) and opens ws://<api>/api/v1/ws/scan with the same
+   {type: auth} first message the phone sends -> prints
    WS /ws/scan CONFIRMED only after the server's {type: ready} reply.
 3. Pumps frames: latest-frame-wins. While the server owes an answer for the
    frame in flight, newer source frames are dropped rather than queued, so the
@@ -55,6 +56,7 @@ from backend.stream_source import (  # noqa: E402
 
 WS_PATH = "/api/v1/ws/scan"
 LOGIN_PATH = "/api/v1/auth/login"
+DEVICES_PATH = "/api/v1/devices/register"
 # The phone releases a frame slot 1.5 s after sending if no reply arrived; a
 # fixed camera should behave the same so a lost reply cannot wedge the stream.
 UNANSWERED_MS = 1.5
@@ -82,6 +84,30 @@ def fetch_token(api_base: str, username: str, password: str) -> str:
         if not token:
             raise SystemExit("login returned no access_token")
         return token
+
+
+def register_device(api_base: str, token: str, name: str) -> str:
+    """Register the camera as a scanner, exactly the way the phone does.
+
+    This is not cosmetic. `sightings.device_id` is not nullable, so a session
+    that authenticates without a device cannot have its detections recorded -
+    and the server cannot page the police for a detection it cannot write down.
+    A camera that skips this step runs perfectly, prints the STOLEN verdict, and
+    silently raises nothing.
+    """
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.post(
+            api_base.rstrip("/") + DEVICES_PATH,
+            json={"device_type": "fixed-camera", "device_name": name[:120]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if resp.status_code != 200:
+            detail = resp.json().get("detail", "unknown") if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:200]
+            raise SystemExit(f"device registration failed ({resp.status_code}): {detail}")
+        device_id = resp.json().get("id")
+        if not device_id:
+            raise SystemExit("device registration returned no id")
+        return device_id
 
 
 class ScanPump:
@@ -195,6 +221,7 @@ class ScanPump:
 async def run_session(
     api_base: str,
     token: str,
+    device_id: str,
     source: StreamSource,
     lat: float,
     lng: float,
@@ -211,9 +238,10 @@ async def run_session(
                         {
                             "type": "auth",
                             "token": token,
-                            # A fixed camera is not a registered volunteer
-                            # device; sighting attribution is simply skipped.
-                            "device_id": None,
+                            # A fixed camera is a scanner like any other, so it
+                            # claims a device. Without one the server has nowhere
+                            # to write the sighting and never pages the police.
+                            "device_id": device_id,
                         }
                     )
                 )
@@ -271,6 +299,10 @@ async def main_async(args) -> int:
     print(f"SOURCE CONFIRMED: {source.describe()} (first frame {len(jpeg)} bytes)")
 
     token = args.token or fetch_token(args.api, args.username, args.password)
+    # Registered once per run, like the simulator does. The name is what the
+    # police dashboard shows as the camera that saw the car.
+    device_id = args.device_id or register_device(args.api, token, f"Fixed camera ({name})")
+    print(f"DEVICE: {device_id}")
     stats: dict = {
         "sent": 0,
         "dropped": 0,
@@ -281,7 +313,7 @@ async def main_async(args) -> int:
     }
     try:
         await run_session(
-            args.api, token, source, args.lat, args.lng, args.max_frames, stats
+            args.api, token, device_id, source, args.lat, args.lng, args.max_frames, stats
         )
     finally:
         source.close()
@@ -303,13 +335,18 @@ def main() -> int:
     ap.add_argument("--username", default=os.getenv("STREAM_USERNAME", "volunteer@example.com"))
     ap.add_argument("--password", default=os.getenv("STREAM_PASSWORD", "Volunteer@123"))
     ap.add_argument("--token", default=os.getenv("STREAM_TOKEN", ""))
+    ap.add_argument(
+        "--device-id",
+        default=os.getenv("STREAM_DEVICE_ID", ""),
+        help="reuse an existing device instead of registering a new one",
+    )
     ap.add_argument("--lat", type=float, default=0.0)
     ap.add_argument("--lng", type=float, default=0.0)
     ap.add_argument("--max-frames", type=int, default=0, help="stop after N sent frames (0 = run)")
     args = ap.parse_args()
 
     if not args.list_sources and not args.source:
-        print("use --source <name> (see --list-sources) or --spec JSON")
+        print("use --source <name> (see --list-sources) or an inline JSON spec")
         return 2
 
     try:

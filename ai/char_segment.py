@@ -81,6 +81,19 @@ MIN_SEG_W_FRAC = 0.40
 MAX_SEG_W_FRAC = 2.20
 MAX_DP_CANDIDATES = 48  # keeps the fallback dynamic program tiny
 
+# ---- "is this crop a plate panel at all?" ----------------------------------
+# `_ink_mask` works by finding the background and calling whatever is far from
+# it ink, which is only meaningful when the characters are a minority of the
+# crop - the assumption the module is built on. A detector crop is the plate box
+# plus a margin, and that margin is whatever sits behind the plate: on a dark car
+# that is dark paint, which is as dark as the glyphs, so *no* brightness cut can
+# separate them and "far from the background" floods the entire margin. The mask
+# then describes the surrounding paint, not the characters, and any split built
+# on it is fiction. Above this share of ink the crop is refused outright, which
+# the caller reads as "unverified" and answers with the consensus rule rather
+# than with a verdict invented from a split nobody can justify.
+MAX_MASK_INK_FRAC = 0.35
+
 # ---- de-fusing a blob that swallowed a character ---------------------------
 _VALLEY_FRAC = 0.30  # a seam dips below this fraction of the profile's peak
 _MAX_SPLIT_DEPTH = 4  # bounds the recursion when a blob is welded shut
@@ -655,6 +668,8 @@ def _boxes(crop_bgr: np.ndarray, ocr_str: str) -> Optional[List[Box]]:
         return None
 
     mask = _ink_mask(gray)
+    if float((mask > 0).sum()) > MAX_MASK_INK_FRAC * h * w:
+        return None
     comps, grow, _any = _glyph_candidates(mask, h, w, want)
     if not comps:
         return None

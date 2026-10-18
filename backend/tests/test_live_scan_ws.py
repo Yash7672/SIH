@@ -600,6 +600,64 @@ def test_a_hotlisted_plate_is_recorded_and_alerted(
 
     assert [event for event, _payload in broadcasts] == ["hotlist_detection"]
     assert broadcasts[0][1]["plate"] == HOTLISTED_PLATE
+    assert broadcasts[0][1].get("needs_review") is False
+
+
+def test_a_sixty_percent_read_still_reaches_the_cop_portal(
+    client, demo_tokens, one_car, register_device, hotlisted, monkeypatch
+):
+    """A 60% read of a listed plate must not sit silent, and must not lie.
+
+    One unverified read at 0.60 is correctly *not* enough for the STOLEN
+    verdict (the phone stays on its amber POSSIBLE banner), but the cop portal
+    is woken anyway, flagged ``needs_review`` - the alert a human can act on by
+    *checking*, without the dashboard ever claiming a proven hit. No sighting
+    row is written, so the corroborated STOLEN alert that follows seconds later
+    is never swallowed by the cooldown this one uses.
+    """
+    from app.db.session import SessionLocal
+    from app.models import Sighting
+
+    # 0.60, unverified: below the single-read bar, so the verdict stays POSSIBLE.
+    monkeypatch.setattr(ls, "run_ocr", _read(HOTLISTED_PLATE, conf=0.60))
+    broadcasts = []
+
+    async def _fake_broadcast(event, payload):
+        broadcasts.append((event, payload))
+
+    monkeypatch.setattr(ls.alert_manager, "broadcast", _fake_broadcast)
+
+    device_id = register_device("SixtyCam")
+
+    db = SessionLocal()
+    try:
+        before = db.query(Sighting).count()
+    finally:
+        db.close()
+
+    with client.websocket_connect("/api/v1/ws/scan") as ws:
+        _auth(ws, demo_tokens["volunteer"], device_id=device_id)
+        ws.send_json(_frame(1))
+        plate, seen = _drain(ws, "plate", limit=6, timeout=10.0)
+
+    assert plate is not None, f"no plate message; saw {[m.get('type') for m in seen]}"
+    assert plate["stolen"] is False, "a 60% read must not raise the STOLEN banner"
+    assert plate["verdict"]["state"] == "POSSIBLE"
+
+    assert [event for event, _payload in broadcasts] == ["hotlist_detection"]
+    payload = broadcasts[0][1]
+    assert payload["plate"] == HOTLISTED_PLATE
+    assert payload["needs_review"] is True, "the dashboard must be told to verify"
+    assert payload["confidence"] == pytest.approx(0.60)
+
+    db = SessionLocal()
+    try:
+        assert db.query(Sighting).count() == before, (
+            "a review alert must not write a sighting row: it would arm the "
+            "cooldown that the corroborated STOLEN alert depends on"
+        )
+    finally:
+        db.close()
 
 
 def test_an_unreadable_plate_still_draws_the_vehicle(client, demo_tokens, one_car, monkeypatch):

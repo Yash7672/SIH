@@ -292,14 +292,30 @@ def test_a_reported_plate_is_flagged_within_three_seconds_and_alerted_once(
     assert vd["reason"], "a verdict without a reason cannot be argued with"
     assert stolen["police_alerted"] is True
 
-    # ---- and exactly once -------------------------------------------------
-    assert len(alerts) == 1, f"{len(alerts)} police alerts for one car"
-    assert alerts[0][0] == "hotlist_detection", alerts[0][0]
-    payload = alerts[0][1]
+    # ---- and exactly once, in two honest steps ----------------------------
+    # A 0.78 read is above the review floor, so the portal is first woken with
+    # `needs_review` while the verdict is still POSSIBLE, and woken again -
+    # without the flag - the moment the second read corroborates STOLEN. Two
+    # broadcasts, but only one *confirmed* alert and one sighting row: the
+    # review step writes nothing, so it can never eat the cooldown the
+    # confirmed step needs.
+    assert len(alerts) == 2, f"{len(alerts)} police alerts for one car"
+    for event, _payload in alerts:
+        assert event == "hotlist_detection", event
+    review_event, review_payload = alerts[0]
+    stolen_event, payload = alerts[1]
+    assert review_payload["needs_review"] is True, (
+        "the 0.78 read must reach the portal flagged for verification"
+    )
+    assert payload["needs_review"] is False, (
+        "the corroborated alert must not still say 'merely verify'"
+    )
+    assert payload["plate"] == REPORTED
     # The payload shape is what the police dashboard reads; this is the contract,
     # and the verdict work must not have changed it.
     for key in ("plate", "latitude", "longitude", "confidence", "hotlist_id"):
         assert key in payload, f"the alert lost `{key}`"
+        assert key in review_payload, f"the review alert lost `{key}`"
 
     assert _count_sightings(REPORTED) == before + 1
 
@@ -339,7 +355,12 @@ def test_more_frames_after_the_verdict_do_not_alert_again(
         seen = [m for m in _collect(ws, 6.0) if m.get("type") == "plate"]
 
     assert len(seen) >= 2, f"only {len(seen)} plate messages across five frames"
-    assert len(alerts) == 1, f"{len(alerts)} alerts across five frames of one parked car"
+    # One review alert (the first 0.79 read is above the review floor) and one
+    # confirmed STOLEN alert - and then silence. The throttle that matters is
+    # that neither may repeat, not that only one may exist.
+    assert len(alerts) == 2, f"{len(alerts)} alerts across five frames of one parked car"
+    assert alerts[0][1]["needs_review"] is True
+    assert alerts[1][1]["needs_review"] is False
     states = [m["verdict"]["state"] for m in seen]
     # The first read is not corroborated, so it is POSSIBLE; from the second
     # onwards the phone keeps being told the car is stolen. The banner must not
@@ -347,9 +368,54 @@ def test_more_frames_after_the_verdict_do_not_alert_again(
     # back on the strength of "we already told someone".
     assert states[-1] == "STOLEN", states
     assert "STOLEN" in states[1:], states
-    # Only the frame that earned the verdict may claim the alert was filed.
+    # Only the two frames that actually woke the portal may claim an alert was
+    # filed: the first read (review) and the corroborating one (confirmed).
     flagged = [m for m in seen if m["police_alerted"]]
-    assert len(flagged) == 1, f"{len(flagged)} frames claim to have filed the alert"
+    assert len(flagged) == 2, f"{len(flagged)} frames claim to have filed an alert"
+
+
+def test_a_camera_with_no_device_says_it_cannot_alert_and_does_not_claim_to(
+    client, demo_tokens, register_device, one_car, alerts, monkeypatch
+):
+    """A session that authenticates without a device must not claim it alerted.
+
+    `scripts/stream_camera.py` - the fixed-camera path the README walks through
+    - used to open the socket with `device_id: None`. The server accepted that
+    (`_device_allowed` allows an unidentified scanner), and the verdict was
+    right: the operator saw STOLEN on a listed car. But a sighting row is only
+    ever written for a device (`sightings.device_id` is not nullable), so there
+    was nothing to record, nothing to broadcast, and `police_alerted` came back
+    True regardless. The console printed POLICE-ALERTED while the police
+    dashboard stayed dark - the one claim the flag exists to make honestly.
+
+    The banner must survive: the car really is on the list, and the volunteer
+    looking at a stolen car is the person who most needs to know it.
+    """
+    complaint = _complaint(client, demo_tokens["citizen"], CITIZEN_TEXT)
+    _verify(client, demo_tokens["cop"], complaint["id"])
+    monkeypatch.setattr(
+        ls,
+        "run_ocr",
+        _stub_read(REPORTED, 0.79, char_confs=[0.99] * 10),
+    )
+
+    before = _count_sightings(REPORTED)
+    with client.websocket_connect("/api/v1/ws/scan") as ws:
+        assert _auth(ws, demo_tokens["volunteer"], None)["type"] == "ready"
+        seen = []
+        for seq in range(1, 6):
+            ws.send_json(_frame(seq))
+            time.sleep(0.08)
+        seen = [m for m in _collect(ws, 6.0) if m.get("type") == "plate"]
+
+    assert seen, "the camera never produced a read"
+    # The verdict is unaffected: the plate is genuinely on the list.
+    assert [m["verdict"]["state"] for m in seen][-1] == "STOLEN", seen[-1]["verdict"]
+    # What must not happen is the claim.
+    flagged = [m for m in seen if m["police_alerted"]]
+    assert not flagged, f"{len(flagged)} frames claimed to have paged the police without a device"
+    assert alerts == [], "a device-less session broadcast a police alert"
+    assert _count_sightings(REPORTED) == before, "a sighting was written without a device"
 
 
 # --------------------------------------------------------------------------- #
@@ -423,8 +489,13 @@ def test_a_zero_padded_report_still_pages_the_police(
     assert vd["matches"] == UNPADDED
     assert stolen["police_alerted"] is True
 
-    assert len(alerts) == 1, f"{len(alerts)} police alerts for one car"
+    # The 0.79 read is above the review floor, so the portal hears once while
+    # the verdict is still POSSIBLE (flagged `needs_review`) and once when the
+    # second frame confirms it - one confirmed alert, one sighting, either way.
+    assert len(alerts) == 2, f"{len(alerts)} police alerts for one car"
     assert alerts[0][0] == "hotlist_detection"
+    assert alerts[0][1]["needs_review"] is True
+    assert alerts[1][1]["needs_review"] is False
     assert _count_sightings(PADDED) == before + 1, "the sighting was not filed against the entry"
 
 

@@ -161,7 +161,7 @@ export interface Sighting {
 }
 
 export interface AlertEvent {
-  sighting_id: string;
+  sighting_id: string | null;
   plate: string;
   latitude: number;
   longitude: number;
@@ -172,6 +172,9 @@ export interface AlertEvent {
   camera?: string;
   device_id?: string;
   last_seen_at?: string | null;
+  /** True when the backend matched on a low-confidence read rather than a
+   *  corroborated verdict: show as "verify", never as a confirmed hit. */
+  needs_review?: boolean;
 }
 
 export interface Overview {

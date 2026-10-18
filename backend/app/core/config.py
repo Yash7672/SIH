@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     STREAM_SOURCES_PATH: str = "config/stream_sources.json"
 
     DETECTION_COOLDOWN_SECONDS: int = 60
+    # The cop portal is woken for an *exact* hot-list read at or above this
+    # confidence even when the verdict is only POSSIBLE (uncorroborated), so a
+    # 60% read gets a cop's eyes instead of nobody's. The alert is flagged
+    # `needs_review` and never raises the red STOLEN banner on the phone - a
+    # 60% read is worth reviewing, not worth rolling a unit on. Fuzzy
+    # near-misses to a different plate never alert, at any confidence.
+    ALERT_MIN_CONFIDENCE: float = 0.60
     MAX_UPLOAD_MB: int = 5
     RATE_LIMIT_DETECTIONS_PER_MINUTE: int = 60
     RATE_LIMIT_AUTH_PER_MINUTE: int = 20

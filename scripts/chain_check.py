@@ -282,6 +282,54 @@ def clear_hotlist(token: str, plate: str) -> int:
     return n
 
 
+def active_entries(token: str, plate: str) -> list[dict]:
+    """The ACTIVE/FIR_CONFIRMED rows for one plate, as the API reports them."""
+    r = requests.get(f"{API_V1}/hotlist", headers=auth(token), timeout=20)
+    r.raise_for_status()
+    return [
+        e
+        for e in r.json()
+        if e.get("plate") == plate and e.get("status") in ("ACTIVE", "FIR_CONFIRMED")
+    ]
+
+
+def restore_hotlist(token: str, plate: str, before: list[dict]) -> str:
+    """Put one plate back the way the run found it.
+
+    This script closes HOT_PLATE (twice) as part of the checks, and the fixture
+    plate is also the plate the demo seed lists with an FIR on file. Leaving it
+    closed made the portal read the demo car as Closed and silenced the live
+    alert for it, so whatever was captured at the start is put back at the end.
+    """
+    had_fir = any(e.get("status") == "FIR_CONFIRMED" for e in before)
+    fir_ref = next((e.get("fir_reference") for e in before if e.get("fir_reference")), None)
+    if not before:
+        # The run listed it and then closed it; make sure it is off the list.
+        clear_hotlist(token, plate)
+        return "left off the list"
+    now = active_entries(token, plate)
+    if not now:
+        entry = requests.post(f"{API_V1}/hotlist", headers=auth(token), json={"plate": plate}, timeout=20)
+        if entry.status_code in (200, 201) and had_fir:
+            requests.patch(
+                f"{API_V1}/hotlist/{entry.json()['id']}",
+                headers=auth(token),
+                json={"status": "FIR_CONFIRMED", "fir_reference": fir_ref or "FIR-PENDING"},
+                timeout=20,
+            )
+        return "re-listed" + (" as FIR_CONFIRMED" if had_fir else "")
+    if had_fir and not any(e.get("status") == "FIR_CONFIRMED" for e in now):
+        for e in now:
+            requests.patch(
+                f"{API_V1}/hotlist/{e['id']}",
+                headers=auth(token),
+                json={"status": "FIR_CONFIRMED", "fir_reference": fir_ref or "FIR-PENDING"},
+                timeout=20,
+            )
+        return "FIR_CONFIRMED restored"
+    return "already active"
+
+
 def sightings_for(token: str, plate: str) -> list[dict]:
     """Sighting rows for one plate.
 
@@ -330,7 +378,9 @@ def main() -> int:
 
     # 0. start from a known state: an earlier run may have left the plate on the
     # hot-list, which would make the "does not alert yet" check below fail for a
-    # reason unrelated to the code.
+    # reason unrelated to the code. Whatever the demo had is captured first so it
+    # can be put back at the end - the run closes this plate as part of the chain.
+    hot_before = active_entries(police_t, HOT_PLATE)
     cleared = clear_hotlist(police_t, HOT_PLATE)
     print(f"  pre-existing hot-list entries closed for {HOT_PLATE}: {cleared}\n", flush=True)
 
@@ -509,6 +559,10 @@ def main() -> int:
     )
 
     # And a complaint rejected before it was ever verified never lists the plate.
+    # Compared before and after rather than against zero, because the demo seed
+    # legitimately lists this plate too - the check used to fail on a row that was
+    # not this test's doing.
+    cold_before = len(active_entries(police_t, COLD_PLATE))
     r = requests.post(
         f"{API_V1}/complaints",
         headers=auth(citizen_t),
@@ -519,13 +573,17 @@ def main() -> int:
     if rejected_id:
         r = requests.post(f"{API_V1}/complaints/{rejected_id}/reject", headers=auth(police_t), timeout=20)
         check("a pending complaint can be rejected", r.status_code in (200, 204), f"HTTP {r.status_code}")
-        r = requests.get(f"{API_V1}/hotlist", headers=auth(police_t), timeout=20)
-        listed = [
-            e for e in r.json() if e.get("plate") == COLD_PLATE and e.get("status") in ("ACTIVE", "FIR_CONFIRMED")
-        ]
-        check("a rejected complaint never reaches the hot-list", not listed, f"{len(listed)} active entries")
+        cold_after = len(active_entries(police_t, COLD_PLATE))
+        check("a rejected complaint never reaches the hot-list", cold_after <= cold_before,
+              f"{cold_before} then {cold_after} active entries")
     else:
         check("a second complaint can be filed for the rejected case", False, f"HTTP {r.status_code} {r.text[:90]}")
+
+    # Put the demo's hot-list state back before reporting: this run closed
+    # HOT_PLATE, which would otherwise leave the portal showing the demo car as
+    # Closed and silence the live alert for it.
+    restored = restore_hotlist(police_t, HOT_PLATE, hot_before)
+    print(f"\n  hot-list state restored for {HOT_PLATE}: {restored}", flush=True)
 
     print("", flush=True)
     passed = sum(1 for ok, _, _ in RESULTS if ok)

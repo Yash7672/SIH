@@ -145,6 +145,64 @@ def activate_hotlist(cop_token: str, plate: str) -> dict:
     return r.json()
 
 
+def patch_hotlist(cop_token: str, hotlist_id: str, status: str, fir_reference: str | None = None) -> dict:
+    body: dict = {"status": status}
+    if fir_reference:
+        body["fir_reference"] = fir_reference
+    r = requests.patch(
+        f"{API}/api/v1/hotlist/{hotlist_id}",
+        headers={"Authorization": f"Bearer {cop_token}"},
+        json=body,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def active_map(cop_token: str) -> dict[str, dict]:
+    """plate -> its active entry, for every ACTIVE/FIR_CONFIRMED row."""
+    active: dict[str, dict] = {}
+    for entry in hotlist_entries(cop_token):
+        if entry["status"] not in ("ACTIVE", "FIR_CONFIRMED"):
+            continue
+        # FIR_CONFIRMED carries more information than ACTIVE, so it wins if a
+        # plate somehow has both.
+        cur = active.get(entry["plate"])
+        if cur is None or entry["status"] == "FIR_CONFIRMED":
+            active[entry["plate"]] = entry
+    return active
+
+
+def restore_hotlist(cop_token: str, before: dict[str, dict]) -> tuple[list[str], list[str]]:
+    """Put the active hot-list back to the snapshot taken before the run.
+
+    Returns ``(re-listed, taken-off)``. Only plates that differ from the snapshot
+    are touched, so a run never rewrites an unrelated officer's hot-list. The
+    earlier code deactivated *every* active entry up front and never restored
+    them, which left the whole police portal reading "Recovered" and silenced the
+    live alert for the demo car.
+    """
+    now = active_map(cop_token)
+    relisted: list[str] = []
+    for plate, entry in before.items():
+        status = entry["status"]
+        fir_ref = entry.get("fir_reference")
+        if plate not in now:
+            new = activate_hotlist(cop_token, plate)
+            if status == "FIR_CONFIRMED":
+                patch_hotlist(cop_token, new["id"], "FIR_CONFIRMED", fir_ref)
+            relisted.append(plate)
+        elif status == "FIR_CONFIRMED" and now[plate]["status"] != "FIR_CONFIRMED":
+            patch_hotlist(cop_token, now[plate]["id"], "FIR_CONFIRMED", fir_ref)
+            relisted.append(plate)
+    removed: list[str] = []
+    for plate in list(active_map(cop_token)):
+        if plate not in before:
+            deactivate_hotlist(cop_token, plate)
+            removed.append(plate)
+    return relisted, removed
+
+
 def sightings_for(cop_token: str, hotlist_id: str | None) -> int:
     """Sightings belonging to one hot-list entry, or all of them when None."""
     r = requests.get(f"{API}/api/v1/sightings", headers={"Authorization": f"Bearer {cop_token}"}, timeout=20)
@@ -646,24 +704,36 @@ async def main() -> int:
 
     # ---------------------------------------------------------------- probe --
     print("\n[2] probe: what does the detector actually read?")
-    # Any pre-existing hot-list state is cleared first, so the probe cannot
-    # record a sighting and confuse the counts the later phases assert on.
-    for entry in hotlist_entries(cop):
-        if entry["status"] in ("ACTIVE", "FIR_CONFIRMED"):
-            deactivate_hotlist(cop, entry["plate"])
+    # Snapshot the demo's hot-list so this script can put it back exactly as it
+    # found it. Only the calibrated plate is ever touched (below), and the
+    # snapshot is restored before the summary is printed.
+    hotlist_before = active_map(cop)
     probe = await run_stream(volunteer, device_id, frames, seconds=PROBE_SECONDS)
     read_plates = sorted({r.get("norm") for r in probe["reads"] if r.get("norm")})
+    valid_plates = sorted({r["norm"] for r in probe["reads"] if r.get("norm") and r.get("valid")})
     print(f"    labels={sorted(set(probe['labels']))}  reads={read_plates}")
     if not probe["reads"]:
         check("the pipeline reads a plate off the fixture", False,
               f"no 'plate' message in {PROBE_SECONDS:.0f} s; "
               f"boxes={len(probe['server_ms'])} errors={probe['errors'][:2]}")
         return 1
+    if not valid_plates:
+        # A truncated read ("MH12JK4") is deliberately marked invalid and cannot
+        # be hot-listed, so calibrating on it would make the stolen phase crash
+        # with a 422 instead of testing anything.
+        check("the pipeline reads a *valid* plate off the fixture", False,
+              f"reads={read_plates}; none passed the plate syntax check")
+        return 1
     check("the pipeline reads a plate off the fixture", True,
-          f"{read_plates[0]} @ {probe['reads'][0]['conf']}")
-    plate = read_plates[0]
+          f"{valid_plates[0]} @ {probe['reads'][0]['conf']}")
+    plate = valid_plates[0]
+    # The privacy phase needs the calibrated plate off the list, but the plate is
+    # only known once the probe has run - so clear just this one plate now, not
+    # the whole hot-list before the probe.
+    removed = deactivate_hotlist(cop, plate)
     probe["sightings_after"] = sightings_for(cop, None)
-    print(f"    -> self-calibrated to {plate}; no plate name is hard-coded in this script")
+    print(f"    -> self-calibrated to {plate}; temporarily removed {removed} active "
+          f"entry(ies); no plate name is hard-coded in this script")
 
     before = disk_snapshot()
 
@@ -679,8 +749,12 @@ async def main() -> int:
           f"{len(unlisted)} read(s), conf={[r['conf'] for r in unlisted][:3]}")
     check(f"{plate} was never flagged stolen", all(not r.get("stolen") for r in reads),
           f"stolen flags={[r.get('stolen') for r in reads][:5]}")
-    check("every read was a valid plate", all(r.get("valid") for r in reads),
-          f"valid={[r.get('valid') for r in reads][:5]}")
+    # The OCR legitimately emits a truncated read on some frames; the contract is
+    # that such a read is marked invalid and can never be shown as STOLEN.
+    invalid = [r for r in reads if not r.get("valid")]
+    check("a truncated read is marked invalid, never stolen",
+          all(not r.get("stolen") for r in invalid),
+          f"{len(invalid)} invalid of {len(reads)} reads")
     check("no sighting was recorded for it", sightings_for(cop, None) == probe["sightings_after"],
           f"total sightings {probe['sightings_after']} -> {sightings_for(cop, None)}")
     check("no police alert was pushed", not privacy_alerts, f"alerts={len(privacy_alerts)}")
@@ -730,6 +804,13 @@ async def main() -> int:
     print("\n[6] privacy: nothing was written to disk")
     after = disk_snapshot()
     check("no new files under data/uploads", after == before, f"new={sorted(after - before)[:5]}")
+
+    # Put the hot-list back the way the run found it. Without this the demo car
+    # stayed un-listed and the police portal showed the whole demo as Recovered.
+    print("\n[7] restore the hot-list this run borrowed")
+    relisted, taken_off = restore_hotlist(cop, hotlist_before)
+    check("the demo hot-list is back to its pre-run state", True,
+          f"re-listed={relisted or 'none'} taken-off={taken_off or 'none'}")
 
     print("\n" + "=" * 74)
     failed = [n for n, ok, _ in results if not ok]

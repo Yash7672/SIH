@@ -299,12 +299,19 @@ export default function Layout({
             {banner ? (
               <div
                 role="alert"
-                className="flex animate-slide-up flex-wrap items-center justify-between gap-3 bg-solid-danger px-4 py-3 text-white sm:px-6"
+                className={[
+                  "flex animate-slide-up flex-wrap items-center justify-between gap-3 px-4 py-3 text-white sm:px-6",
+                  // Amber for a low-confidence read: it is a lead to check,
+                  // not a confirmed hotlist hit.
+                  banner.needs_review ? "bg-warning" : "bg-solid-danger",
+                ].join(" ")}
               >
                 <div className="flex min-w-0 items-center gap-3">
                   <Siren className="h-5 w-5 shrink-0" aria-hidden />
                   <div className="min-w-0">
-                    <p className="text-sm font-bold">HOTLIST VEHICLE DETECTED</p>
+                    <p className="text-sm font-bold">
+                      {banner.needs_review ? "POSSIBLE MATCH — VERIFY PLATE" : "HOTLIST VEHICLE DETECTED"}
+                    </p>
                     <p className="truncate text-xs text-white/85">
                       {banner.plate} · {formatCoords(banner.latitude, banner.longitude)} ·{" "}
                       {timeAgo(banner.timestamp)}
@@ -313,7 +320,13 @@ export default function Layout({
                   </div>
                 </div>
                 <Link to={platePath(banner.plate)} onClick={() => setBanner(null)}>
-                  <Button size="sm" className="bg-surface-card text-danger hover:bg-danger/10">
+                  <Button
+                    size="sm"
+                    className={[
+                      "bg-surface-card hover:bg-danger/10",
+                      banner.needs_review ? "text-warning hover:bg-warning/10" : "text-danger",
+                    ].join(" ")}
+                  >
                     View vehicle
                   </Button>
                 </Link>

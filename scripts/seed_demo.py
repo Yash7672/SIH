@@ -12,8 +12,17 @@ Run against the backend DB (`rakshak`) — safe to re-run anytime.
 import sys
 import uuid
 from datetime import timedelta
+from pathlib import Path
 
-sys.path.append("backend")
+# Resolve the package directory from this file, not from the current working
+# directory. The old `sys.path.append("backend")` only worked when the script was
+# run from the repo root; inside the backend container the code lives at
+# `/app/app` with no `/app/backend`, so the documented
+# `docker compose exec backend python scripts/seed_demo.py` died with
+# "No module named 'app'" and docker-mode seeding silently produced no demo data.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "backend"))
 
 from app.db.session import SessionLocal  # noqa: E402
 from app.models import (  # noqa: E402

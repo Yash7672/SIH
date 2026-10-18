@@ -14,28 +14,35 @@ const AlertRow = memo(function AlertRow({ alert, isNew }: { alert: AlertEvent; i
     () => formatCoords(alert.latitude, alert.longitude),
     [alert.latitude, alert.longitude]
   );
+  // A low-confidence match is a lead to verify, not a confirmed hit: it is
+  // styled amber and never red, so a 60% read cannot look like a proven one
+  // from across the room.
+  const review = Boolean(alert.needs_review);
 
   return (
     <article
       className={[
         "animate-slide-up rounded-xl border p-4 transition-colors sm:p-5",
-        "border-danger/40 bg-danger/10 hover:bg-danger/15",
-        isNew ? "ring-1 ring-danger/50" : "",
+        review ? "border-warning/40 bg-warning/10 hover:bg-warning/15" : "border-danger/40 bg-danger/10 hover:bg-danger/15",
+        isNew ? (review ? "ring-1 ring-warning/50" : "ring-1 ring-danger/50") : "",
       ].join(" ")}
     >
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex min-w-0 items-start gap-3">
           <span
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-solid-danger text-white"
+            className={[
+              "flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-white",
+              review ? "bg-warning" : "bg-solid-danger",
+            ].join(" ")}
             aria-hidden
           >
             <Siren className="h-5 w-5" />
           </span>
           <div className="min-w-0">
-            <p className="text-sm font-bold uppercase tracking-wide text-danger">
-              Hotlist vehicle detected
+            <p className={["text-sm font-bold uppercase tracking-wide", review ? "text-warning" : "text-danger"].join(" ")}>
+              {review ? "Possible match · verify plate" : "Hotlist vehicle detected"}
             </p>
-            <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-danger">
+            <div className={["mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs", review ? "text-warning" : "text-danger"].join(" ")}>
               <span className="inline-flex items-center gap-1.5">
                 <MapPin className="h-3.5 w-3.5" aria-hidden />
                 {coords}
@@ -51,7 +58,7 @@ const AlertRow = memo(function AlertRow({ alert, isNew }: { alert: AlertEvent; i
 
         <Link
           to={platePath(alert.plate)}
-          className="shrink-0 text-sm font-semibold text-danger underline-offset-2 hover:underline"
+          className={["shrink-0 text-sm font-semibold underline-offset-2 hover:underline", review ? "text-warning" : "text-danger"].join(" ")}
         >
           View on map →
         </Link>

@@ -87,7 +87,7 @@ try:  # noqa: E402
     from ai import char_grammar, char_segment, char_verifier
 except Exception:  # noqa: E402, BLE001 - optional: reported as "unverified"
     char_grammar = char_segment = char_verifier = None  # type: ignore[assignment]
-from app.services.plate import normalize_plate  # noqa: E402
+from app.services.plate import normalize_plate, plate_key  # noqa: E402
 from app.services.plate_reader import (  # noqa: E402
     debug_crops_enabled,
     plate_box_plausible,
@@ -97,8 +97,10 @@ from app.services.plate_reader import (  # noqa: E402
     warn_debug_enabled_once,
 )
 from app.services.plate_verdict import (  # noqa: E402
+    POSSIBLE,
     STOLEN,
     PlateRead,
+    read_is_decisive,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,7 +110,7 @@ router = APIRouter()
 # --------------------------------------------------------------------------- #
 # Limits
 # --------------------------------------------------------------------------- #
-ACTIVE_CONNECTIONS = 0
+ACTIVE_CONNECTIONS: set = set()
 MAX_CONNECTIONS = 3
 PING_INTERVAL_SECONDS = 20
 # A socket that never sends its auth message releases its slot after this long,
@@ -786,6 +788,17 @@ def run_ocr(crop_bgr: np.ndarray) -> Optional[dict]:
         return ocr_confs[i] if ocr_confs and i < len(ocr_confs) else float(read.conf)
 
     confs = [conf_at(i) for i in range(n)]
+    # How sure the *recogniser* was of the string it read. Every read-level bar
+    # is calibrated against this (MIN_READ_CONF, MIN_PLATE_CONFIDENCE, the
+    # verdict's SINGLE_READ_CONF), so it must not move when the verifier is
+    # asked for a second opinion: `_fuse_chars` re-scores each position on the
+    # classifier's own scale, which is the right basis for `char_confs` - the
+    # verdict reads that to find a doubtful glyph - and the wrong basis for the
+    # read itself. Letting the fused score *be* the read's confidence is what
+    # turned a correctly read, hot-listed plate into "UNREAD: best guess 0.13,
+    # below the 0.45 floor" and stopped every alert.
+    read_conf = float(np.mean(confs)) if confs else float(read.conf)
+    char_confs_out = [float(c) for c in confs]
     details = _unverified_chars(text, confs)
     verified = False
     pattern = ""
@@ -808,15 +821,19 @@ def run_ocr(crop_bgr: np.ndarray) -> Optional[dict]:
                     fused, pattern = _fuse_chars(text, confs, verdicts)
                     details = fused
                     verified = True
-                    confs = [float(d["p"]) for d in details]
+                    # Per-position believability, on the classifier's scale. It is
+                    # what makes a doubtful glyph show up as `weak` downstream,
+                    # and it is deliberately *not* what `conf` reports.
+                    char_confs_out = [float(d["p"]) for d in details]
                     text = "".join(d["c"] for d in details)
         except Exception:  # noqa: BLE001 - a verifier fault must never lose the read
             details = _unverified_chars(text, confs)
             verified = False
             pattern = ""
+            char_confs_out = [float(c) for c in confs]
 
     ambiguous = [int(d["i"]) for d in details if d["status"] == "ambiguous"]
-    mean_conf = float(np.mean(confs)) if confs else float(read.conf)
+    mean_conf = read_conf
     norm = normalize_plate(text, ocr_score=mean_conf)
     valid = bool(norm.valid and mean_conf >= MIN_PLATE_CONFIDENCE)
     result = {
@@ -824,7 +841,7 @@ def run_ocr(crop_bgr: np.ndarray) -> Optional[dict]:
         "norm": norm.normalized,
         "conf": mean_conf,
         "valid": valid,
-        "char_confs": [float(c) for c in confs] if n else None,
+        "char_confs": char_confs_out if n else None,
         "variant": read.best_variant,
         "reason": read.reason,
         "chars": details,
@@ -862,18 +879,29 @@ async def _check_hotlist_and_record(
     lat: Optional[float],
     lng: Optional[float],
     conf: float,
+    needs_review: bool = False,
 ) -> bool:
-    """Return True when the plate is hot-listed, recording and alerting if so.
+    """Return True when this detection actually filed a police alert.
 
-    `stolen` is a statement about the hot-list, so it comes from the hot-list
-    lookup itself. `record_detection` enforces the 60 s cooldown and returns None
-    both for "not hotlisted" and "cooldown active"; only a real sighting is worth
-    waking the dashboards for.
+    The value is a claim about *this frame*, so it is False unless an alert was
+    really broadcast. The `stolen` banner on the phone is separate and comes from
+    the verdict; a camera that reads a listed car is told that plainly either way.
+
+    `record_detection` enforces the 60 s cooldown and returns None both for "not
+    hotlisted" and "cooldown active"; only a real sighting is worth waking the
+    dashboards for.
     """
     hotlist = HotlistService(db)
     stolen = hotlist.is_plate_hotlisted(plate)
-    if not stolen or device is None or lat is None or lng is None:
-        return stolen
+    if not stolen:
+        return False
+    if device is None or lat is None or lng is None:
+        # Listed, but nothing can be filed for it. A sighting row is only ever
+        # written for a device - `sightings.device_id` is not nullable - and a
+        # detection with nowhere to stand cannot be actioned. Returning `stolen`
+        # here used to make a camera without a device print POLICE-ALERTED while
+        # the dashboard stayed dark.
+        return False
 
     try:
         sighting = SightingService(db).record_detection(
@@ -888,7 +916,10 @@ async def _check_hotlist_and_record(
         # record_detection rejects impossible coordinates; drop the frame.
         return False
     if sighting is None:
-        return True
+        # None means either "the 60 s cooldown is running" - an alert for this
+        # car already went out - or "the list no longer holds it", which the
+        # stale-cache correction just discovered. Only the first is an alert.
+        return hotlist.get_active_by_plate(plate) is not None
 
     entry = hotlist.get_active_by_plate(plate)
     await alert_manager.broadcast(
@@ -907,6 +938,75 @@ async def _check_hotlist_and_record(
             "camera": device.device_name or device.device_type or "unknown",
             "device_id": str(device.id),
             "last_seen_at": entry.last_seen_at.isoformat() if entry and entry.last_seen_at else None,
+            # True when the read reached the portal on confidence alone, not on
+            # a corroborated STOLEN verdict. The dashboard styles these amber
+            # and says "verify" instead of sounding the siren outright.
+            "needs_review": needs_review,
+        },
+    )
+    return True
+
+
+async def _broadcast_review_alert(
+    db,
+    device,
+    plate: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    conf: float,
+) -> bool:
+    """Wake the cop portal for an *exact* hot-list read that is not yet proven.
+
+    For a read between ``ALERT_MIN_CONFIDENCE`` and the corroboration bar: the
+    plate string is on the hot-list but only one frame has agreed on it, so the
+    phone stays amber (POSSIBLE) while the dashboard is still told - flagged
+    ``needs_review`` so it reads "verify this" and not "roll on this".
+
+    Broadcast-only, deliberately: it writes no sighting row and so cannot arm
+    the 60 s sighting cooldown. That matters because the *second*, corroborated
+    read arrives seconds later wanting the STOLEN alert - if the review alert
+    had consumed the cooldown, the confirmed alert would be silently swallowed
+    and the dashboard would never hear the upgrade. Its own Redis cooldown is
+    the only throttle, and losing it costs a duplicate nudge, never a lost one.
+    """
+    if lat is None or lng is None:
+        # Not actionable on a map without a position, same as the STOLEN path.
+        return False
+    if device is None:
+        # No device means no camera to name and nothing attributable - the
+        # same reason the STOLEN path refuses. A review alert an officer
+        # cannot trace to a source is worse than no alert.
+        return False
+    if not cache_service.cooldown(
+        f"review_alert:{plate_key(plate)}:{device.id if device else 'anon'}",
+        settings.DETECTION_COOLDOWN_SECONDS,
+    ):
+        return False
+
+    entry = HotlistService(db).get_active_by_plate(plate)
+    if entry is None:
+        return False
+
+    camera = "unknown"
+    device_id = None
+    if device is not None:
+        camera = device.device_name or device.device_type or "unknown"
+        device_id = str(device.id)
+
+    await alert_manager.broadcast(
+        "hotlist_detection",
+        {
+            "sighting_id": None,
+            "plate": plate,
+            "latitude": lat,
+            "longitude": lng,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "confidence": conf,
+            "hotlist_id": str(entry.id),
+            "camera": camera,
+            "device_id": device_id,
+            "last_seen_at": entry.last_seen_at.isoformat() if entry.last_seen_at else None,
+            "needs_review": True,
         },
     )
     return True
@@ -948,13 +1048,16 @@ async def ws_live_scan(websocket: WebSocket):
         await websocket.close(code=1000, reason="Demo mode disabled")
         return
 
-    if ACTIVE_CONNECTIONS >= MAX_CONNECTIONS:
+    if len(ACTIVE_CONNECTIONS) >= MAX_CONNECTIONS:
         await websocket.accept()
         await websocket.close(code=1013, reason="Server busy")
         return
 
     await websocket.accept()
-    ACTIVE_CONNECTIONS += 1
+    # Claimed only once the socket is really open, and released in the `finally`
+    # below - so the cap counts live sockets and nothing else can hold a slot.
+    slot = object()
+    ACTIVE_CONNECTIONS.add(slot)
 
     # Per connection. Two phones must never share tracks.
     conn = ScanConnection()
@@ -1232,8 +1335,23 @@ async def ws_live_scan(websocket: WebSocket):
                             track.plate_text = result["text"]
                             track.plate_conf = result["conf"]
                             track.plate_valid = result["valid"]
-                            if result["conf"] >= PLATE_CONF_DONE or track.attempts >= MAX_READ_ATTEMPTS:
-                                # Good enough, or out of budget: stop paying for this car.
+                            if read_is_decisive(
+                                float(result["conf"]),
+                                bool(result.get("verified", False)),
+                                tuple(result["char_confs"]) if result.get("char_confs") else None,
+                                tuple(result.get("ambiguous") or ()),
+                                result["norm"],
+                            ) or track.attempts >= MAX_READ_ATTEMPTS:
+                                # This read can carry the decision on its own, or
+                                # the car is out of attempts: either way another
+                                # read cannot change the verdict, so stop paying
+                                # for it. A read that is merely *confident* is not
+                                # enough to settle on. The verdict still wants
+                                # either a clean glyph-by-glyph pass or a second
+                                # agreeing read, and settling a doubtful read
+                                # removes that second read for good - which is how
+                                # a correctly read stolen car sat at POSSIBLE and
+                                # drove away with no alert raised.
                                 track.plate_settled = True
 
                         # ---- the one decision ---------------------------------- #
@@ -1278,6 +1396,27 @@ async def ws_live_scan(websocket: WebSocket):
                             db = SessionLocal()
                             try:
                                 alerted = await _check_hotlist_and_record(
+                                    db, conn.device, vd.plate, lat, lng, vd.confidence
+                                )
+                            finally:
+                                db.close()
+                        elif (
+                            vd.state == POSSIBLE
+                            # The read *itself* is on the list. The other
+                            # POSSIBLE branch names a fuzzy neighbour - a
+                            # different plate - and paging a cop for that is
+                            # exactly the false-alarm the verdict exists to
+                            # prevent.
+                            and vd.matches == vd.plate
+                            and vd.confidence >= settings.ALERT_MIN_CONFIDENCE
+                        ):
+                            # A 60% read of a listed plate is not proof, so the
+                            # phone keeps its amber POSSIBLE banner and never a
+                            # red one - but it is enough for a cop to look, so
+                            # the portal is woken with `needs_review` set.
+                            db = SessionLocal()
+                            try:
+                                alerted = await _broadcast_review_alert(
                                     db, conn.device, vd.plate, lat, lng, vd.confidence
                                 )
                             finally:
@@ -1415,4 +1554,4 @@ async def ws_live_scan(websocket: WebSocket):
             finally:
                 if db is not None:
                     db.close()
-        ACTIVE_CONNECTIONS -= 1
+        ACTIVE_CONNECTIONS.discard(slot)

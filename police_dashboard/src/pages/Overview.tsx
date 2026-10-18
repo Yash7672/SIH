@@ -31,9 +31,17 @@ const RecentAlertRow = memo(function RecentAlertRow({ alert }: { alert: AlertEve
           {alert.confidence ? ` · ${Math.round(alert.confidence * 100)}%` : ""}
         </p>
       </div>
-      <span className="chip-danger inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium">
-        <span className="h-1.5 w-1.5 rounded-full bg-danger" aria-hidden />
-        Match
+      <span
+        className={[
+          "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium",
+          alert.needs_review ? "chip-warning" : "chip-danger",
+        ].join(" ")}
+      >
+        <span
+          className={["h-1.5 w-1.5 rounded-full", alert.needs_review ? "bg-warning" : "bg-danger"].join(" ")}
+          aria-hidden
+        />
+        {alert.needs_review ? "Review" : "Match"}
       </span>
     </li>
   );

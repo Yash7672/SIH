@@ -82,6 +82,10 @@ async def create_sighting(
         "camera": device.device_name or device.device_type or "unknown",
         "device_id": str(device.id),
         "last_seen_at": hotlist_entry.last_seen_at.isoformat() if hotlist_entry and hotlist_entry.last_seen_at else None,
+        # The HTTP path has no verdict pipeline behind it, so anything under
+        # the live scanner's corroborated bar is flagged for the same
+        # "verify before intercepting" styling on the dashboard.
+        "needs_review": (payload.confidence or 0.0) < settings.ALERT_MIN_CONFIDENCE,
     }
     await alert_manager.broadcast("hotlist_detection", alert_payload)
     logger.info("Hotlist match broadcast: plate_len=%d", len(norm.normalized))

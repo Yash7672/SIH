@@ -164,6 +164,36 @@ FUZZY_THRESHOLD = 0.85
 MIN_READ_CONF = 0.45
 
 
+def read_is_decisive(
+    conf: float,
+    verified: bool,
+    char_confs: Optional[Sequence[float]],
+    amb: Sequence[int],
+    norm: str,
+) -> bool:
+    """Is this *one* read, on its own, enough to page the police?
+
+    This is the one-read route of `evaluate`'s corroboration clause, lifted out
+    so the live scanner can ask the same question: a track may stop being read
+    exactly when the next read could no longer change the verdict. Settling a
+    track on a read that is *not* decisive is what makes a genuine stolen car
+    unreachable - the second agreeing read the verdict is waiting for can only
+    come from a later frame, and a settled track never gets one.
+
+    `amb` is the read's own verifier-flagged doubt (``PlateRead.amb``); the
+    ``char_confs`` test below is the OCR-confidence doubt. Either one blocks a
+    lone read, because a single read is only ever trusted when nothing about it
+    is in doubt.
+    """
+    if not verified or conf < SINGLE_READ_CONF:
+        return False
+    if char_confs is not None and min(char_confs) < MIN_CHAR_CONF:
+        return False
+    if any(0 <= i < len(norm) for i in amb):
+        return False
+    return not ambiguous_positions(norm, char_confs)
+
+
 # --------------------------------------------------------------------------- #
 # Fuzzy scoring
 # --------------------------------------------------------------------------- #
@@ -546,12 +576,7 @@ class TrackVerdict:
             # produces - two legal readings of the same car.
             corroborated = not ver_amb and (
                 (backing >= 2 and self._within_window(norm))
-                or (
-                    verified_any
-                    and conf >= SINGLE_READ_CONF
-                    and (char_confs is None or min(char_confs) >= MIN_CHAR_CONF)
-                    and not amb
-                )
+                or read_is_decisive(conf, bool(verified_any), char_confs, ver_amb, norm)
             )
             if corroborated:
                 if not cooldown_ok and self._last_stolen_at is not None:
