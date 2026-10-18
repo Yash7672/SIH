@@ -44,7 +44,7 @@ export function ThemeToggle({ style, tone = "surface" }) {
 
 /** Full three-option picker for a settings sheet. `variant="segmented"`. */
 export function ThemeModePicker({ style }) {
-  const { mode, setMode, isDark } = useTheme();
+  const { mode, setMode, isDark, colors } = useTheme();
 
   return (
     <View
@@ -58,6 +58,7 @@ export function ThemeModePicker({ style }) {
     >
       {OPTIONS.map(({ value, label, glyph }) => {
         const active = mode === value;
+        const idle = isDark ? "#9FB0C7" : "#5A6B85";
         return (
           <TouchableOpacity
             key={value}
@@ -67,14 +68,14 @@ export function ThemeModePicker({ style }) {
             accessibilityLabel={`${label} theme`}
             style={[
               styles.segmentBtn,
-              active && { backgroundColor: isDark ? "#111A2E" : "#FFFFFF" },
+              active && { backgroundColor: colors.solid },
             ]}
           >
-            <Text style={{ color: active ? "#2F4BD8" : isDark ? "#94A3B8" : "#5A6B85" }}>{glyph}</Text>
+            <Text style={{ color: active ? "#FFFFFF" : idle }}>{glyph}</Text>
             <Text
               style={[
                 styles.segmentText,
-                { color: active ? (isDark ? "#E6EDF7" : "#0F172A") : isDark ? "#94A3B8" : "#5A6B85" },
+                { color: active ? "#FFFFFF" : idle },
               ]}
             >
               {label}

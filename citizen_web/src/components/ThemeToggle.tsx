@@ -43,7 +43,7 @@ export function ThemeModePicker({ className = "" }: { className?: string }) {
     <div
       role="radiogroup"
       aria-label="Colour theme"
-      className={`inline-flex items-center gap-0.5 rounded-lg border border-surface-border bg-surface-raised p-0.5 ${className}`}
+      className={`segmented segmented--sm ${className}`}
     >
       {OPTIONS.map(({ value, label, Icon }) => {
         const active = mode === value;
@@ -56,13 +56,7 @@ export function ThemeModePicker({ className = "" }: { className?: string }) {
             aria-label={`${label} theme`}
             title={`${label} theme`}
             onClick={() => setMode(value)}
-            className={[
-              BASE,
-              "flex-1 gap-1.5 px-2 py-1.5 text-xs font-semibold",
-              active
-                ? "bg-surface-card text-primary-700 shadow-card dark:text-primary-200"
-                : "text-surface-muted hover:text-surface-text",
-            ].join(" ")}
+            className="segmented-tab flex-1"
           >
             <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
             <span className="hidden sm:inline">{label}</span>

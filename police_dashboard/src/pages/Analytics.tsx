@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { BarChart3, MapPin, Trophy } from "lucide-react";
+import { BarChart3, LayoutDashboard, MapPin, ScanLine, Trophy } from "lucide-react";
 import { api } from "../services/api";
 import { Card, CardHeader } from "../components/ui/Card";
 import { PlateBadge } from "../components/ui/StatusChip";
@@ -97,18 +97,18 @@ export default function Analytics() {
         subtitle="Detection throughput, the vehicles generating the most alerts, and the latest sighting pings."
       />
 
-      <div role="tablist" aria-label="Analytics sections" className="flex w-fit gap-1 rounded-xl bg-surface-sunken p-1">
+      {/* A segmented control, not a pair of loose labels: the raised track and
+          the icon on each segment make it read as buttons at a glance, and the
+          selected segment is filled with the solid action colour. */}
+      <div role="tablist" aria-label="Analytics sections" className="segmented w-fit">
         <button
           type="button"
           role="tab"
           aria-selected={tab === "overview"}
           onClick={() => setTab("overview")}
-          className={
-            tab === "overview"
-              ? "rounded-lg bg-surface-card px-4 py-2 text-sm font-medium text-surface-text shadow"
-              : "rounded-lg px-4 py-2 text-sm font-medium text-surface-muted hover:text-surface-text"
-          }
+          className="segmented-tab"
         >
+          <LayoutDashboard className="h-4 w-4" aria-hidden />
           Overview
         </button>
         <button
@@ -116,12 +116,9 @@ export default function Analytics() {
           role="tab"
           aria-selected={tab === "ocr"}
           onClick={() => setTab("ocr")}
-          className={
-            tab === "ocr"
-              ? "rounded-lg bg-surface-card px-4 py-2 text-sm font-medium text-surface-text shadow"
-              : "rounded-lg px-4 py-2 text-sm font-medium text-surface-muted hover:text-surface-text"
-          }
+          className="segmented-tab"
         >
+          <ScanLine className="h-4 w-4" aria-hidden />
           OCR Model
         </button>
       </div>

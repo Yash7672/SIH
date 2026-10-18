@@ -19,7 +19,12 @@ function WatermarkText({ text = "POLICE" }) {
       <Text
         style={[
           styles.text,
-          { color: "#7DC4FF", opacity: isDark ? 0.07 : 0.08 },
+          {
+            // A light blue wash disappears on a light surface, so light mode
+            // uses a deep indigo - the same swap the web clients make.
+            color: isDark ? "#7DC4FF" : "#1E40AF",
+            opacity: isDark ? 0.07 : 0.12,
+          },
         ]}
       >
         {text}

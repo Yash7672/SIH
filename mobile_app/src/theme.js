@@ -43,9 +43,9 @@ export const lightColors = {
     card: "#FFFFFF",
     border: "#E2E8F0",
     text: "#0F172A",
-    muted: "#64748B",
-    subtle: "#94A3B8",
-    raised: "#FFFFFF",
+    muted: "#5A6B85",
+    subtle: "#7C8CA5",
+    raised: "#F1F5F9",
   },
   // Dark surfaces: the scanner chrome is dark so the plate stays the brightest
   // thing on screen.
@@ -57,10 +57,10 @@ export const lightColors = {
     500: "#3A4A68",
   },
   // Semantic status colours.
-  success: "#16A34A",
-  warning: "#F59E0B",
+  success: "#15803D",
+  warning: "#B45309",
   danger: "#DC2626",
-  info: "#0EA5E9",
+  info: "#0369A1",
   // Solid action fills. Kept dark in BOTH themes so white label text is always
   // AA - matches the `solid` token in both web clients.
   solid: "#2F4BD8",
@@ -105,8 +105,8 @@ export const darkColors = {
     card: "#111A2E",
     border: "#263552",
     text: "#E6EDF7",
-    muted: "#94A3B8",
-    subtle: "#94A3B8",
+    muted: "#9FB0C7",
+    subtle: "#8C9CB5",
     raised: "#1B2742",
   },
   dark: {
@@ -116,7 +116,7 @@ export const darkColors = {
     600: "#263552",
     500: "#3A4A68",
   },
-  success: "#34D399",
+  success: "#4ADE80",
   warning: "#FBBF24",
   danger: "#F87171",
   info: "#38BDF8",

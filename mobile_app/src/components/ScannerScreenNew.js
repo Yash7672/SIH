@@ -97,6 +97,35 @@ export default function ScannerScreen({
   // object every render would re-render the whole screen several times a second.
   const s = useMemo(() => makeStyles(colors), [colors]);
 
+  // Chrome palette. The viewfinder itself stays black in both themes - a bright
+  // surround makes the plate the least readable thing on screen - but the
+  // header, panels and log follow the theme, so choosing Light actually yields a
+  // light app instead of the always-dark shell this screen used to be.
+  const tone = isDark ? "dark" : "surface";
+  const chrome = useMemo(
+    () =>
+      isDark
+        ? {
+            screen: colors.dark[900],
+            surface: colors.dark[800],
+            raised: colors.dark[700],
+            border: colors.dark[600],
+            strong: colors.onDark.strong,
+            body: colors.onDark.body,
+            muted: colors.onDark.muted,
+          }
+        : {
+            screen: colors.surface.bg,
+            surface: colors.surface.card,
+            raised: colors.surface.raised,
+            border: colors.surface.border,
+            strong: colors.surface.text,
+            body: colors.surface.text,
+            muted: colors.surface.muted,
+          },
+    [colors, isDark]
+  );
+
   // A phone that sleeps mid-scan stops detecting, and nobody notices until the
   // screen is dark in their hand. Held only while the stream is actually
   // running, so the rest of the app still sleeps normally.
@@ -153,7 +182,7 @@ export default function ScannerScreen({
     }
   }, [onSimulate, appendLog]);
 
-  if (!deviceReady) return <LoadingState label="Registering device…" />;
+  if (!deviceReady) return <LoadingState label="Registering device…" appearance={isDark ? "dark" : "surface"} />;
 
   if (!perm?.granted) {
     return (
@@ -179,13 +208,13 @@ export default function ScannerScreen({
   const cameraHeight = Math.round(Math.max(MIN_CAMERA_HEIGHT, height * CAMERA_HEIGHT_RATIO));
 
   return (
-    <View style={[s.fill, { backgroundColor: colors.dark[900] }]}>
+    <View style={[s.fill, { backgroundColor: chrome.screen }]}>
       {/* Edge-to-edge on Android: the header applies insets.top itself. */}
-      <StatusBar style="light" translucent />
+      <StatusBar style={isDark ? "light" : "dark"} translucent />
 
-      <View style={[s.header, { backgroundColor: colors.dark[800], borderBottomColor: colors.dark[600], paddingTop: insets.top + spacing.sm }]}>
+      <View style={[s.header, { backgroundColor: chrome.surface, borderBottomColor: chrome.border, paddingTop: insets.top + spacing.sm }]}>
         <View style={s.headerRow}>
-          <Text style={[s.title, { color: colors.onDark.strong }]} numberOfLines={1}>
+          <Text style={[s.title, { color: chrome.strong }]} numberOfLines={1}>
             RAKSHAK Scanner
           </Text>
           <View style={s.headerActions}>
@@ -196,7 +225,7 @@ export default function ScannerScreen({
               accessibilityLabel={isDark ? "Switch to light theme" : "Switch to dark theme"}
               style={({ pressed }) => [s.iconBtn, { opacity: pressed ? 0.6 : 1 }]}
             >
-              <Ionicons name={isDark ? "sunny" : "moon"} size={19} color={colors.onDark.body} />
+              <Ionicons name={isDark ? "sunny" : "moon"} size={19} color={chrome.body} />
             </Pressable>
             <Pressable
               onPress={onLogout}
@@ -205,13 +234,13 @@ export default function ScannerScreen({
               accessibilityLabel="Log out"
               style={({ pressed }) => [s.iconBtn, { opacity: pressed ? 0.6 : 1 }]}
             >
-              <Ionicons name="log-out-outline" size={19} color={colors.onDark.body} />
+              <Ionicons name="log-out-outline" size={19} color={chrome.body} />
             </Pressable>
           </View>
         </View>
 
         <View style={s.headerRow}>
-          <Text style={[s.subtitle, { color: colors.onDark.muted }]} numberOfLines={1}>
+          <Text style={[s.subtitle, { color: chrome.muted }]} numberOfLines={1}>
             {user?.name} · {String(user?.role || "VOLUNTEER").toUpperCase()}
           </Text>
           <LivePill live={liveScan} colors={colors} s={s} />
@@ -247,16 +276,16 @@ export default function ScannerScreen({
         <StolenBanner plate={stalePlate} />
 
         {cameraFault ? (
-          <View style={[s.faultBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
+          <View style={[s.faultBanner, { backgroundColor: chrome.raised, borderColor: colors.danger }]}>
             <Ionicons name="alert-circle-outline" size={15} color={colors.danger} />
-            <Text style={[s.faultText, { color: colors.onDark.body }]}>{cameraFault}</Text>
+            <Text style={[s.faultText, { color: chrome.body }]}>{cameraFault}</Text>
           </View>
         ) : null}
 
         {backendState.status === "OFFLINE" ? (
-          <View style={[s.faultBanner, { backgroundColor: colors.dark[700], borderColor: colors.danger }]}>
+          <View style={[s.faultBanner, { backgroundColor: chrome.raised, borderColor: colors.danger }]}>
             <Ionicons name="warning-outline" size={15} color={colors.danger} />
-            <Text style={[s.faultText, { color: colors.onDark.body }]} numberOfLines={2}>
+            <Text style={[s.faultText, { color: chrome.body }]} numberOfLines={2}>
               Backend unreachable{backendState.error ? `: ${backendState.error}` : ""}
             </Text>
           </View>
@@ -270,6 +299,8 @@ export default function ScannerScreen({
           qualityPreset={qualityPreset}
           onQualityPreset={onQualityPreset}
           colors={colors}
+          chrome={chrome}
+          tone={tone}
           s={s}
         />
 
@@ -278,23 +309,25 @@ export default function ScannerScreen({
             label="Simulate"
             size="lg"
             variant="secondary"
+            appearance={tone}
             onPress={simulate}
             style={s.flex}
-            icon={<Ionicons name="dice" size={19} color={colors.onDark.body} />}
+            icon={<Ionicons name="dice" size={19} color={isDark ? colors.onDark.body : colors.surface.muted} />}
           />
           <Button
             label="TEST BACKEND"
             size="lg"
             variant="secondary"
+            appearance={tone}
             onPress={handleTestBackend}
             loading={testing}
             loadingLabel="Testing..."
             style={s.flex}
-            icon={<Ionicons name="pulse" size={19} color={colors.accent[300]} />}
+            icon={<Ionicons name="pulse" size={19} color={isDark ? colors.accent[300] : colors.accent[600]} />}
           />
         </View>
 
-        <ActivityLog log={log} colors={colors} s={s} />
+        <ActivityLog log={log} colors={colors} chrome={chrome} tone={tone} s={s} />
       </ScrollView>
     </View>
   );
@@ -866,15 +899,15 @@ function PlateWithWeakChips({ plate, chars, confidence, s }) {
  * independently, and the two answers could be different at the same instant on
  * the same car.
  */
-function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, qualityPreset, onQualityPreset, colors, s }) {
+function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, qualityPreset, onQualityPreset, colors, chrome, tone, s }) {
   const last = stalePlate;
   const state = last?.state;
   const chipColor =
-    state === "STOLEN" ? "#FF6B6B" : state === "POSSIBLE" ? "#F59E0B" : colors.onDark.strong;
+    state === "STOLEN" ? colors.danger : state === "POSSIBLE" ? colors.warning : chrome.strong;
   return (
-    <Card tone="dark" style={s.block}>
+    <Card tone={tone} style={s.block}>
       <View style={s.blockHeader}>
-        <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>LAST PLATE</Text>
+        <Text style={[s.blockTitle, { color: chrome.strong }]}>LAST PLATE</Text>
         <Pressable
           onPress={onToggleStreaming}
           hitSlop={8}
@@ -883,7 +916,7 @@ function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, quality
           accessibilityLabel={streaming ? "Pause live detection" : "Resume live detection"}
           style={({ pressed }) => [styles.detectToggle, { opacity: pressed ? 0.7 : 1 }]}
         >
-          <View style={[styles.detectTrack, { backgroundColor: streaming ? colors.success : colors.dark[600] }]}>
+          <View style={[styles.detectTrack, { backgroundColor: streaming ? colors.success : chrome.border }]}>
             <View style={[styles.detectKnob, { alignSelf: streaming ? "flex-end" : "flex-start" }]} />
           </View>
         </Pressable>
@@ -906,12 +939,13 @@ function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, quality
               onPress={() => onQualityPreset(p)}
               style={({ pressed }) => [
                 s.presetChip,
+                { borderColor: chrome.border },
                 active && { backgroundColor: colors.accent[300], borderColor: colors.accent[300] },
                 pressed && { opacity: 0.7 },
               ]}
             >
               <Text
-                style={[s.presetChipText, active && { color: colors.dark[900], fontWeight: "800" }]}
+                style={[s.presetChipText, { color: chrome.muted }, active && { color: colors.dark[900], fontWeight: "800" }]}
               >
                 {p.toUpperCase()}
               </Text>
@@ -923,17 +957,17 @@ function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, quality
       {last && last.plate ? (
         <View>
           <PlateWithWeakChips plate={last.plate} chars={last.weak} confidence={chipColor} s={s} />
-          <Text style={s.detSub}>
+          <Text style={[s.detSub, { color: chrome.muted }]}>
             {`${last.confidence}% · ${VERDICT_LINE[state] || VERDICT_LINE.UNREAD}`}
             {last.reads > 1 ? ` · seen in ${last.reads} frames` : ""}
           </Text>
         </View>
       ) : (
         <View>
-          <Text style={[s.plateMono, { color: colors.onDark.muted }]} numberOfLines={1}>
+          <Text style={[s.plateMono, { color: chrome.muted }]} numberOfLines={1}>
             {last ? "unsure" : "—"}
           </Text>
-          <Text style={s.detSub}>
+          <Text style={[s.detSub, { color: chrome.muted }]}>
             {last?.reason
               ? `${VERDICT_LINE.UNREAD} · ${last.reason}`
               : streaming
@@ -943,34 +977,34 @@ function InfoPanel({ liveScan, stalePlate, streaming, onToggleStreaming, quality
         </View>
       )}
 
-      <View style={[s.statRow, { borderTopColor: colors.dark[600] }]}>
-        <Stat label="FPS" value={liveScan?.fps ? String(liveScan.fps) : "-"} colors={colors} s={s} />
-        <Stat label="SERVER" value={liveScan?.serverMs ? `${liveScan.serverMs}ms` : "-"} colors={colors} s={s} />
-        <Stat label="ROUND TRIP" value={liveScan?.roundTripMs ? `${liveScan.roundTripMs}ms` : "-"} colors={colors} s={s} />
+      <View style={[s.statRow, { borderTopColor: chrome.border }]}>
+        <Stat label="FPS" value={liveScan?.fps ? String(liveScan.fps) : "-"} chrome={chrome} s={s} />
+        <Stat label="SERVER" value={liveScan?.serverMs ? `${liveScan.serverMs}ms` : "-"} chrome={chrome} s={s} />
+        <Stat label="ROUND TRIP" value={liveScan?.roundTripMs ? `${liveScan.roundTripMs}ms` : "-"} chrome={chrome} s={s} />
       </View>
     </Card>
   );
 }
 
-function Stat({ label, value, colors, s }) {
+function Stat({ label, value, chrome, s }) {
   return (
     <View style={s.stat}>
-      <Text style={[s.statLabel, { color: colors.onDark.muted }]}>{label}</Text>
-      <Text style={[s.statValue, { color: colors.onDark.strong }]}>{value}</Text>
+      <Text style={[s.statLabel, { color: chrome.muted }]}>{label}</Text>
+      <Text style={[s.statValue, { color: chrome.strong }]}>{value}</Text>
     </View>
   );
 }
 
-function ActivityLog({ log, colors, s }) {
+function ActivityLog({ log, chrome, tone, s }) {
   return (
-    <Card tone="dark" style={s.block}>
-      <Text style={[s.blockTitle, { color: colors.onDark.strong }]}>RECENT EVENTS</Text>
+    <Card tone={tone} style={s.block}>
+      <Text style={[s.blockTitle, { color: chrome.strong }]}>RECENT EVENTS</Text>
       {log.length === 0 ? (
-        <Text style={[s.emptyText, { color: colors.onDark.muted }]}>Nothing yet.</Text>
+        <Text style={[s.emptyText, { color: chrome.muted }]}>Nothing yet.</Text>
       ) : (
         <View style={s.logBody}>
           {log.map((line, i) => (
-            <Text key={`${i}-${line.slice(0, 24)}`} style={[s.logLine, { color: colors.onDark.muted }]} numberOfLines={2}>
+            <Text key={`${i}-${line.slice(0, 24)}`} style={[s.logLine, { color: chrome.muted }]} numberOfLines={2}>
               {line}
             </Text>
           ))}

@@ -97,8 +97,10 @@
     --chip-info-fg: 7 89 133;
 
     /* --- Decoration knobs. Tune the watermark here. ------------------ */
-    --wm-color: 125 196 255; /* #7DC4FF */
-    --wm-opacity: 0.08;
+    /* A light blue wash vanishes on a light surface, so the light theme uses a
+       deep indigo at a touch more opacity - the "POLICE" mark reads on both. */
+    --wm-color: 30 64 175; /* #1E40AF */
+    --wm-opacity: 0.12;
     --glow: rgb(47 75 216 / 0.09);
     --pattern-dot: rgb(15 23 42 / 0.3);
     --pattern-line: rgb(15 23 42 / 0.16);
@@ -217,6 +219,34 @@
     --tw-ring-offset-color: var(--surface-bg);
   }
 
+  /* Everything that behaves like a control must *look* like one. Tailwind's
+     preflight only sets `cursor: pointer` on <button> and [role="button"], so
+     the tab / radio / menu roles used across both clients were showing the
+     default arrow and reading as static labels. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  [role="radio"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([aria-disabled="true"]),
+  a[href],
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+
+  /* A subtle press response makes buttons feel physical rather than printed. */
+  button:not(:disabled):active,
+  [role="button"]:not([aria-disabled="true"]):active,
+  [role="tab"]:not([aria-disabled="true"]):active,
+  [role="radio"]:not([aria-disabled="true"]):active {
+    transform: translateY(0.5px);
+  }
+
   h1,
   h2,
   h3,
@@ -331,6 +361,66 @@
   .chip-info {
     background-color: rgb(var(--chip-info-bg));
     color: rgb(var(--chip-info-fg));
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Segmented control. The shared shape for "pick one of these" across
+   * the console, the portal and the phone: a raised track with the
+   * selected segment filled with the solid action colour, so a selected
+   * tab can never be mistaken for a static label.
+   * ------------------------------------------------------------------ */
+  .segmented {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    border-radius: 0.75rem;
+    border: 1px solid rgb(var(--surface-border));
+    background-color: rgb(var(--surface-raised));
+    box-shadow: 0 1px 2px 0 rgb(15 23 42 / 0.05);
+  }
+
+  .segmented-tab {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 0.5rem;
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: rgb(var(--surface-muted));
+    transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+  }
+
+  .segmented-tab:hover {
+    color: rgb(var(--surface-text));
+    background-color: rgb(var(--surface-card));
+  }
+
+  .segmented-tab[aria-selected="true"],
+  .segmented-tab[aria-checked="true"] {
+    color: #fff;
+    background-color: rgb(var(--solid));
+    box-shadow: 0 1px 2px 0 rgb(15 23 42 / 0.12);
+  }
+
+  .segmented-tab[aria-selected="true"]:hover,
+  .segmented-tab[aria-checked="true"]:hover {
+    color: #fff;
+    background-color: rgb(var(--solid-hover));
+  }
+
+  .segmented-tab:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px rgb(var(--surface-bg)), 0 0 0 4px rgb(var(--primary-600));
+  }
+
+  /* Compact variant for the theme picker and other tight toolbars. */
+  .segmented--sm .segmented-tab {
+    gap: 0.375rem;
+    padding: 0.375rem 0.625rem;
+    font-size: 0.75rem;
   }
 
   /* Table rows: zebra banding and hover both come from tokens. */
