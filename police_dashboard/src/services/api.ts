@@ -350,11 +350,22 @@ export interface OcrNoReport {
 }
 
 /**
+ * The eval ran but found no labelled plates. Distinct from {@link OcrReport}
+ * because there are no measurements to show: rendering this as a normal report
+ * produced a 0% error rate and a green "0 wrong-but-confident reads" tick,
+ * which reads as a clean result when nothing was actually measured.
+ */
+export interface OcrEmptyReport {
+  status: "empty";
+  metadata: OcrReport["metadata"];
+}
+
+/**
  * The latest OCR evaluation. Returns the no_report shape untouched so the tab
  * can show the command; never triggers an evaluation on the server.
  */
-export async function fetchOcrReport(): Promise<OcrReport | OcrNoReport> {
-  const r = await api.get<OcrReport | OcrNoReport>("/analytics/ocr");
+export async function fetchOcrReport(): Promise<OcrReport | OcrEmptyReport | OcrNoReport> {
+  const r = await api.get<OcrReport | OcrEmptyReport | OcrNoReport>("/analytics/ocr");
   return r.data;
 }
 

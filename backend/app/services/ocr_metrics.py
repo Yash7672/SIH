@@ -545,6 +545,21 @@ class OcrReport(BaseModel):
     metadata: Metadata = Metadata()
 
 
+class OcrEmptyReport(BaseModel):
+    """The eval ran but found no labelled plates, so nothing was measured.
+
+    Kept apart from :class:`OcrReport` on purpose. Every number in a real
+    report is a measurement; here there are none, and the dashboard must show
+    the "nothing to evaluate" state rather than rendering absent metrics as
+    zero (a 0% error rate from an empty set is not a clean result).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str = "empty"
+    metadata: Metadata = Metadata()
+
+
 class OcrNoReport(BaseModel):
     model_config = ConfigDict(extra="allow")
 

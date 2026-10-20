@@ -370,14 +370,43 @@ def main() -> int:
           f"char verifier {'ON' if settings.CHAR_VERIFY else 'OFF'}")
     if not kept:
         print("nothing to evaluate - add labelled plates (e.g. DL1ZA9092.jpg) to data/test_plates/")
+        # A report with no scored samples is NOT a measurement. It carries
+        # status="empty" so the dashboard shows the "nothing to evaluate" state
+        # instead of rendering zeros as if they were results: a zero error rate
+        # from an empty set reads as a clean bill of health, which is exactly
+        # the claim this file must never make.
         atomic_write_json(
             REPORT_PATH,
             {
-                "status": "ok",
-                "metadata": {"generated_at": datetime.now(timezone.utc).isoformat(),
-                             "commit": git_commit(),
-                             "dataset": {"real_files": 0, "synthetic_files": 0, "skipped": skipped,
-                                         "char_dataset_note": CHAR_DATASET_NOTE}},
+                "status": "empty",
+                "metadata": {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "commit": git_commit(),
+                    "dataset": {
+                        # Count what is actually on disk (skipped included), so the
+                        # report cannot claim "0 real files" while a real file was
+                        # sitting there unscoreable.
+                        "real_files": len(real_images),
+                        "synthetic_files": len(synthetic_images),
+                        "scored_files": 0,
+                        "skipped": skipped,
+                        "char_dataset_note": CHAR_DATASET_NOTE,
+                    },
+                    # Recorded on the empty path too: otherwise the file says
+                    # char_verifier=false and versions={} while the run that wrote
+                    # it had the verifier ON, which is simply untrue.
+                    "char_verifier": bool(settings.CHAR_VERIFY),
+                    "models": model_files(),
+                    "versions": package_versions(),
+                    "char_confidences_available": False,
+                    "notes": [
+                        "No labelled plates were found, so no accuracy was measured. "
+                        "Nothing in this file is a result.",
+                        "Add plate images named after the plate they show "
+                        "(e.g. data/test_plates/DL1ZA9092.jpg) and re-run "
+                        "scripts/eval_ocr.py.",
+                    ],
+                },
             },
         )
         return 0

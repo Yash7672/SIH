@@ -272,6 +272,47 @@ def test_endpoint_no_report(client, demo_tokens, report_path):
     assert r.json() == {"status": "no_report", "hint": "Run: python scripts/eval_ocr.py"}
 
 
+def test_endpoint_empty_report_is_not_served_as_a_result(client, demo_tokens, report_path):
+    from tests.conftest import auth
+
+    # A run that found no labelled plates. Serving this as a normal report made
+    # the dashboard render a 0% error rate and a green "no wrong-but-confident
+    # reads" tick - a safety claim an empty set cannot support. Written directly
+    # rather than through _write_report: this is a different shape, not a
+    # variant of a full report.
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "empty",
+                "metadata": {
+                    "generated_at": "2026-10-18T00:00:00+00:00",
+                    "commit": "abc1234",
+                    "dataset": {
+                        "real_files": 1,
+                        "synthetic_files": 0,
+                        "scored_files": 0,
+                        "skipped": [
+                            {"file": "road_scene.jpg", "reason": "no plate pattern in the file name"}
+                        ],
+                    },
+                    "char_verifier": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    r = client.get("/api/v1/analytics/ocr", headers=auth(demo_tokens["cop"]))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "empty"
+    # The real file count survives, so the tab can say what is on disk.
+    assert body["metadata"]["dataset"]["real_files"] == 1
+    # No metrics are claimed: this is the whole point of the separate status.
+    assert "kpis" not in body
+    assert "target" not in body
+    assert "decision" not in body
+
+
 def test_endpoint_rbac(client, demo_tokens, report_path):
     from tests.conftest import auth
 

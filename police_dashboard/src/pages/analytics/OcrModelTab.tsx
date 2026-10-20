@@ -15,7 +15,13 @@ import {
   type TooltipProps,
 } from "recharts";
 import { AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
-import { fetchOcrReport, type OcrNoReport, type OcrReport, type OcrSetMetrics } from "../../services/api";
+import {
+  fetchOcrReport,
+  type OcrEmptyReport,
+  type OcrNoReport,
+  type OcrReport,
+  type OcrSetMetrics,
+} from "../../services/api";
 import { Card, CardHeader } from "../../components/ui/Card";
 import { StatCard } from "../../components/ui/StatCard";
 import { EmptyState, ErrorState, Skeleton } from "../../components/ui/Feedback";
@@ -857,6 +863,7 @@ function formatIst(iso: string): string {
 export default function OcrModelTab() {
   const [report, setReport] = useState<OcrReport | null>(null);
   const [noReport, setNoReport] = useState<OcrNoReport | null>(null);
+  const [emptyReport, setEmptyReport] = useState<OcrEmptyReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
@@ -868,12 +875,21 @@ export default function OcrModelTab() {
     fetchOcrReport()
       .then((data) => {
         if (cancelled) return;
+        // Three states, not two: never-run, ran-but-empty, and a real
+        // measurement. The middle one is not a result and must not be rendered
+        // as one - zeros from an empty set look like a clean bill of health.
         if (data.status === "no_report") {
           setNoReport(data);
           setReport(null);
+          setEmptyReport(null);
+        } else if (data.status === "empty") {
+          setEmptyReport(data);
+          setReport(null);
+          setNoReport(null);
         } else {
           setReport(data as OcrReport);
           setNoReport(null);
+          setEmptyReport(null);
         }
       })
       .catch((err: unknown) => {
@@ -908,6 +924,60 @@ export default function OcrModelTab() {
 
   if (error) {
     return <ErrorState title="OCR report unavailable" description={error} onRetry={refresh} />;
+  }
+
+  if (emptyReport) {
+    const dataset = emptyReport.metadata?.dataset;
+    const skipped = dataset?.skipped ?? [];
+    return (
+      <Card>
+        <EmptyState
+          icon={<XCircle className="h-6 w-6" aria-hidden />}
+          title="No plates were evaluated"
+          description="The evaluation ran but found no labelled plate images, so no accuracy was measured. Nothing on this tab would be a result yet."
+          action={
+            <div className="space-y-3 text-left">
+              <p className="text-sm text-surface-text">
+                Add plate images to{" "}
+                <code className="rounded bg-surface-sunken px-1.5 py-0.5 font-mono text-xs">
+                  data/test_plates/
+                </code>
+                , naming each file after the plate it shows —{" "}
+                <code className="rounded bg-surface-sunken px-1.5 py-0.5 font-mono text-xs">
+                  DL1ZA9092.jpg
+                </code>
+                .
+              </p>
+              <code className="block rounded bg-surface-sunken px-2 py-1 font-mono text-xs text-surface-text">
+                python scripts/eval_ocr.py
+              </code>
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-surface-muted">
+                <dt>Files on disk</dt>
+                <dd className="text-surface-text">
+                  {dataset?.real_files ?? 0} real / {dataset?.synthetic_files ?? 0} synthetic
+                </dd>
+                <dt>Scored</dt>
+                <dd className="text-surface-text">0</dd>
+              </dl>
+              {skipped.length > 0 ? (
+                <details className="text-xs text-surface-muted">
+                  <summary className="cursor-pointer">
+                    {skipped.length} file{skipped.length === 1 ? "" : "s"} skipped
+                  </summary>
+                  <ul className="mt-2 space-y-1">
+                    {skipped.map((s) => (
+                      <li key={s.file}>
+                        <code className="font-mono text-surface-text">{s.file}</code> — {s.reason}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+            </div>
+          }
+        />
+      </Card>
+    );
   }
 
   if (noReport || !report) {

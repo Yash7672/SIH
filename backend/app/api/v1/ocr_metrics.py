@@ -16,7 +16,7 @@ from pydantic import ValidationError
 from app.api.deps import require_cop
 from app.core.config import BACKEND_DIR, REPO_ROOT
 from app.models import User
-from app.services.ocr_metrics import OcrNoReport, OcrReport, load_report
+from app.services.ocr_metrics import OcrEmptyReport, OcrNoReport, OcrReport, load_report
 
 router = APIRouter()
 
@@ -47,15 +47,21 @@ REPORT_PATH: Path = _default_report_path()
 
 @router.get(
     "",
-    response_model=Union[OcrReport, OcrNoReport],
+    response_model=Union[OcrReport, OcrEmptyReport, OcrNoReport],
     summary="Latest measured OCR model accuracy",
-    response_description="The parsed eval report, or a no_report hint",
+    response_description="The parsed eval report, an empty-report notice, or a no_report hint",
 )
-def ocr_model_report(_: User = Depends(require_cop)) -> Union[OcrReport, OcrNoReport]:
+def ocr_model_report(_: User = Depends(require_cop)) -> Union[OcrReport, OcrEmptyReport, OcrNoReport]:
     """Serve the latest offline OCR evaluation, cached by the file's mtime.
 
     Returns 200 with ``{"status": "no_report", ...}`` when the evaluation has
     never been run, so the dashboard can show the command to produce it.
+
+    Returns ``{"status": "empty", ...}`` when the evaluation ran but found no
+    labelled plates. That is deliberately distinct from ``"ok"``: a report with
+    no scored samples has no accuracy, and serving it as a normal report let the
+    dashboard render a zero error rate and a green "no bad reads" tick, which is
+    a safety claim an empty set cannot support.
     """
     try:
         report = load_report(Path(REPORT_PATH))
@@ -63,4 +69,6 @@ def ocr_model_report(_: User = Depends(require_cop)) -> Union[OcrReport, OcrNoRe
         raise HTTPException(status_code=500, detail=f"ocr report unreadable: {exc}") from exc
     if report is None:
         return OcrNoReport(status="no_report", hint="Run: python scripts/eval_ocr.py")
+    if report.status == "empty":
+        return OcrEmptyReport(status="empty", metadata=report.metadata)
     return report
