@@ -50,6 +50,21 @@ VALID_STATE_CODES = frozenset(
 
 PLATE_MIN_LEN, PLATE_MAX_LEN = 8, 10
 
+# Minimum length of the *unpadded* input we are willing to complete. "TS1A12"
+# (6) is a plate a person genuinely writes when they leave the leading zeros
+# out; "AB12" (4) is not a plate at all and `test_invalid_plate_short` pins
+# that, so the floor stays well above it.
+PLATE_PAD_MIN_LEN = 5
+
+# A district code is written with a leading zero on the RC ("TS 01"), and the
+# tail number is a fixed four digits ("0012"). Someone filing a complaint types
+# "ts 1 a 12" and means the same car, so the digit runs are left-padded back to
+# their canonical width rather than being rejected. Letters are NEVER invented -
+# only a digit run can be widened, because "A" has no canonical long form and
+# guessing one would silently name a different vehicle.
+RTO_DIGITS_WIDTH = 2
+TAIL_DIGITS_WIDTH = 4
+
 # Characters RapidOCR regularly swaps for one another on plates. Used to repair
 # the state code only (position 0-1) and only when the original code is invalid.
 VISUAL_SIMILARITY: Dict[str, Tuple[str, ...]] = {
@@ -366,6 +381,92 @@ def _rank_candidates(
     if exact:
         return best, f"exact match, state code {best[:2]} is a valid RTO code"
     return best, f"repaired to {best} ({edits} char fix, state code {best[:2]} whitelisted)"
+
+
+def pad_short_plate(compact: str) -> Optional[str]:
+    """Restore the canonical digit widths of a plate a *person* typed loosely.
+
+    ``TS1A12`` -> ``TS01A0012``: the state code is already two letters, the
+    district digit run is padded to two, the series letters are kept exactly as
+    typed, and the tail number is padded to four. Only digit runs are widened -
+    a missing *letter* cannot be recovered from a shorter string, so a plate
+    with no letters between the digits (``TS091234``) is refused here and left
+    to fail the pattern.
+
+    A registration whose tail is already four digits is treated as written in
+    full, even when its district is a single digit: ``DL1ZA9092`` is a real
+    plate spelled the way it is issued, and ``plate_key``/``plate_spellings``
+    already reconcile it with ``DL01ZA9092`` at lookup time. Padding those
+    would rewrite how an existing plate is displayed.
+
+    Deliberately NOT called from :func:`normalize_plate`. The camera pipeline
+    must never widen a short OCR read - ``DL1ZA909`` is what the camera saw,
+    and inventing a fourth digit is how a different car gets flagged (see
+    ``test_two_character_rewrites_never_win_over_an_exact_read``). Only the
+    complaint path, where a human is entering their own registration, opts in.
+
+    Returns ``None`` when the input cannot be completed into a well-formed
+    Indian plate.
+    """
+    if len(compact) < PLATE_PAD_MIN_LEN:
+        return None
+    if not compact[:2].isalpha():
+        return None
+
+    # Split the body into its alternating runs once the two-letter state code is
+    # off the front. The first run must be digits (the district), the next must
+    # be letters (the series) - that shape is what makes this a plate rather
+    # than an arbitrary string.
+    body = compact[2:]
+    parts = re.findall(r"[0-9]+|[A-Z]+", body)
+    if len(parts) != 3:
+        return None
+    rto, series, tail = parts
+    if not (rto.isdigit() and series.isalpha() and tail.isdigit()):
+        return None
+    if len(rto) > RTO_DIGITS_WIDTH or len(tail) > TAIL_DIGITS_WIDTH:
+        return None
+    # A four-digit tail means the whole registration was written out; only a
+    # shorter tail leaves something to restore.
+    if len(tail) == TAIL_DIGITS_WIDTH:
+        return None
+    if not (1 <= len(series) <= 3):
+        return None
+
+    candidate = f"{compact[:2]}{rto.zfill(RTO_DIGITS_WIDTH)}{series}{tail.zfill(TAIL_DIGITS_WIDTH)}"
+    return candidate if is_valid_plate(candidate) else None
+
+
+def normalize_plate_for_entry(raw: str) -> NormalizedPlate:
+    """Normalize a registration that a person typed, completing short forms.
+
+    This is :func:`normalize_plate` plus one extra step, applied *only* when the
+    ordinary rules do not already yield a valid plate: a loosely typed
+    ``TS1A12`` becomes ``TS01A0012``. It exists for the complaint form, where
+    the citizen is describing their own car and leaving out the leading zeros is
+    a spelling choice, not a misread.
+
+    The camera path deliberately keeps calling :func:`normalize_plate`: a short
+    OCR read must be reported as read, never padded with invented digits.
+    """
+    result = normalize_plate(raw)
+    if result.valid:
+        return result
+
+    compact = "".join(ch for ch in unicodedata.normalize("NFKC", str(raw or "")).upper() if ch.isalnum())
+    compact, _ = _strip_blue_band(compact)
+    padded = pad_short_plate(compact)
+    if padded is None:
+        return result
+    return NormalizedPlate(
+        raw=str(raw or ""),
+        normalized=padded,
+        valid=True,
+        reason=f"padded short registration to canonical form ({compact} -> {padded})",
+        state_code_valid=state_code_ok(padded),
+        repaired=True,
+        candidates=[padded, compact],
+    )
 
 
 def normalize_plate(raw: str, ocr_score: float = 1.0) -> NormalizedPlate:

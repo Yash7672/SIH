@@ -7,6 +7,7 @@ import { Card } from "../components/ui/Card";
 import { Input, Select } from "../components/ui/Input";
 import { ErrorState } from "../components/ui/Feedback";
 import { PageHeader } from "../components/ui/Overlay";
+import { padPlate, plateEntryHint } from "../utils/plate";
 
 const TYPES = [
   { value: "stolen", label: "Stolen vehicle" },
@@ -20,10 +21,7 @@ const ACCEPT = ".jpg,.jpeg,.png,.pdf";
 
 /** Live counter for the registration field: how many characters are still missing. */
 function plateHint(raw: string) {
-  const clean = raw.replace(/[^A-Za-z0-9]/g, "");
-  if (clean.length === 0) return "Format: 2 letters, 1-2 digits, 1-2 letters, 4 digits, e.g. MH12AB1234";
-  if (clean.length === 10) return "Looks complete - 10 characters.";
-  return `${10 - clean.length} more character(s) to complete.`;
+  return plateEntryHint(raw);
 }
 
 export default function NewComplaint() {
@@ -69,16 +67,22 @@ export default function NewComplaint() {
     setSubmitError("");
     setErrors({});
 
+    // The server completes a loosely typed registration ("TS1A12" ->
+    // "TS01A0012"); do it here too so the value actually sent is the completed
+    // one and the citizen was shown it in the hint before submitting.
     const clean = plate.replace(/[^A-Za-z0-9]/g, "");
-    if (clean.length !== 10) {
-      setErrors({ plate: "Enter the 10-character registration, e.g. MH12AB1234." });
+    const completed = padPlate(clean);
+    if (!completed) {
+      setErrors({
+        plate: "Enter a valid registration, e.g. TS11A1234 or DL1ZA9092. The leading zeros are optional.",
+      });
       return;
     }
 
     setBusy(true);
     try {
       const body = new FormData();
-      body.append("plate", clean);
+      body.append("plate", completed);
       body.append("complaint_type", type);
       body.append("description", description);
       if (file) body.append("proof", file);
@@ -108,7 +112,7 @@ export default function NewComplaint() {
             required
             value={plate}
             onChange={(e) => setPlate(e.target.value.toUpperCase().slice(0, 12))}
-            placeholder="MH12AB1234"
+            placeholder="TS11A1234"
             error={errors.plate}
             hint={hint}
             className="font-mono uppercase tracking-widest"

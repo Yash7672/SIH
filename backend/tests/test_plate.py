@@ -8,6 +8,8 @@ from app.services.plate import (
     VALID_STATE_CODES,
     is_valid_plate,
     normalize_plate,
+    normalize_plate_for_entry,
+    pad_short_plate,
     plate_key,
     plate_read_reliable,
     plate_spellings,
@@ -215,6 +217,63 @@ def test_two_character_rewrites_never_win_over_an_exact_read():
         assert p.repaired is False, raw
     # A short tail is still a plate; it is not padded out to four digits.
     assert normalize_plate("DL1ZA909").normalized == "DL1ZA909"
+
+
+def test_camera_path_never_pads_a_short_read():
+    # The safety rule above is about the camera, and stays true no matter what
+    # the complaint form does: a read is reported as read.
+    for raw in ("DL1ZA909", "TS1A12", "TS1A123"):
+        p = normalize_plate(raw)
+        assert p.normalized == raw, raw
+        assert p.repaired is False, raw
+
+
+def test_complaint_entry_pads_a_loosely_typed_plate():
+    # The reported case: a citizen types "ts 1 a 12" and means TS 01 A 0012.
+    assert normalize_plate_for_entry("ts 1 a 12").normalized == "TS01A0012"
+    assert normalize_plate_for_entry("TS1A12").normalized == "TS01A0012"
+    assert normalize_plate_for_entry("TS1AB12").normalized == "TS01AB0012"
+    assert normalize_plate_for_entry("ts1a12").normalized == "TS01A0012"
+    for raw in ("ts 1 a 12", "TS1A12", "TS1AB12"):
+        p = normalize_plate_for_entry(raw)
+        assert p.valid is True, raw
+        assert p.repaired is True, raw
+
+
+def test_entry_padding_keeps_letters_exactly_as_typed():
+    # Padding widens digit runs only; it never invents a series letter, because
+    # a longer series is a different car, not a longer spelling of this one.
+    assert normalize_plate_for_entry("TS1A12").normalized == "TS01A0012"
+    assert normalize_plate_for_entry("TS1AB12").normalized == "TS01AB0012"
+
+
+def test_entry_leaves_a_complete_plate_alone():
+    # A registration already written in full is never rewritten - the display
+    # form of an existing plate is not this function's business.
+    for raw in ("TS11A1234", "KA01AB1234", "DL8CBF4890", "DL1ZA9092", "DL1ZA909"):
+        p = normalize_plate_for_entry(raw)
+        assert p.normalized == raw, raw
+        assert p.valid is True, raw
+
+
+def test_entry_still_rejects_what_is_not_a_plate():
+    # Too short to complete, missing the series letters, or a bogus state code.
+    for raw in ("AB12", "TS091234", "HL09AB1234", ""):
+        assert normalize_plate_for_entry(raw).valid is False, raw
+
+
+def test_pad_short_plate_returns_none_when_it_cannot_help():
+    assert pad_short_plate("TS091234") is None      # no series letters
+    assert pad_short_plate("AB12") is None          # below the floor
+    assert pad_short_plate("TS1A12345") is None     # tail too long
+    assert pad_short_plate("1234A12") is None       # state code is not letters
+    assert pad_short_plate("TS11A1234") is None     # already complete
+    assert pad_short_plate("TS1A12") == "TS01A0012"
+
+
+def test_entry_rejects_a_bogus_state_code_even_when_padding():
+    # Padding must not resurrect an un-whitelisted code.
+    assert normalize_plate_for_entry("ZL1A12").valid is False
 
 
 def test_ambiguous_state_code_is_never_guessed():

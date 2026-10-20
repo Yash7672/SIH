@@ -10,7 +10,7 @@ from app.db.session import get_db
 from app.models import Complaint, ComplaintStatus, Role, User
 from app.schemas.entities import ComplaintAction, ComplaintOut
 from app.services.audit_service import log_action
-from app.services.plate import normalize_plate
+from app.services.plate import normalize_plate_for_entry
 
 router = APIRouter()
 
@@ -24,7 +24,11 @@ def create_complaint(
     user: User = Depends(require_citizen),
     db: Session = Depends(get_db),
 ):
-    norm = normalize_plate(plate)
+    # A citizen typing their own registration may leave the leading zeros out
+    # ("TS1A12"); the entry-scoped normalizer completes it to "TS01A0012". The
+    # camera path keeps the strict normalize_plate, so a short OCR read is never
+    # padded with invented digits.
+    norm = normalize_plate_for_entry(plate)
     if not norm.valid:
         raise HTTPException(status_code=422, detail="Invalid Indian-style plate number")
 
