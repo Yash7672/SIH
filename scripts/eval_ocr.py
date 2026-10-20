@@ -336,6 +336,11 @@ def build_distributions(samples: List[dict]) -> dict:
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
+    # The output directory is created here rather than only on the happy path:
+    # the "nothing to evaluate" branch also writes a report, and on a fresh
+    # checkout data/eval/ does not exist yet, so that branch used to die with
+    # FileNotFoundError instead of recording the empty result.
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
@@ -477,6 +482,7 @@ def main() -> int:
     atomic_write_json(REPORT_PATH, report)
 
     tmp_csv = SAMPLES_PATH.with_suffix(".csv.tmp")
+    tmp_csv.parent.mkdir(parents=True, exist_ok=True)
     with tmp_csv.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow([
