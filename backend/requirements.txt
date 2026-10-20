@@ -25,3 +25,8 @@ rapidocr-onnxruntime==1.4.4
 onnxruntime==1.30.0
 PyYAML==6.0.3
 ultralytics>=8.0.0
+# AI assistant (app/services/chat/). Groq is a router + phrasing helper only: it
+# picks an approved tool, the backend runs it with role checks. Verified against
+# `pip index versions groq` (1.7.0 was latest at the time of pinning) and
+# `pip check` stays clean. Without it the assistant still runs in quick-only mode.
+groq==1.7.0

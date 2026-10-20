@@ -126,6 +126,32 @@ class CacheService:
         except Exception:
             return True
 
+    def rate_limit(self, key: str, limit: int, window_seconds: int) -> tuple[bool, int]:
+        """Count hits for `key` over `window_seconds`; (allowed, retry_after).
+
+        Separate from ``throttle`` on purpose: ``throttle`` derives its limit from
+        the window length (limit == window seconds), so it cannot express a real
+        "N per minute" / "N per day" budget. This one takes the limit
+        independently, which is what a per-user chat budget needs.
+
+        Fails open when Redis is down, matching ``throttle``: an unavailable cache
+        must not lock every user out of the assistant, and the expensive path is
+        still bounded by the global Groq semaphore.
+        """
+        if not self.available:
+            return True, 0
+        try:
+            rkey = f"rakshak:ratelimit:{key}"
+            current = int(self._client.incr(rkey))
+            if current == 1:
+                self._client.expire(rkey, window_seconds)
+            if current <= limit:
+                return True, 0
+            ttl = int(self._client.ttl(rkey)) or window_seconds
+            return False, max(ttl, 1)
+        except Exception:
+            return True, 0
+
     def set_json(self, key: str, value: dict, ttl: int = 60) -> None:
         if not self.available:
             return

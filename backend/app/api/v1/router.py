@@ -4,6 +4,7 @@ from app.api.v1 import (
     alerts,
     analytics,
     auth,
+    chat,
     complaints,
     devices,
     geo,
@@ -32,5 +33,6 @@ api_router.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(scanner.router, prefix="/scanner", tags=["scanner"])
 api_router.include_router(geo.router, prefix="/geo", tags=["geo"])
+api_router.include_router(chat.router, prefix="/chat", tags=["chat"])
 api_router.include_router(ws.router, prefix="/ws", tags=["ws"])
 api_router.include_router(live_scan.router, prefix="/ws", tags=["ws"])

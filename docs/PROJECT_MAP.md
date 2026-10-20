@@ -127,6 +127,67 @@ Roles are enforced by `app/api/deps.py` (`require_cop`, `require_volunteer`, `re
 | GET | `/api/v1/analytics/ocr` | COP, ADMIN |
 | POST | `/api/v1/scanner/scan` | VOLUNTEER, COP |
 | GET | `/api/v1/geo/heat` | COP, ADMIN |
+| GET | `/api/v1/chat/config` | CITIZEN, COP, ADMIN |
+| POST | `/api/v1/chat/quick` | CITIZEN, COP, ADMIN |
+| POST | `/api/v1/chat/message` | CITIZEN, COP, ADMIN |
+
+## AI Assistant (chat)
+
+Groq powers the RAKSHAK Assistant in both web apps. It is a **router and a
+phrasing helper, never a data source**: the model only picks which approved tool
+to run, the backend executes it with the caller's own role, and every number is
+built from real rows. There are no write tools and no path from model output to
+SQL.
+
+- `GET /api/v1/chat/config` — quick questions for the caller's role, plus
+  `llm_enabled`. CITIZEN gets the citizen toolset; COP/ADMIN get the police
+  toolset; VOLUNTEER gets 403; no/invalid token gets 401. The toolset comes from
+  the JWT, never from the request body.
+- `POST /api/v1/chat/quick` `{id}` — runs a predefined question deterministically.
+  No model is involved, so it keeps working with no key.
+- `POST /api/v1/chat/message` `{message, history}` — Groq picks a tool; the answer
+  is a deterministic template, optionally reworded into one sentence by a second
+  call (`CHAT_LLM_PHRASING=on`). Plates are masked to `VEH_1`/`VEH_2` before that
+  call and substituted back after. A guard rejects any rewording containing a
+  number that is not in the tool data, or any plate-like token that is not one of
+  ours, and the template is used instead.
+
+Roles and tools:
+
+| Role | Toolset |
+| --- | --- |
+| CITIZEN | `my_complaints`, `faq(topic)` — own complaints only; never reveals hot-list status |
+| COP, ADMIN | `stolen_today`, `analytics_today`, `latest_alerts`, `top_hotlist`, `busiest_areas`, `pending_complaints`, `ocr_accuracy`, `devices_online`, `last_seen(plate)` |
+
+`last_seen` answers for **hot-listed plates only**; any other plate returns an
+explicit "no record is kept" (non-hot-listed plates are never stored).
+`busiest_areas` and `ocr_accuracy` are hidden by `/chat/config` when their data
+source is absent, and a hidden question is not runnable by id.
+
+Notes that matter:
+
+- **"Today" is the Asia/Kolkata day**, converted to a UTC window before querying
+  (`app/services/chat/common.py:ist_day_bounds`). Stored timestamps are UTC, so a
+  00:30 IST sighting lands on the previous UTC date — the same class of bug as the
+  `date_trunc` note in the Maps section.
+- **Fallback**: with no key, no network, a 429, a 404 or a timeout, free text is
+  matched against the quick questions (rapidfuzz, else difflib) and run
+  deterministically. The reply says "AI is busy, showing the closest answer", or
+  lists the available questions. A raw provider error is never shown.
+- **Limits**: per-user `CHAT_RATE_PER_MIN` / `CHAT_RATE_PER_DAY` via the Redis
+  limiter (429 with `Retry-After`), a global semaphore of 3 concurrent Groq calls,
+  8 s timeout, and a circuit breaker that pauses Groq for 60 s after 3 consecutive
+  failures. Police tool results are cached for 15 s.
+- **Privacy**: the server stores no message text. Only role, tool names, latency,
+  token counts and outcome are logged. Police queries add an `audit_logs` row
+  (`action=chat_query`) carrying tool names only.
+- `/health` now reports `chat: {enabled, provider, llm_ready}` — no secrets.
+
+The key lives only in `.env` (gitignored). `scripts/groq_check.py` lists the models
+a key can call, verifies the routing model supports tool calling, sends one tiny
+routed request and prints latency and tokens. Model ids are never hard-coded
+without being verified live; the shipped choice is `openai/gpt-oss-20b` with
+`openai/gpt-oss-120b` as the fallback.
 
 ## WebSocket Endpoints
 
@@ -513,7 +574,15 @@ Defined in `backend/app/core/config.py`, documented in `.env.example`:
 `STORAGE_LOCAL_PATH`, `AI_MODEL_PATH`, `OCR_MODEL_PATH`, `API_BASE_URL`,
 `DETECTION_COOLDOWN_SECONDS`, `MAX_UPLOAD_MB`, `RATE_LIMIT_DETECTIONS_PER_MINUTE`,
 `RATE_LIMIT_AUTH_PER_MINUTE`, `HEAT_TAU_HOURS`, `VITE_API_URL`, `VITE_WS_URL`,
-`EXPO_PUBLIC_API_URL`, `CHAR_VERIFY`, `STREAM_SOURCES_PATH`.
+`EXPO_PUBLIC_API_URL`, `CHAR_VERIFY`, `STREAM_SOURCES_PATH`,
+`GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_FALLBACK_MODEL`, `CHAT_ENABLED`,
+`CHAT_LLM_PHRASING`, `CHAT_RATE_PER_MIN`, `CHAT_RATE_PER_DAY`.
+
+`GROQ_API_KEY` is read only by the backend and only from `.env` (gitignored). An
+empty key is a supported mode: the assistant answers from the predefined questions
+and matches free text fuzzily. `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` may be left
+empty, in which case the ids are resolved at startup against the live models
+endpoint.
 
 Web clients read `VITE_API_URL` / `VITE_WS_URL`; the mobile app reads
 `EXPO_PUBLIC_API_URL`. `mobile_app/.env` ships it **empty on purpose** — the app derives

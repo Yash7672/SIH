@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   BarChart3,
@@ -23,6 +23,9 @@ import { Button } from "./ui/Button";
 import { formatCoords, platePath, timeAgo } from "../lib/format";
 import { ThemeModePicker, ThemeToggle } from "./ThemeToggle";
 import { PageBackground } from "./ui/PageBackground";
+
+// The assistant is lazy-loaded so its code stays out of the first paint.
+const ChatWidget = lazy(() => import("./chat/ChatWidget"));
 
 const NAV = [
   { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
@@ -354,6 +357,13 @@ export default function Layout({
           </div>
         </div>
       </div>
+
+      {/* Lazy so the assistant adds nothing to the console's first-load bundle.
+          Mounted here (inside Layout) so it never appears on the login page, and
+          it reads only - the Live Alerts socket is untouched. */}
+      <Suspense fallback={null}>
+        <ChatWidget />
+      </Suspense>
     </PageBackground>
   );
 }

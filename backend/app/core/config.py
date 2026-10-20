@@ -90,6 +90,42 @@ class Settings(BaseSettings):
     # counts half as much as one just now.
     HEAT_TAU_HOURS: float = 6.0
 
+    # --- AI assistant (chat) ---
+    # Groq is a ROUTER and a phrasing helper, never a data source: it only picks
+    # which approved tool to run and the backend executes it with role checks.
+    #
+    # GROQ_API_KEY lives ONLY in .env (gitignored, see .gitignore line 1). It is
+    # never read by a frontend, never logged, never returned in a response. If it
+    # is absent the assistant still works - quick questions are deterministic and
+    # free text falls back to fuzzy matching - so a missing key degrades the
+    # feature instead of breaking it.
+    GROQ_API_KEY: str = ""
+    # Empty means "resolve at startup against the live /models endpoint"; the id
+    # is never hard-coded without being verified against Groq first.
+    GROQ_MODEL: str = ""
+    GROQ_FALLBACK_MODEL: str = ""
+    CHAT_ENABLED: bool = True
+    # "on" enables the optional second call that turns an aggregate into one
+    # natural sentence. Plates are masked before that call either way.
+    CHAT_LLM_PHRASING: str = "on"
+    # Free-tier Groq limits are tight, so per-user caps are deliberately low.
+    CHAT_RATE_PER_MIN: int = 12
+    CHAT_RATE_PER_DAY: int = 200
+
+    @property
+    def chat_enabled(self) -> bool:
+        """True when the feature is on at all (key or not)."""
+        return self.CHAT_ENABLED
+
+    @property
+    def chat_llm_ready(self) -> bool:
+        """True only when a Groq call could actually be attempted right now."""
+        return bool(self.CHAT_ENABLED and self.GROQ_API_KEY.strip())
+
+    @property
+    def chat_phrasing_on(self) -> bool:
+        return self.CHAT_LLM_PHRASING.strip().lower() in {"on", "true", "1", "yes"}
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]

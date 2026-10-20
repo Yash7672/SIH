@@ -136,3 +136,5 @@ class HealthOut(BaseModel):
     database: str
     redis: str
     demo_mode: bool
+    # AI assistant state. Optional so any older client keeps parsing the payload.
+    chat: Optional[dict] = None

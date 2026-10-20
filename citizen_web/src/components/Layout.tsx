@@ -1,9 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { ChevronDown, FilePlus2, LayoutDashboard, LogOut, Menu, X } from "lucide-react";
 import { clearSession } from "../services/api";
 import { Wordmark } from "./Brand";
 import { ThemeModePicker, ThemeToggle } from "./ThemeToggle";
+
+// The assistant is lazy-loaded so its code (and its request) stays out of the
+// first paint; it is only fetched when Layout mounts.
+const ChatWidget = lazy(() => import("./chat/ChatWidget"));
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -179,6 +183,12 @@ export default function Layout() {
           RAKSHAK · Privacy-first crowdsourced ANPR · Plate photos and locations are encrypted in transit.
         </div>
       </footer>
+
+      {/* Lazy so the assistant never adds to the first-load bundle: the chunk is
+          fetched only when Layout itself is on screen. */}
+      <Suspense fallback={null}>
+        <ChatWidget />
+      </Suspense>
     </div>
   );
 }
