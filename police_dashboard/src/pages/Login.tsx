@@ -67,7 +67,7 @@ export default function Login() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="cop@example.com"
+              placeholder="you@example.com"
             />
 
             <div className="relative">
@@ -104,17 +104,6 @@ export default function Login() {
               {loading ? "Signing in…" : "Sign in"}
             </Button>
           </form>
-        </div>
-
-        <div className="mt-4 rounded-xl border border-surface-border bg-surface-card/70 px-4 py-3 text-center text-xs text-surface-muted">
-          <p>
-            Demo COP <code className="font-mono text-surface-text">cop@example.com</code> /{" "}
-            <code className="font-mono text-surface-text">Police@123</code>
-          </p>
-          <p className="mt-1">
-            Demo ADMIN <code className="font-mono text-surface-text">admin@example.com</code> /{" "}
-            <code className="font-mono text-surface-text">Admin@123</code>
-          </p>
         </div>
       </div>
     </div>

@@ -57,15 +57,23 @@ export default function Analytics() {
         if (cancelled) return;
         if (h.status === "fulfilled") {
           setByHour(
-            h.value.data.map((r) => ({
-              ...r,
-              hour: new Date(r.hour).toLocaleString([], {
-                month: "short",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-            }))
+            h.value.data.map((r) => {
+              const at = new Date(r.hour);
+              return {
+                ...r,
+                // Two labels per bucket: a compact one for the axis (a full
+                // "Sep 23, 09:00 AM" is ~15 characters, so four of them collide
+                // in a half-width card and Recharts drops the ticks) and the
+                // full timestamp for the tooltip, which has room for it.
+                hour: at.toLocaleString([], { hour: "2-digit", minute: "2-digit" }),
+                full: at.toLocaleString([], {
+                  month: "short",
+                  day: "numeric",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+              };
+            })
           );
         }
         if (m.status === "fulfilled") setMatches(m.value.data);
@@ -204,7 +212,7 @@ export default function Analytics() {
             <EmptyState
               icon={<BarChart3 className="h-6 w-6" aria-hidden />}
               title="No traffic data yet"
-              description="Scan with the phone app, or run scripts/seed_traffic.py for demo counts."
+              description="Traffic density appears once a volunteer device has scanned in this window."
             />
           )}
         </Card>

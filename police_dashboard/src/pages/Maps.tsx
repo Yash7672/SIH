@@ -196,7 +196,7 @@ export default function Maps() {
             title="No density in this window"
             description={
               layer === "traffic"
-                ? "Traffic density is recorded only where a volunteer phone is actively scanning. Widen the window, or run scripts/seed_traffic.py to populate demo data."
+                ? "Traffic density is recorded only where a volunteer phone is actively scanning. Try widening the time window."
                 : "No hot-listed plate was sighted in this window."
             }
           />

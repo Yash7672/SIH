@@ -60,7 +60,7 @@ export default function Login() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="citizen@example.com"
+              placeholder="you@example.com"
             />
 
             <div className="relative">
@@ -104,11 +104,6 @@ export default function Login() {
               Register as citizen
             </Link>
           </p>
-        </div>
-
-        <div className="mt-4 rounded-xl border border-surface-border bg-surface-card/70 px-4 py-3 text-center text-xs text-surface-muted">
-          Demo · <code className="font-mono font-medium text-surface-text">citizen@example.com</code> /{" "}
-          <code className="font-mono font-medium text-surface-text">Citizen@123</code>
         </div>
       </div>
     </div>

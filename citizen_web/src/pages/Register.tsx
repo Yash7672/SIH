@@ -70,7 +70,7 @@ export default function Register() {
               autoComplete="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="citizen@example.com"
+              placeholder="you@example.com"
             />
             <Input
               label="Phone"

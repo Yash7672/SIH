@@ -13,6 +13,8 @@ import { useTheme } from "../../hooks/useTheme";
 export interface HourBucket {
   hour: string;
   count: number;
+  /** Full timestamp, shown in the tooltip where there is room for it. */
+  full?: string;
 }
 
 /**
@@ -55,6 +57,14 @@ export default function DetectionsChart({ data }: { data: HourBucket[] }) {
     []
   );
 
+  // The tooltip labels a bucket with its full timestamp; the axis only has room
+  // for the short form.
+  const tooltipLabel = useCallback(
+    (_label: unknown, payload: ReadonlyArray<{ payload?: HourBucket }>) =>
+      payload?.[0]?.payload?.full ?? String(_label ?? ""),
+    []
+  );
+
   // Until the stored preference has been read, draw nothing rather than flash
   // the wrong palette.
   if (!ready) return <div className="h-72 p-4" />;
@@ -68,6 +78,8 @@ export default function DetectionsChart({ data }: { data: HourBucket[] }) {
             dataKey="hour"
             tick={{ fill: "var(--chart-axis)", fontSize: 11 }}
             interval="preserveStartEnd"
+            minTickGap={12}
+            tickMargin={8}
             tickLine={false}
             axisLine={{ stroke: "var(--chart-grid)" }}
           />
@@ -81,6 +93,7 @@ export default function DetectionsChart({ data }: { data: HourBucket[] }) {
             cursor={{ fill: "var(--row-hover)" }}
             contentStyle={tooltipStyle}
             labelStyle={labelStyle()}
+            labelFormatter={tooltipLabel}
           />
           <Bar
             dataKey="count"
