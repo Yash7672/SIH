@@ -70,5 +70,10 @@ def ocr_model_report(_: User = Depends(require_cop)) -> Union[OcrReport, OcrEmpt
     if report is None:
         return OcrNoReport(status="no_report", hint="Run: python scripts/eval_ocr.py")
     if report.status == "empty":
+        # Serve the metadata only. The report schema allows extra keys, so an
+        # empty file written by an older run still carries kpis/target/decision
+        # filled with zeros - and a 0% error rate with 0 wrong-but-confident
+        # reads reads as a clean result. Dropping the measurement blocks here
+        # means the dashboard cannot render them even from a stale file.
         return OcrEmptyReport(status="empty", metadata=report.metadata)
     return report

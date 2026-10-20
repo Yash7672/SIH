@@ -308,9 +308,33 @@ def test_endpoint_empty_report_is_not_served_as_a_result(client, demo_tokens, re
     # The real file count survives, so the tab can say what is on disk.
     assert body["metadata"]["dataset"]["real_files"] == 1
     # No metrics are claimed: this is the whole point of the separate status.
-    assert "kpis" not in body
-    assert "target" not in body
-    assert "decision" not in body
+    assert set(body) == {"status", "metadata"}
+
+
+def test_endpoint_strips_metrics_from_a_stale_empty_report(client, demo_tokens, report_path):
+    from tests.conftest import auth
+
+    # An empty report left by an older run still carries the full metric blocks
+    # filled with zeros. Serving those would put a 0% error rate and "0
+    # wrong-but-confident reads" back in front of the reader, so they are
+    # dropped at the endpoint rather than trusted to be absent from the file.
+    stale = {
+        "status": "empty",
+        "target": {"value": 0.9, "met_point": False, "accuracy": None},
+        "kpis": {"error_rate": 0.0, "wrong_confident_count": 0, "no_read_rate": 0.0},
+        "sets": [],
+        "confusion": {"labels": [], "counts": []},
+        "confidence_histogram": {"bins": [], "correct": [], "wrong": []},
+        "decision": {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "n": 0},
+        "distributions": {"grid": [], "correct": [], "wrong": []},
+        "metadata": {"generated_at": "2026-10-18T00:00:00+00:00", "commit": "abc1234"},
+    }
+    report_path.write_text(json.dumps(stale), encoding="utf-8")
+    r = client.get("/api/v1/analytics/ocr", headers=auth(demo_tokens["cop"]))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "empty"
+    assert set(body) == {"status", "metadata"}
 
 
 def test_endpoint_rbac(client, demo_tokens, report_path):
