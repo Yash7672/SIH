@@ -122,7 +122,8 @@ export function useChat() {
 
   const loadConfig = useCallback(async () => {
     try {
-      const { data } = await api.get<ChatConfig>("/api/v1/chat/config");
+      // Paths are relative to `api`'s baseURL, which already ends in /api/v1.
+      const { data } = await api.get<ChatConfig>("/chat/config");
       setConfig(data);
     } catch {
       // A failed config still leaves the panel usable: show no chips, no AI.
@@ -156,9 +157,9 @@ export function useChat() {
           .map((m) => ({ role: m.role, content: m.text.slice(0, MAX_MESSAGE_CHARS) }));
 
         const { data } = payload.quickId
-          ? await api.post<ChatAnswer>("/api/v1/chat/quick", { id: payload.quickId }, { signal: controller.signal })
+          ? await api.post<ChatAnswer>("/chat/quick", { id: payload.quickId }, { signal: controller.signal })
           : await api.post<ChatAnswer>(
-              "/api/v1/chat/message",
+              "/chat/message",
               { message: (payload.message ?? "").slice(0, MAX_MESSAGE_CHARS), history },
               { signal: controller.signal },
             );

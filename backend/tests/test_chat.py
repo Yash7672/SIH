@@ -1051,6 +1051,27 @@ def test_no_write_endpoints_exist():
     }
 
 
+def test_chat_paths_are_relative_to_the_api_v1_mount():
+    """The mount prefix is added once, by the router.
+
+    The web clients build their base URL as ``<host>/api/v1`` and pass paths
+    *relative* to it. A client that repeats the prefix asks for
+    ``/api/v1/api/v1/chat/...`` and gets a 404, so the mount point is pinned
+    here: the app must expose the chat routes under exactly one ``/api/v1``.
+    """
+    from app.main import app
+
+    paths = {getattr(r, "path", "") for r in app.routes}
+    assert "/api/v1/chat/config" in paths
+    assert "/api/v1/api/v1/chat/config" not in paths
+
+    # The route-table spelling the client adds to its own base URL.
+    from app.api.v1.router import api_router
+
+    relative = {getattr(r, "path", "") for r in api_router.routes if getattr(r, "path", "").startswith("/chat")}
+    assert relative == {"/chat/config", "/chat/quick", "/chat/message"}
+
+
 def test_llm_never_gets_a_police_toolset_for_a_citizen(client, demo_tokens, seeded, monkeypatch):
     patch_key(monkeypatch)
     fake = use_fake(FakeGroq(default=tool_call("faq", '{"topic": "privacy"}')))
