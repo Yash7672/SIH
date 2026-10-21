@@ -35,6 +35,17 @@ function RequireAuth({ children }: { children: JSX.Element }) {
   return children;
 }
 
+/**
+ * The administration page is ADMIN-only. Every action on it is already refused
+ * server-side for a COP, so this is not what enforces the rule - it just stops a
+ * COP who types the URL from landing on a page whose buttons all 403.
+ */
+function RequireAdmin({ children }: { children: JSX.Element }) {
+  const user = JSON.parse(localStorage.getItem("rakshak_user") || "null");
+  if (user?.role !== "ADMIN") return <Navigate to="/" replace />;
+  return children;
+}
+
 export default function App() {
   const [liveAlerts, setLiveAlerts] = useState<AlertEvent[]>([]);
   const queueRef = useRef<AlertEvent[]>([]);
@@ -93,7 +104,14 @@ export default function App() {
           <Route path="search" element={<VehicleSearch />} />
           <Route path="vehicles/:plate" element={<VehicleDetail />} />
           <Route path="analytics" element={<Analytics />} />
-          <Route path="admin" element={<Admin />} />
+          <Route
+            path="admin"
+            element={
+              <RequireAdmin>
+                <Admin />
+              </RequireAdmin>
+            }
+          />
         </Route>
         <Route path="*" element={<NotFound />} />
       </Routes>

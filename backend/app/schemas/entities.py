@@ -37,6 +37,38 @@ class UserOut(BaseModel):
     phone: Optional[str] = None
     role: str
     created_at: datetime
+    # Whether the account can sign in. An admin needs this to tell a deactivated
+    # officer from an active one; every other reader simply ignores it.
+    active: bool = True
+
+
+class StaffCreateRequest(BaseModel):
+    """An ADMIN creating a COP account for a police station.
+
+    Deliberately not :class:`RegisterRequest`: that one takes a caller-chosen
+    role, and the role here is fixed by the endpoint. The password is set by the
+    admin, who hands it to the station - there is no self-service path for a
+    police account.
+    """
+
+    name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    phone: Optional[str] = Field(default=None, max_length=20)
+    # Same bounds as registration, so an admin cannot create an account that the
+    # login form would refuse to set for a citizen.
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordResetRequest(BaseModel):
+    """An ADMIN setting a new password for an officer who lost theirs."""
+
+    password: str = Field(min_length=8, max_length=128)
+
+
+class ActiveUpdateRequest(BaseModel):
+    """An ADMIN enabling or disabling an account."""
+
+    active: bool
 
 
 class ComplaintCreate(BaseModel):

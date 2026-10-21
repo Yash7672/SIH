@@ -119,6 +119,7 @@ export interface User {
   role: string;
   phone?: string;
   created_at?: string;
+  active?: boolean;
 }
 
 export interface TokenResponse {
@@ -377,3 +378,31 @@ export const COMPLAINT_STATUS_COLORS: Record<string, string> = {
   HOTLISTED: "chip-danger",
   CLOSED: "chip-neutral",
 };
+
+/**
+ * Admin-only account administration. Police accounts cannot be self-registered
+ * (the public register form only accepts citizens and volunteers), so these are
+ * the only way one is created. The server enforces ADMIN on every one of them -
+ * these helpers do not decide who may call them.
+ */
+export interface PoliceAccountInput {
+  name: string;
+  email: string;
+  phone?: string;
+  password: string;
+}
+
+export async function createPoliceAccount(payload: PoliceAccountInput): Promise<User> {
+  const r = await api.post<User>("/users/police", payload);
+  return r.data;
+}
+
+export async function setUserActive(userId: string, active: boolean): Promise<User> {
+  const r = await api.post<User>(`/users/${userId}/active`, { active });
+  return r.data;
+}
+
+export async function resetUserPassword(userId: string, password: string): Promise<User> {
+  const r = await api.post<User>(`/users/${userId}/password`, { password });
+  return r.data;
+}
